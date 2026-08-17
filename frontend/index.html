@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="console">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#09100f" />
+    <script>
+      (() => {
+        const theme = localStorage.getItem('jian.theme');
+        if (theme === 'light' || theme === 'black') {
+          document.documentElement.dataset.theme = theme;
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', theme === 'light' ? '#f5f7f4' : '#050505');
+        }
+      })();
+    </script>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="icon" href="/app_icon.svg" type="image/svg+xml" />
+    <title>Jian - 简</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

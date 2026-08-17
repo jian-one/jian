@@ -1,0 +1,32 @@
+[package]
+name = "jian"
+version = "0.2.3"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+bcrypt = "0.17"
+bolt-lite = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+jammdb = "0.11"
+libc = "0.2"
+mime_guess = "2"
+portable-pty = "0.9"
+rand = "0.9"
+regex = "1"
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tower = { version = "0.5", features = ["util"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+strip = true
+lto = "thin"
