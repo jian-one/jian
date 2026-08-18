@@ -145,7 +145,7 @@ pub fn token_hash(raw: &str) -> String {
 pub fn default_path() -> PathBuf {
     std::env::var_os("JIAN_DB")
         .map(PathBuf::from)
-        .unwrap_or_else(|| dirs_home().join(".local/share/jian/jian.db"))
+        .unwrap_or_else(|| dirs_home().join(".local/jian/jian.db"))
 }
 pub fn dirs_home() -> PathBuf {
     std::env::var_os("HOME")

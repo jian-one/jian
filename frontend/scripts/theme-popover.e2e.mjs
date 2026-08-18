@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -7,6 +7,7 @@ const root = resolve(import.meta.dirname, '../..');
 const port = 18000 + Math.floor(Math.random() * 1000);
 const chromePort = port + 1000;
 const temporary = await mkdtemp(join(tmpdir(), 'jian-theme-e2e-'));
+const config = join(temporary, 'config.json');
 const processes = [];
 
 const start = (command, args, options = {}) => {
@@ -59,11 +60,11 @@ class CDP {
 }
 
 try {
-  start('cargo', ['run', '--quiet'], {
+  await writeFile(config, JSON.stringify({ bind_ip: '127.0.0.1', listen_port: port }));
+  start('cargo', ['run', '--quiet', '--', '--config', config], {
     cwd: root,
     env: {
       ...process.env,
-      JIAN_ADDR: `127.0.0.1:${port}`,
       JIAN_DB: join(temporary, 'jian.db'),
       JIAN_ADMIN_USER: 'theme-test',
       JIAN_ADMIN_PASSWORD: 'theme-test-password',

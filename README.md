@@ -19,11 +19,11 @@ jian log -f
 `build.sh` builds the UI and installs the `jian` binary with Cargo under
 `${CARGO_HOME:-$HOME/.cargo}/bin`. The `deploy` subcommand only writes the systemd user
 unit, reloads and enables it, then restarts the service. It stores application data under
-`~/.local/share/jian` and manages
+`~/.local/jian` and manages
 `~/.config/systemd/user/jian.service`. Run it from the repository, or
 set `JIAN_SOURCE_DIR` to the repository path. The service listens on
-`0.0.0.0:8000` by default. Optional administrator and Hermes settings can be
-placed in `~/.local/share/jian/env`. The file is created with development
+`0.0.0.0:8080` by default. Optional administrator and Hermes settings can be
+placed in `~/.local/jian/env`. The file is created with development
 defaults on the first deploy and is never overwritten on subsequent deploys.
 
 
@@ -35,9 +35,10 @@ cd ..
 JIAN_ADMIN_PASSWORD='change-me-now' cargo run
 ```
 
-The server listens on `:8000`. Set `JIAN_ADMIN_USER`,
-`JIAN_ADMIN_PASSWORD`, `JIAN_DB`, and `JIAN_ADDR` to adjust
-the defaults. The production UI is embedded from `web/dist`.
+The server listens on `0.0.0.0:8080`. Set `bind_ip` and `listen_port` in
+`~/.local/jian/config.json` to change it. Set `JIAN_ADMIN_USER`,
+`JIAN_ADMIN_PASSWORD`, or `JIAN_DB` to adjust those defaults. The production
+UI is embedded from `web/dist`.
 
 ## Codex terminal integration
 
@@ -72,7 +73,7 @@ Set `JIAN_BASH_BIN` to override the Bash executable used for session
 terminals; it defaults to `/bin/bash`.
 
 For a user service, put these variables in
-`~/.local/share/jian/env` (the recommended persistent location), or
+`~/.local/jian/env` (the recommended persistent location), or
 export them before running the server/deploy script:
 
 ```sh

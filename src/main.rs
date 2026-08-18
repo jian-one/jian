@@ -8,7 +8,7 @@ mod terminal;
 use std::{
     collections::HashMap,
     fs,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -91,7 +91,7 @@ async fn dispatch() -> Result<()> {
 }
 
 async fn run_server(config_path: Option<PathBuf>) -> Result<()> {
-    let resolved = load_config(config_path)?;
+    let (config, resolved) = load_config(config_path)?;
     tracing::info!("jian config: {}", resolved.display());
     let store = Store::open(default_path())?;
     let username = std::env::var("JIAN_ADMIN_USER").unwrap_or_else(|_| "admin".into());
@@ -108,13 +108,7 @@ async fn run_server(config_path: Option<PathBuf>) -> Result<()> {
         secure_cookie: std::env::var("JIAN_SECURE_COOKIE").as_deref() == Ok("1"),
     });
     let app = routes(state).fallback(static_asset);
-    let configured_addr = std::env::var("JIAN_ADDR").unwrap_or_else(|_| ":8000".into());
-    let addr: SocketAddr = if configured_addr.starts_with(':') {
-        format!("0.0.0.0{configured_addr}")
-    } else {
-        configured_addr
-    }
-    .parse()?;
+    let addr = SocketAddr::new(config.bind_ip, config.listen_port);
     tracing::info!("jian listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(
@@ -1063,11 +1057,23 @@ fn parse_config_arg(args: &[String]) -> Result<Option<PathBuf>> {
     }
     Err(anyhow!("usage: jian run [--config PATH]"))
 }
-#[derive(Default, Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 struct ConfigFile {
+    bind_ip: IpAddr,
+    listen_port: u16,
+    #[serde(skip_serializing)]
     #[allow(dead_code)]
     terminal: TerminalConfig,
+}
+impl Default for ConfigFile {
+    fn default() -> Self {
+        Self {
+            bind_ip: Ipv4Addr::UNSPECIFIED.into(),
+            listen_port: 8080,
+            terminal: TerminalConfig::default(),
+        }
+    }
 }
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1077,8 +1083,8 @@ struct TerminalConfig {
     #[allow(dead_code)]
     inactive_sweep_interval: String,
 }
-fn load_config(path: Option<PathBuf>) -> Result<PathBuf> {
-    let path = path.unwrap_or_else(|| dirs_home().join(".local/share/jian/config.json"));
+fn load_config(path: Option<PathBuf>) -> Result<(ConfigFile, PathBuf)> {
+    let path = path.unwrap_or_else(|| dirs_home().join(".local/jian/config.json"));
     let path = if path.is_absolute() {
         path
     } else {
@@ -1089,13 +1095,13 @@ fn load_config(path: Option<PathBuf>) -> Result<PathBuf> {
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?
     }
     if !path.exists() {
-        fs::write(&path, b"{}\n")?;
+        fs::write(&path, serde_json::to_vec_pretty(&ConfigFile::default())?)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?
     }
     let data = fs::read(&path)?;
-    let _: ConfigFile =
+    let config: ConfigFile =
         serde_json::from_slice(&data).with_context(|| format!("parse config {:?}", path))?;
-    Ok(path)
+    Ok((config, path))
 }
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
@@ -1120,9 +1126,9 @@ Commands:
   help, -h, --help  Show this help
 
 Configuration:
-  Service data:  ~/.local/share/jian
+  Service data:  ~/.local/jian
   Service unit:  ~/.config/systemd/user/jian.service
-  Listen address defaults to 0.0.0.0:8000; override it with JIAN_ADDR.";
+  Listen address defaults to 0.0.0.0:8080; configure bind_ip and listen_port in config.json.";
 
 const STATUS_ARGS: &[&str] = &["--user", "status", "jian.service", "--no-pager"];
 
@@ -1187,7 +1193,8 @@ fn deploy() -> Result<()> {
     let repo = std::env::var_os("JIAN_SOURCE_DIR")
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
-    let data = dirs_home().join(".local/share/jian");
+    let data = dirs_home().join(".local/jian");
+    let (config, _) = load_config(None)?;
     let units = dirs_home().join(".config/systemd/user");
     fs::create_dir_all(&data)?;
     fs::create_dir_all(&units)?;
@@ -1199,7 +1206,6 @@ fn deploy() -> Result<()> {
         fs::set_permissions(&env_file, fs::Permissions::from_mode(0o600))?
     }
     let binary = std::env::current_exe()?;
-    let listen = std::env::var("JIAN_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".into());
     let mut inherited = String::new();
     for (name, fallback) in [
         ("PATH", ""),
@@ -1229,10 +1235,9 @@ fn deploy() -> Result<()> {
         ));
     }
     let unit = format!(
-        "[Unit]\nDescription=Jian Agent Workbench\nAfter=default.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={}\nEnvironmentFile=-%h/.local/share/jian/env\nEnvironment=JIAN_DB=%h/.local/share/jian/jian.db\nEnvironment=JIAN_ADDR={}\n{}Restart=on-failure\nRestartSec=2s\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Jian Agent Workbench\nAfter=default.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={}\nEnvironmentFile=-%h/.local/jian/env\nEnvironment=JIAN_DB=%h/.local/jian/jian.db\n{}Restart=on-failure\nRestartSec=2s\n\n[Install]\nWantedBy=default.target\n",
         systemd_path(&repo),
         systemd_path(&binary),
-        systemd_quote(&listen),
         inherited,
     );
     let unit_file = units.join("jian.service");
@@ -1243,10 +1248,11 @@ fn deploy() -> Result<()> {
         run("systemctl", &["--user", "start", "jian.service"])?
     }
     println!(
-        "Jian deployed successfully.\nService: {}\nData:    {}\nListen:  {}",
+        "Jian deployed successfully.\nService: {}\nData:    {}\nListen:  {}:{}",
         unit_file.display(),
         data.display(),
-        listen
+        config.bind_ip,
+        config.listen_port,
     );
     Ok(())
 }
@@ -1297,6 +1303,13 @@ mod cli_tests {
         ] {
             assert!(HELP.contains(text));
         }
+    }
+
+    #[test]
+    fn config_defaults_to_public_8080() {
+        let config: ConfigFile = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.bind_ip, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(config.listen_port, 8080);
     }
 
     #[test]
