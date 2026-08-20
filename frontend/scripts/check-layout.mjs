@@ -23,7 +23,7 @@ const allCSS = `${theme}\n${css}`;
 const checks = [
   ['expanded state is not persisted', !source.includes('jian.nav_expanded')],
   ['Navigation Menu owns sidebar disclosure', source.includes('NavigationMenu.Root') && source.includes('NavigationMenu.Sub') && source.includes('orientation="vertical"')],
-  ['primary navigation sections share one component', source.includes('function PrimaryNavigationItem') && (source.match(/<PrimaryNavigationItem/g) || []).length === 3],
+  ['primary navigation sections share one component', source.includes('function PrimaryNavigationItem') && (source.match(/<PrimaryNavigationItem/g) || []).length === 4],
   ['all navigation levels share one trigger component', source.includes('function MenuTrigger') && source.includes('<MenuTrigger icon={icon}>') && source.includes('<MenuTrigger variant="profile"')],
   ['Radix focus proxy cannot displace primary actions', source.includes('className="navigation-trigger-slot"') && theme.includes('.navigation-menu-row > .navigation-trigger-slot')],
   ['primary navigation row keeps a fixed height when children expand', theme.includes('.navigation-menu-row {') && theme.includes('height: 42px') && theme.includes('min-height: 42px')],
@@ -61,7 +61,7 @@ const checks = [
   ['themed scrollbars are applied', css.includes('scrollbar-color: var(--scroll-thumb) var(--scroll-track)')],
   ['empty titles have a visible fallback', source.includes("|| '无标题'")],
   ['channel labels are localized', source.includes("weixin: '微信'") && source.includes("dingtalk: '钉钉'")],
-  ['mobile terminal controls stay touch friendly', theme.includes('height: 42px') && theme.includes('grid-template-columns: repeat(3, minmax(0, 1fr))')],
+  ['mobile terminal controls stay touch friendly', source.includes('<Collapsible.Content forceMount') && theme.includes('height: 42px') && theme.includes('grid-template-columns: repeat(3, minmax(0, 1fr))')],
   ['mobile terminal supports vertical touch scrolling', source.includes("addEventListener('touchmove'") && source.includes('term.scrollLines(lines)') && theme.includes('.terminal {\n    touch-action: none;')],
   ['touch terminals use a dedicated IME input buffer', source.includes('attachTerminalInputBuffer') && source.includes('terminal-input-buffer') && source.includes('inputMode="text"') && theme.includes('.terminal-input-buffer')],
   ['IME preview follows the terminal theme', source.includes('terminal-input-preview') && theme.includes('color: var(--terminal-fg)') && theme.includes('background: var(--terminal-bg)')],

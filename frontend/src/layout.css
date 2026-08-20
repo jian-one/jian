@@ -51,6 +51,8 @@
 }
 
 @media (max-width: 800px) {
+  .quick-note-toggle { right: max(10px, env(safe-area-inset-right)); }
+  .quick-note { width: min(380px, calc(100vw - max(28px, env(safe-area-inset-left) + env(safe-area-inset-right) + 20px))); }
   .app {
     position: relative;
     display: block;

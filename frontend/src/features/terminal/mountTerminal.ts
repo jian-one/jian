@@ -13,6 +13,7 @@ type MountOptions = {
   sessionID: string;
   terminalPath: Kind | 'local';
   theme: TerminalTheme;
+  fontSize: number;
   focus: () => void;
   send: (data: string) => void;
   onStatus: (value: string) => void;
@@ -20,10 +21,10 @@ type MountOptions = {
 };
 
 export function mountTerminal(options: MountOptions) {
-  const { host, inputBuffer, preview, terminalRef, socketRef, sessionID, terminalPath, theme, focus, send, onStatus, onProgress } = options;
+  const { host, inputBuffer, preview, terminalRef, socketRef, sessionID, terminalPath, theme, fontSize, focus, send, onStatus, onProgress } = options;
   onProgress('正在建立终端连接…');
   const touchInput = window.matchMedia('(pointer: coarse), (hover: none)').matches;
-  const term = new Terminal({ cursorBlink: true, disableStdin: true, theme: terminalThemes[theme], scrollback: 10000 });
+  const term = new Terminal({ cursorBlink: true, disableStdin: true, fontSize, theme: terminalThemes[theme], scrollback: 10000 });
   // A selected xterm range owns Ctrl+C: copy and clear the selection instead
   // of sending SIGINT. With no selection xterm keeps its normal control byte.
   term.attachCustomKeyEventHandler(event => {

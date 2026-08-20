@@ -1,6 +1,6 @@
 import type { AgentSettings } from '../../shared/model';
 
-export type AgentKind = 'codex' | 'hermes';
+export type AgentKind = 'codex' | 'hermes' | 'pi';
 export type RosterKind = AgentKind | 'local';
 
 export const normalizeAgentSettings = (settings: AgentSettings): AgentSettings => ({
@@ -11,19 +11,22 @@ export const normalizeAgentSettings = (settings: AgentSettings): AgentSettings =
   hermes_args: settings.hermes_args || [],
   codex_env: settings.codex_env || [],
   hermes_env: settings.hermes_env || [],
+  pi_args: settings.pi_args || [],
+  pi_env: settings.pi_env || [],
+  pi_agents: settings.pi_agents || [],
   hermes_profiles: settings.hermes_profiles || [],
 });
 
-export const agentEnabled = (settings: AgentSettings, kind: AgentKind) => kind === 'codex' ? settings.codex_enabled !== false : settings.hermes_enabled !== false;
+export const agentEnabled = (settings: AgentSettings, kind: AgentKind) => settings[`${kind}_enabled` as 'codex_enabled' | 'hermes_enabled' | 'pi_enabled'] !== false;
 
 export const withAgentEnabled = (settings: AgentSettings, kind: RosterKind, enabled: boolean): AgentSettings => kind === 'local' ? settings : {
   ...settings,
-  [kind === 'codex' ? 'codex_enabled' : 'hermes_enabled']: enabled,
+  [`${kind}_enabled`]: enabled,
 };
 
 export const parseExpandedRoster = (raw: string | null): RosterKind[] => {
   try {
     const values = JSON.parse(raw || '[]');
-    return Array.isArray(values) ? values.filter((value): value is RosterKind => value === 'local' || value === 'codex' || value === 'hermes') : [];
+    return Array.isArray(values) ? values.filter((value): value is RosterKind => value === 'local' || value === 'codex' || value === 'hermes' || value === 'pi') : [];
   } catch { return []; }
 };

@@ -20,7 +20,15 @@ const BUCKETS: &[&str] = &[
     "runtime_state",
     "monitor_definitions",
     "agent_settings",
+    "quick_notes",
 ];
+
+#[derive(Clone, Serialize, serde::Deserialize)]
+pub struct QuickNote {
+    pub state: String,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub version: u8,
+}
 
 pub struct Store {
     db: DB,
@@ -76,6 +84,12 @@ impl Store {
     }
     pub fn save_settings(&self, username: &str, value: &AgentSettings) -> Result<()> {
         self.put("agent_settings", username, value)
+    }
+    pub fn quick_note(&self, username: &str) -> Option<QuickNote> {
+        self.get("quick_notes", username).ok()
+    }
+    pub fn save_quick_note(&self, username: &str, value: &QuickNote) -> Result<()> {
+        self.put("quick_notes", username, value)
     }
     pub fn admin_hash(&self, username: &str) -> Option<String> {
         self.get::<serde_json::Value>("users", username)

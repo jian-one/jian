@@ -13,6 +13,7 @@ type Props = {
   currentKind: Kind | 'local';
   profile: string;
   profiles: string[];
+  piAgents?: string[];
   sessions: Session[];
   localSessions: LocalSession[];
   sidebarRef: RefObject<HTMLElement | null>;
@@ -39,7 +40,7 @@ type Props = {
 };
 
 const rowsFor = (sessions: Session[], kind: Kind, profile?: string) => sessions
-  .filter(session => session.kind === kind && (kind !== 'hermes' || (session.profile || 'default') === profile) && session.title.trim().toLowerCase() !== `new ${kind} session`)
+  .filter(session => session.kind === kind && (kind === 'hermes' || kind === 'pi' ? (session.profile || 'default') === profile : true) && session.title.trim().toLowerCase() !== `new ${kind} session`)
   .sort(byLastActiveDesc);
 const preventHoverOpen = (event: PointerEvent<HTMLButtonElement>) => event.preventDefault();
 const preventEscapeDismiss = (event: KeyboardEvent) => event.preventDefault();
@@ -86,10 +87,10 @@ function PrimaryNavigationItem({ value, label, icon, selected, actions, children
  * The sidebar has one interaction owner: Radix Navigation Menu. It owns group
  * disclosure and keyboard navigation; callers only provide session data and commands.
  */
-export function SidebarNavigation({ active, currentKind, profile, profiles, sessions, localSessions, sidebarRef, onScroll, onAreaChange, onProfileChange, onSelectSession, onSelectLocal, onCreateLocal, onRemoveLocal, onOpenWorkspace, onRefresh, refreshingKind, onSettings, onDialog, connectedSessionID, onDisconnect, visibleCount, onShowMore, username, onLogout, settingsOpen, onSettingsPage }: Props) {
+export function SidebarNavigation({ active, currentKind, profile, profiles, piAgents = profiles, sessions, localSessions, sidebarRef, onScroll, onAreaChange, onProfileChange, onSelectSession, onSelectLocal, onCreateLocal, onRemoveLocal, onOpenWorkspace, onRefresh, refreshingKind, onSettings, onDialog, connectedSessionID, onDisconnect, visibleCount, onShowMore, username, onLogout, settingsOpen, onSettingsPage }: Props) {
   const areaFromActive: Area = currentKind;
-  const [agentEnabled, setAgentEnabled] = useState({ codex: localStorage.getItem('jian.codex-enabled') !== 'false', hermes: localStorage.getItem('jian.hermes-enabled') !== 'false' });
-  useEffect(() => { const refreshAgentEnabled = () => setAgentEnabled({ codex: localStorage.getItem('jian.codex-enabled') !== 'false', hermes: localStorage.getItem('jian.hermes-enabled') !== 'false' }); window.addEventListener('jian-agent-settings', refreshAgentEnabled); return () => window.removeEventListener('jian-agent-settings', refreshAgentEnabled); }, []);
+  const [agentEnabled, setAgentEnabled] = useState({ codex: localStorage.getItem('jian.codex-enabled') !== 'false', hermes: localStorage.getItem('jian.hermes-enabled') !== 'false', pi: localStorage.getItem('jian.pi-enabled') !== 'false' });
+  useEffect(() => { const refreshAgentEnabled = () => setAgentEnabled({ codex: localStorage.getItem('jian.codex-enabled') !== 'false', hermes: localStorage.getItem('jian.hermes-enabled') !== 'false', pi: localStorage.getItem('jian.pi-enabled') !== 'false' }); window.addEventListener('jian-agent-settings', refreshAgentEnabled); return () => window.removeEventListener('jian-agent-settings', refreshAgentEnabled); }, []);
   const [value, setValue] = useState<Area | ''>(areaFromActive);
   const [profileValue, setProfileValue] = useState(profile);
   const [codexWorkspaceValue, setCodexWorkspaceValue] = useState('');
@@ -111,6 +112,7 @@ export function SidebarNavigation({ active, currentKind, profile, profiles, sess
     if (toggledValue) onProfileChange(toggledValue);
   };
   const profileRows = profiles.length ? profiles : ['default'];
+  const piRows = piAgents.length ? piAgents : ['default'];
   const codexRows = rowsFor(sessions, 'codex');
   const codexWorkspaces = Array.from(new Set(codexRows.map(session => session.workspace || '未知工作区')));
   const toggleCodexWorkspace = (workspace: string) => setCodexWorkspaceValue(value => value === workspace ? '' : workspace);
@@ -133,6 +135,11 @@ export function SidebarNavigation({ active, currentKind, profile, profiles, sess
         {agentEnabled.hermes && <PrimaryNavigationItem value="hermes" label="Hermes" icon={<AgentIcon kind="hermes" />} selected={currentKind === 'hermes'} actions={<div className="navigation-menu-actions"><button className="icon" aria-label="Hermes 设置" title="Hermes 设置" onClick={() => onSettings('hermes')}><Settings2 /></button><button className="icon" aria-label="刷新 Hermes 会话" title="刷新 Hermes 会话" disabled={!!refreshingKind} aria-busy={refreshingKind === 'hermes'} onClick={() => onRefresh('hermes')}><RefreshCw /></button></div>}>
           <NavigationMenu.Sub className="profile-navigation secondary-navigation" value={profileValue} onValueChange={selectProfile} orientation="vertical"><NavigationMenu.List className="profile-navigation-list secondary-navigation-list">
 	            {profileRows.map(item => <NavigationMenu.Item key={item} value={item} className="profile-navigation-item secondary-navigation-item"><MenuTrigger variant="profile" onClick={event => { event.preventDefault(); toggleProfile(item); }}><span className="profile-navigation-label secondary-navigation-label"><small>PROFILE</small><strong title={item}>{item}</strong></span></MenuTrigger><NavigationMenu.Content className="profile-navigation-content secondary-navigation-content" onEscapeKeyDown={preventEscapeDismiss} onFocusOutside={event => event.preventDefault()} onPointerDownOutside={event => event.preventDefault()}><section className="nav-sessions"><header><span>会话目录</span><button className="icon" aria-label={`在 ${item} 中新建 Hermes 会话`} title="新建会话" onClick={() => onOpenWorkspace('hermes', item)}><Plus /></button></header><SessionList rows={rowsFor(sessions, 'hermes', item)} listKind="hermes" listProfile={item} activeID={active?.id} connectedID={connectedSessionID} visibleCount={visibleCount('hermes', item)} onSelect={onSelectSession} onDialog={onDialog} onDisconnect={onDisconnect} onShowMore={() => onShowMore('hermes', item)} /></section></NavigationMenu.Content></NavigationMenu.Item>)}
+          </NavigationMenu.List></NavigationMenu.Sub>
+        </PrimaryNavigationItem>}
+        {agentEnabled.pi && <PrimaryNavigationItem value="pi" label="Pi" icon={<AgentIcon kind="pi" />} selected={currentKind === 'pi'} actions={<div className="navigation-menu-actions"><button className="icon" aria-label="Pi 设置" title="Pi 设置" onClick={() => onSettings('pi')}><Settings2 /></button><button className="icon" aria-label="刷新 Pi 会话" title="刷新 Pi 会话" disabled={!!refreshingKind} aria-busy={refreshingKind === 'pi'} onClick={() => onRefresh('pi')}><RefreshCw /></button></div>}>
+          <NavigationMenu.Sub className="profile-navigation secondary-navigation" value={profileValue} onValueChange={selectProfile} orientation="vertical"><NavigationMenu.List className="profile-navigation-list secondary-navigation-list">
+            {piRows.map(item => <NavigationMenu.Item key={item} value={item} className="profile-navigation-item secondary-navigation-item"><MenuTrigger variant="profile" onClick={event => { event.preventDefault(); toggleProfile(item); }}><span className="profile-navigation-label secondary-navigation-label"><small>ROLE</small><strong title={item}>{item}</strong></span></MenuTrigger><NavigationMenu.Content className="profile-navigation-content secondary-navigation-content" onEscapeKeyDown={preventEscapeDismiss} onFocusOutside={event => event.preventDefault()} onPointerDownOutside={event => event.preventDefault()}><section className="nav-sessions"><header><span>会话目录</span><button className="icon" aria-label={`在 ${item} 中新建 Pi 会话`} title="新建会话" onClick={() => onOpenWorkspace('pi', item)}><Plus /></button></header><SessionList rows={rowsFor(sessions, 'pi', item)} listKind="pi" listProfile={item} activeID={active?.id} connectedID={connectedSessionID} visibleCount={visibleCount('pi', item)} onSelect={onSelectSession} onDialog={onDialog} onDisconnect={onDisconnect} onShowMore={() => onShowMore('pi', item)} /></section></NavigationMenu.Content></NavigationMenu.Item>)}
           </NavigationMenu.List></NavigationMenu.Sub>
         </PrimaryNavigationItem>}
       </NavigationMenu.List>

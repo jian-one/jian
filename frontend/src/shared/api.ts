@@ -11,6 +11,14 @@ let pongTimer = 0;
 let nextID = 1;
 let keepAlive = false;
 const pending = new Map<number, Pending>();
+const socketEvents = new Map<string, Set<(message: SocketMessage) => void>>();
+
+export function onSocketEvent(type: string, listener: (message: SocketMessage) => void) {
+  const listeners = socketEvents.get(type) || new Set();
+  listeners.add(listener);
+  socketEvents.set(type, listeners);
+  return () => { listeners.delete(listener); if (!listeners.size) socketEvents.delete(type); };
+}
 
 export const errorMessage = (error: unknown) => error instanceof Error ? error.message : 'Request failed';
 
@@ -67,6 +75,10 @@ function connect(): Promise<void> {
       if (message.type === 'pong') {
         window.clearTimeout(pongTimer);
         pongTimer = 0;
+        return;
+      }
+      if (message.type) {
+        socketEvents.get(message.type)?.forEach(listener => listener(message));
         return;
       }
       if (typeof message.id !== 'number' || typeof message.status !== 'number') return;

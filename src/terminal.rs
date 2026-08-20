@@ -175,7 +175,9 @@ impl TerminalManager {
     }
 
     pub fn stop(&self, id: &str) -> Result<()> {
-        let terminal = self.lookup(id)?;
+        let Some(terminal) = self.active.read().unwrap().get(id).cloned() else {
+            return Ok(());
+        };
         terminal.state.lock().unwrap().running = false;
         if let Some(pid) = terminal.child.lock().unwrap().process_id() {
             let descendants = descendants_of(pid as i32);
@@ -370,6 +372,11 @@ mod tests {
             String::from_utf8_lossy(&manager.subscribe(&session.id).unwrap().0).contains("ready")
         );
         manager.stop(&session.id).unwrap();
+    }
+
+    #[test]
+    fn stopping_missing_terminal_is_idempotent() {
+        TerminalManager::default().stop("already-gone").unwrap();
     }
 
     #[test]

@@ -46,3 +46,12 @@ test('closing the final native session tab clears its persisted restore key', ()
   assert.equal(selectedSessionKey({ kind: 'local' }), 'jian.active_local_session');
   assert.equal(selectedSessionKey({ kind: 'hermes', profile: 'work' }), 'jian.active_hermes_work_session');
 });
+
+test('terminal release errors are caught and shown in a dialog', () => {
+  const main = readFileSync(new URL('../src/main.tsx', import.meta.url), 'utf8');
+  const settings = readFileSync(new URL('../src/features/settings/SettingsPage.tsx', import.meta.url), 'utf8');
+
+  assert.match(main, /const release = async \(\) => \{[\s\S]*catch \(e\) \{ setError\(errorMessage\(e\)\); \}/);
+  assert.match(main, /<ErrorDialog open=\{!!error\}/);
+  assert.match(settings, /<ErrorDialog open=\{!!error\}/);
+});

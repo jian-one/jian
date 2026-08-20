@@ -8,6 +8,7 @@ pub enum AgentKind {
     #[default]
     Codex,
     Hermes,
+    Pi,
     Local,
 }
 
@@ -16,6 +17,7 @@ impl AgentKind {
         match self {
             Self::Codex => "codex",
             Self::Hermes => "hermes",
+            Self::Pi => "pi",
             Self::Local => "local",
         }
     }
@@ -110,11 +112,21 @@ pub struct AgentSettings {
     #[serde(default)]
     pub hermes_env: Vec<EnvVar>,
     #[serde(default)]
+    pub pi_bin: String,
+    #[serde(default)]
+    pub pi_agents: Vec<String>,
+    #[serde(default)]
+    pub pi_args: Vec<String>,
+    #[serde(default)]
+    pub pi_env: Vec<EnvVar>,
+    #[serde(default)]
     pub local_enabled: bool,
     #[serde(default)]
     pub codex_enabled: bool,
     #[serde(default)]
     pub hermes_enabled: bool,
+    #[serde(default)]
+    pub pi_enabled: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub agent_toggles_set: bool,
 }
@@ -134,9 +146,14 @@ impl Default for AgentSettings {
             hermes_args: vec![],
             codex_env: vec![],
             hermes_env: vec![],
+            pi_bin: env_first(&["JIAN_PI_BIN", "PI_BIN"]),
+            pi_agents: vec![],
+            pi_args: vec![],
+            pi_env: vec![],
             local_enabled: true,
             codex_enabled: true,
             hermes_enabled: true,
+            pi_enabled: true,
             agent_toggles_set: false,
         }
     }

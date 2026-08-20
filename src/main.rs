@@ -35,8 +35,9 @@ use rand::RngCore;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tower::ServiceExt;
+use yrs::{Doc, GetString, ReadTxn, StateVector, Transact, Update, updates::decoder::Decode};
 
 use crate::{
     model::{AgentKind, AgentSettings, Session},
@@ -45,16 +46,97 @@ use crate::{
 };
 
 const COOKIE: &str = "jian_session";
+const QUICK_NOTE_STATE_LIMIT: usize = 1024 * 1024;
+const QUICK_NOTE_TEXT_LIMIT: usize = 100_000;
+
+#[derive(Clone)]
+struct QuickNoteEvent {
+    username: String,
+    update: String,
+}
+
+type QuickNoteResult<T> = std::result::Result<T, (StatusCode, String)>;
+
+enum QuickNoteCommand {
+    Get {
+        username: String,
+        reply: oneshot::Sender<QuickNoteResult<String>>,
+    },
+    Put {
+        username: String,
+        update: Vec<u8>,
+        reply: oneshot::Sender<QuickNoteResult<()>>,
+    },
+}
+
+struct QuickNoteWorker(mpsc::Sender<QuickNoteCommand>);
+
+impl QuickNoteWorker {
+    fn start(store: Arc<Store>) -> Result<Self> {
+        let (sender, mut receiver) = mpsc::channel(64);
+        std::thread::Builder::new()
+            .name("jian-quick-note".into())
+            .spawn(move || {
+                while let Some(command) = receiver.blocking_recv() {
+                    match command {
+                        QuickNoteCommand::Get { username, reply } => {
+                            let _ = reply.send(load_quick_note(&store, &username));
+                        }
+                        QuickNoteCommand::Put {
+                            username,
+                            update,
+                            reply,
+                        } => {
+                            let _ = reply.send(save_quick_note(&store, &username, update));
+                        }
+                    }
+                }
+            })
+            .context("start quick note worker")?;
+        Ok(Self(sender))
+    }
+
+    async fn get(&self, username: String) -> QuickNoteResult<String> {
+        let (reply, response) = oneshot::channel();
+        self.0
+            .send(QuickNoteCommand::Get { username, reply })
+            .await
+            .map_err(|_| quick_note_unavailable())?;
+        response.await.map_err(|_| quick_note_unavailable())?
+    }
+
+    async fn put(&self, username: String, update: Vec<u8>) -> QuickNoteResult<()> {
+        let (reply, response) = oneshot::channel();
+        self.0
+            .send(QuickNoteCommand::Put {
+                username,
+                update,
+                reply,
+            })
+            .await
+            .map_err(|_| quick_note_unavailable())?;
+        response.await.map_err(|_| quick_note_unavailable())?
+    }
+}
+
+fn quick_note_unavailable() -> (StatusCode, String) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "quick note worker unavailable".into(),
+    )
+}
 
 #[derive(RustEmbed)]
 #[folder = "web/dist/"]
 struct Assets;
 
 struct AppState {
-    store: Store,
+    store: Arc<Store>,
     runtime: Arc<Runtime>,
     locals: RwLock<HashMap<String, Session>>,
     attempts: Mutex<HashMap<String, Vec<SystemTime>>>,
+    quick_notes: QuickNoteWorker,
+    quick_note_updates: broadcast::Sender<QuickNoteEvent>,
     secure_cookie: bool,
 }
 
@@ -93,18 +175,22 @@ async fn dispatch() -> Result<()> {
 async fn run_server(config_path: Option<PathBuf>) -> Result<()> {
     let (config, resolved) = load_config(config_path)?;
     tracing::info!("jian config: {}", resolved.display());
-    let store = Store::open(default_path())?;
+    let store = Arc::new(Store::open(default_path())?);
     let username = std::env::var("JIAN_ADMIN_USER").unwrap_or_else(|_| "admin".into());
     let password = std::env::var("JIAN_ADMIN_PASSWORD").unwrap_or_else(|_| "change-me".into());
     store.ensure_admin(&username, &hash(password, DEFAULT_COST)?)?;
     let settings = store.settings(&username).unwrap_or_default();
     let runtime = Runtime::new(settings);
     runtime.start_cache();
+    let quick_notes = QuickNoteWorker::start(store.clone())?;
+    let (quick_note_updates, _) = broadcast::channel(64);
     let state = Arc::new(AppState {
         store,
         runtime,
         locals: RwLock::new(HashMap::new()),
         attempts: Mutex::new(HashMap::new()),
+        quick_notes,
+        quick_note_updates,
         secure_cookie: std::env::var("JIAN_SECURE_COOKIE").as_deref() == Ok("1"),
     });
     let app = routes(state).fallback(static_asset);
@@ -139,7 +225,9 @@ fn api_routes(state: Arc<AppState>) -> Router {
         .route("/api/local/sessions/{id}", delete(remove_local))
         .route("/api/local/sessions/{id}/terminal", get(local_terminal))
         .route("/api/hermes/profiles", get(profiles))
+        .route("/api/pi/agents", get(pi_agents))
         .route("/api/settings", get(settings).put(save_settings))
+        .route("/api/quick-note", get(quick_note).put(put_quick_note))
         .route("/api/settings/terminal-status", get(terminal_status))
         .route(
             "/api/settings/terminals/{id}/release",
@@ -188,6 +276,16 @@ fn api_routes(state: Arc<AppState>) -> Router {
             "/api/agents/hermes/sessions/{id}/terminal",
             get(hermes_terminal),
         )
+        .route("/api/agents/pi/sessions", get(list_pi).post(create_pi))
+        .route("/api/agents/pi/sessions/cache", get(list_pi))
+        .route("/api/agents/pi/sessions/refresh", post(refresh_pi))
+        .route(
+            "/api/agents/pi/sessions/{id}",
+            get(get_pi).patch(rename_pi).delete(remove_pi),
+        )
+        .route("/api/agents/pi/sessions/{id}/history", get(history_pi))
+        .route("/api/agents/pi/sessions/{id}/stop", post(stop_pi))
+        .route("/api/agents/pi/sessions/{id}/terminal", get(pi_terminal))
         .with_state(state)
 }
 
@@ -307,7 +405,106 @@ async fn auth_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
 async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
     let username = require(&state, &headers)?;
     let (settings, available) = settings_view(&state, &username);
-    ok(json!({"username":username,"settings":settings,"available_profiles":available}))
+    ok(
+        json!({"username":username,"settings":settings,"available_profiles":available,"available_pi_agents":state.runtime.pi_agents()}),
+    )
+}
+
+#[derive(Deserialize)]
+struct QuickNoteUpdate {
+    update: String,
+}
+
+fn quick_note_doc(state: Option<&str>) -> Result<Doc> {
+    let doc = Doc::new();
+    if let Some(state) = state {
+        let bytes = URL_SAFE_NO_PAD.decode(state)?;
+        if bytes.len() > QUICK_NOTE_STATE_LIMIT {
+            return Err(anyhow!("quick note state is too large"));
+        }
+        doc.transact_mut()
+            .apply_update(Update::decode_v1(&bytes)?)?;
+    }
+    Ok(doc)
+}
+
+fn quick_note_state(doc: &Doc) -> Result<String> {
+    let text = doc.get_or_insert_text("body");
+    let txn = doc.transact();
+    let bytes = txn.encode_state_as_update_v1(&StateVector::default());
+    if bytes.len() > QUICK_NOTE_STATE_LIMIT {
+        return Err(anyhow!("quick note state exceeds 1 MiB"));
+    }
+    if text.get_string(&txn).chars().count() > QUICK_NOTE_TEXT_LIMIT {
+        return Err(anyhow!("quick note text exceeds 100,000 characters"));
+    }
+    Ok(URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn load_quick_note(store: &Store, username: &str) -> QuickNoteResult<String> {
+    let state = store.quick_note(username).map(|note| note.state);
+    quick_note_doc(state.as_deref())
+        .and_then(|doc| quick_note_state(&doc))
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+fn save_quick_note(store: &Store, username: &str, update: Vec<u8>) -> QuickNoteResult<()> {
+    let saved = store.quick_note(username);
+    let doc = quick_note_doc(saved.as_ref().map(|note| note.state.as_str()))
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let update = Update::decode_v1(&update)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid quick note update".into()))?;
+    doc.transact_mut()
+        .apply_update(update)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid quick note update".into()))?;
+    let note = store::QuickNote {
+        state: quick_note_state(&doc)
+            .map_err(|error| (StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?,
+        updated_at: chrono::Utc::now(),
+        version: 1,
+    };
+    store
+        .save_quick_note(username, &note)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
+}
+
+async fn quick_note(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
+    let username = require(&state, &headers)?;
+    match state.quick_notes.get(username).await {
+        Ok(state) => ok(json!({"state": state, "version": 1})),
+        Err((status, error)) => fail(status, error),
+    }
+}
+
+async fn put_quick_note(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<QuickNoteUpdate>,
+) -> Api {
+    let username = require(&state, &headers)?;
+    let update = match URL_SAFE_NO_PAD.decode(&input.update) {
+        Ok(update) if update.len() <= QUICK_NOTE_STATE_LIMIT => update,
+        Ok(_) => {
+            return fail(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "quick note update exceeds 1 MiB",
+            );
+        }
+        Err(_) => {
+            return fail(
+                StatusCode::BAD_REQUEST,
+                "invalid quick note update encoding",
+            );
+        }
+    };
+    if let Err((status, error)) = state.quick_notes.put(username.clone(), update).await {
+        return fail(status, error);
+    }
+    let _ = state.quick_note_updates.send(QuickNoteEvent {
+        username,
+        update: input.update,
+    });
+    no_content()
 }
 
 fn merged_settings(state: &AppState, username: &str) -> AgentSettings {
@@ -332,9 +529,14 @@ fn merged_settings(state: &AppState, username: &str) -> AgentSettings {
         defaults.hermes_args = saved.hermes_args;
         defaults.codex_env = saved.codex_env;
         defaults.hermes_env = saved.hermes_env;
+        defaults.pi_bin = saved.pi_bin;
+        defaults.pi_agents = saved.pi_agents;
+        defaults.pi_args = saved.pi_args;
+        defaults.pi_env = saved.pi_env;
         if saved.agent_toggles_set {
             defaults.codex_enabled = saved.codex_enabled;
             defaults.hermes_enabled = saved.hermes_enabled;
+            defaults.pi_enabled = saved.pi_enabled;
             defaults.agent_toggles_set = true;
         }
     }
@@ -347,12 +549,17 @@ fn settings_view(state: &AppState, username: &str) -> (AgentSettings, Vec<String
     if settings.hermes_profiles.is_empty() {
         settings.hermes_profiles = available.clone();
     }
+    if settings.pi_agents.is_empty() {
+        settings.pi_agents = state.runtime.pi_agents();
+    }
     (settings, available)
 }
 async fn settings(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
     let username = require(&state, &headers)?;
     let (settings, available) = settings_view(&state, &username);
-    ok(json!({"settings":settings,"available_profiles":available}))
+    ok(
+        json!({"settings":settings,"available_profiles":available,"available_pi_agents":state.runtime.pi_agents()}),
+    )
 }
 async fn save_settings(
     State(state): State<Arc<AppState>>,
@@ -364,6 +571,7 @@ async fn save_settings(
     input.codex_bin = input.codex_bin.trim().to_string();
     input.hermes_bin = input.hermes_bin.trim().to_string();
     input.hermes_home = input.hermes_home.trim().to_string();
+    input.pi_bin = input.pi_bin.trim().to_string();
     if input.codex_bin.is_empty() {
         input.codex_bin = current.codex_bin
     }
@@ -373,13 +581,18 @@ async fn save_settings(
     if input.hermes_home.is_empty() {
         input.hermes_home = current.hermes_home
     }
+    if input.pi_bin.is_empty() {
+        input.pi_bin = current.pi_bin
+    }
     input.path = std::env::var("PATH").unwrap_or_default();
     input.local_enabled = true;
     input.agent_toggles_set = true;
     input.local_profiles = normalize_profiles(&input.local_profiles);
     input.hermes_profiles = normalize_profiles(&input.hermes_profiles);
+    input.pi_agents = normalize_profiles(&input.pi_agents);
     input.codex_args = clean_args(&input.codex_args);
     input.hermes_args = clean_args(&input.hermes_args);
+    input.pi_args = clean_args(&input.pi_args);
     if let Err(e) = state.store.save_settings(&username, &input) {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
@@ -472,6 +685,10 @@ async fn profiles(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api
         ok(Vec::<String>::new())
     }
 }
+async fn pi_agents(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
+    require(&state, &headers)?;
+    ok(state.runtime.pi_agents())
+}
 async fn terminal_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
     require(&state, &headers)?;
     ok(json!({"active_pool":state.runtime.terminals.status()}))
@@ -546,8 +763,10 @@ async fn agent_create(
             StatusCode::SERVICE_UNAVAILABLE,
             if kind == AgentKind::Codex {
                 "Codex CLI unavailable"
-            } else {
+            } else if kind == AgentKind::Hermes {
                 "Hermes integration unavailable"
+            } else {
+                "Pi CLI unavailable"
             },
         );
     }
@@ -579,8 +798,10 @@ async fn agent_create(
     }
     if kind == AgentKind::Codex {
         settings.codex_args = session.launch_args.clone()
-    } else {
+    } else if kind == AgentKind::Hermes {
         settings.hermes_args = session.launch_args.clone()
+    } else {
+        settings.pi_args = session.launch_args.clone()
     }
     let _ = state.store.save_settings(&username, &settings);
     Ok((StatusCode::CREATED, Json(session)).into_response())
@@ -604,7 +825,7 @@ async fn agent_rename(
     input: Rename,
 ) -> Api {
     require(state, headers)?;
-    if kind == AgentKind::Codex {
+    if kind != AgentKind::Hermes {
         return fail(StatusCode::CONFLICT, "Codex 原生会话不支持重命名");
     }
     if input.title.trim().is_empty() {
@@ -747,6 +968,17 @@ kind_handlers!(
     remove_hermes,
     AgentKind::Hermes
 );
+kind_handlers!(
+    list_pi,
+    refresh_pi,
+    create_pi,
+    get_pi,
+    rename_pi,
+    history_pi,
+    stop_pi,
+    remove_pi,
+    AgentKind::Pi
+);
 
 async fn local_terminal(
     State(state): State<Arc<AppState>>,
@@ -771,6 +1003,14 @@ async fn hermes_terminal(
     ws: WebSocketUpgrade,
 ) -> Api {
     session_terminal(state, headers, id, ws, AgentKind::Hermes).await
+}
+async fn pi_terminal(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    ws: WebSocketUpgrade,
+) -> Api {
+    session_terminal(state, headers, id, ws, AgentKind::Pi).await
 }
 async fn session_terminal(
     state: Arc<AppState>,
@@ -836,14 +1076,14 @@ async fn api_websocket(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Api {
-    require(&state, &headers)?;
+    let username = require(&state, &headers)?;
     same_origin(&headers)?;
     Ok(ws
-        .on_upgrade(move |socket| api_socket(socket, state, headers))
+        .on_upgrade(move |socket| api_socket(socket, state, headers, username))
         .into_response())
 }
 
-async fn api_socket(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap) {
+async fn api_socket(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap, username: String) {
     let (mut sender, mut receiver) = socket.split();
     let (outgoing, mut replies) = mpsc::channel::<WsMessage>(32);
     let writer = tokio::spawn(async move {
@@ -858,7 +1098,24 @@ async fn api_socket(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap)
             }
         }
     });
-    let mut requests = JoinSet::new();
+    let mut updates = state.quick_note_updates.subscribe();
+    let outgoing_notifications = outgoing.clone();
+    let notifications = tokio::spawn(async move {
+        while let Ok(event) = updates.recv().await {
+            if event.username == username
+                && outgoing_notifications
+                    .send(WsMessage::Text(
+                        json!({"type":"quick-note.update","update":event.update})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .is_err()
+            {
+                break;
+            }
+        }
+    });
     while let Some(Ok(message)) = receiver.next().await {
         let WsMessage::Text(text) = message else {
             if matches!(message, WsMessage::Close(_)) {
@@ -879,15 +1136,15 @@ async fn api_socket(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap)
             continue;
         };
         let (state, headers, outgoing) = (state.clone(), headers.clone(), outgoing.clone());
-        requests.spawn(async move {
+        tokio::spawn(async move {
             let reply = rpc_response(state, headers, input).await;
             let _ = outgoing
                 .send(WsMessage::Text(reply.to_string().into()))
                 .await;
         });
     }
-    requests.abort_all();
     writer.abort();
+    notifications.abort();
 }
 
 async fn rpc_response(state: Arc<AppState>, headers: HeaderMap, input: RpcRequest) -> Value {
@@ -1290,6 +1547,7 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+    use yrs::Text;
 
     #[test]
     fn help_documents_commands_and_aliases() {
@@ -1347,13 +1605,15 @@ mod cli_tests {
     #[test]
     fn terminal_routes_share_session_lookup() {
         let root = std::env::temp_dir().join(format!("jian-routes-{}", uuid::Uuid::new_v4()));
-        let store = Store::open(root.join("jian.db")).unwrap();
+        let store = Arc::new(Store::open(root.join("jian.db")).unwrap());
         let local = Session::new(AgentKind::Local, "/tmp".into(), "Bash".into());
         let state = AppState {
-            store,
+            store: store.clone(),
             runtime: Runtime::new(AgentSettings::default()),
             locals: RwLock::new(HashMap::from([(local.id.clone(), local.clone())])),
             attempts: Mutex::new(HashMap::new()),
+            quick_notes: QuickNoteWorker::start(store).unwrap(),
+            quick_note_updates: broadcast::channel(1).0,
             secure_cookie: false,
         };
         assert_eq!(
@@ -1366,5 +1626,60 @@ mod cli_tests {
         assert!(find_terminal_session(&state, AgentKind::Hermes, "missing").is_none());
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn quick_note_worker_returns_empty_state_without_blocking_runtime() {
+        let root = std::env::temp_dir().join(format!("jian-note-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(Store::open(root.join("jian.db")).unwrap());
+        let worker = QuickNoteWorker::start(store).unwrap();
+        let state = tokio::time::timeout(Duration::from_secs(1), worker.get("test".into()))
+            .await
+            .expect("quick note worker blocked the runtime")
+            .unwrap();
+
+        let doc = quick_note_doc(Some(&state)).unwrap();
+        let text = doc.get_or_insert_text("body");
+        assert_eq!(text.get_string(&doc.transact()), "");
+        drop(worker);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quick_note_updates_merge_and_repeat_idempotently() {
+        let left = Doc::with_client_id(1);
+        let right = Doc::with_client_id(2);
+        left.get_or_insert_text("body")
+            .insert(&mut left.transact_mut(), 0, "left");
+        right
+            .get_or_insert_text("body")
+            .insert(&mut right.transact_mut(), 0, "right");
+        let left_update = left
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        let right_update = right
+            .transact()
+            .encode_state_as_update_v1(&StateVector::default());
+        let merged = Doc::new();
+        merged
+            .transact_mut()
+            .apply_update(Update::decode_v1(&left_update).unwrap())
+            .unwrap();
+        merged
+            .transact_mut()
+            .apply_update(Update::decode_v1(&right_update).unwrap())
+            .unwrap();
+        merged
+            .transact_mut()
+            .apply_update(Update::decode_v1(&left_update).unwrap())
+            .unwrap();
+        assert_eq!(
+            merged
+                .get_or_insert_text("body")
+                .get_string(&merged.transact())
+                .chars()
+                .count(),
+            9
+        );
     }
 }

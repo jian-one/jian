@@ -1,4 +1,4 @@
-export type Kind = 'codex' | 'hermes';
+export type Kind = 'codex' | 'hermes' | 'pi';
 export type Theme = 'console' | 'light' | 'black';
 
 export type LocalSession = {
@@ -14,9 +14,9 @@ export type LocalSession = {
 export type TerminalSession = { id: string };
 export type BrowseResult = { path: string; parent: string; entries: { name: string; directory: boolean }[] };
 export type EnvironmentVariable = { key: string; value: string };
-export type AgentSettings = { codex_bin: string; path: string; hermes_home: string; hermes_bin: string; hermes_profiles: string[]; local_profiles: string[]; codex_args: string[]; hermes_args: string[]; codex_env: EnvironmentVariable[]; hermes_env: EnvironmentVariable[]; local_enabled: boolean; codex_enabled: boolean; hermes_enabled: boolean; agent_toggles_set?: boolean };
-export type SettingsResponse = { settings: AgentSettings; available_profiles: string[] };
-export type TerminalStatus = { id: string; label: 'local' | 'codex' | 'hermes'; title: string; workspace: string; profile?: string; running: boolean; busy: boolean; subscribers: number };
+export type AgentSettings = { codex_bin: string; path: string; hermes_home: string; hermes_bin: string; hermes_profiles: string[]; pi_bin: string; pi_agents: string[]; pi_args: string[]; pi_env: EnvironmentVariable[]; local_profiles: string[]; codex_args: string[]; hermes_args: string[]; codex_env: EnvironmentVariable[]; hermes_env: EnvironmentVariable[]; local_enabled: boolean; codex_enabled: boolean; hermes_enabled: boolean; pi_enabled: boolean; agent_toggles_set?: boolean };
+export type SettingsResponse = { settings: AgentSettings; available_profiles: string[]; available_pi_agents: string[] };
+export type TerminalStatus = { id: string; label: 'local' | 'codex' | 'hermes' | 'pi'; title: string; workspace: string; profile?: string; running: boolean; busy: boolean; subscribers: number };
 export type TerminalStatusResponse = { active_pool: TerminalStatus[] };
 export type Session = {
   id: string;
@@ -41,18 +41,28 @@ export const activeLocalSessionKey = 'jian.active_local_session';
 export const themeKey = 'jian.theme';
 export const interfaceThemeKey = 'jian.interface_theme';
 export const terminalThemeKey = 'jian.terminal_theme';
+export const terminalFontSizeKey = 'jian.terminal_font_size';
+export const terminalFontSizeMin = 10;
+export const terminalFontSizeMax = 24;
+export const terminalFontSizeDefault = 15;
 export const activeSessionKey = (kind: Kind, profile?: string) => `jian.active_${kind}${kind === 'hermes' && profile ? `_${profile}` : ''}_session`;
 export const selectedSessionKey = (session: Pick<LocalSession, 'kind'> | Pick<Session, 'kind' | 'profile'>, fallbackProfile = 'default') => session.kind === 'local' ? activeLocalSessionKey : activeSessionKey(session.kind, session.profile || fallbackProfile);
 export const sessionCacheKey = (username: string, kind: Kind) => `jian.session_cache.${encodeURIComponent(username)}.${kind}`;
 export const navScrollKey = (kind: Kind, profile: string) => `jian.nav_scroll_${kind}_${profile}`;
 
-export const initialKind = (): Kind => localStorage.getItem(activeKindKey) === 'hermes' ? 'hermes' : 'codex';
+export const initialKind = (): Kind => ['codex', 'hermes', 'pi'].includes(localStorage.getItem(activeKindKey) || '') ? localStorage.getItem(activeKindKey) as Kind : 'codex';
 const readTheme = (key: string): Theme | null => {
   const value = localStorage.getItem(key);
   return value === 'light' || value === 'black' || value === 'console' ? value : null;
 };
 export const initialInterfaceTheme = (): Theme => readTheme(interfaceThemeKey) || readTheme(themeKey) || 'console';
 export const initialTheme = initialInterfaceTheme;
+export const clampTerminalFontSize = (value: number) => Math.min(terminalFontSizeMax, Math.max(terminalFontSizeMin, Math.round(value)));
+export const initialTerminalFontSize = () => {
+  const stored = localStorage.getItem(terminalFontSizeKey);
+  const value = stored === null ? NaN : Number(stored);
+  return Number.isFinite(value) ? clampTerminalFontSize(value) : terminalFontSizeDefault;
+};
 
 export const themeOptions: { id: Theme; label: string; description: string }[] = [
   { id: 'console', label: '默认主题', description: '深绿信号与低照度工作台' },

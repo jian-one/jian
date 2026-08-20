@@ -1,10 +1,11 @@
 use std::{
     collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Write},
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{Arc, Mutex, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
@@ -37,7 +38,7 @@ impl Runtime {
     }
 
     pub fn start_cache(self: &Arc<Self>) {
-        for kind in [AgentKind::Codex, AgentKind::Hermes] {
+        for kind in [AgentKind::Codex, AgentKind::Hermes, AgentKind::Pi] {
             let runtime = self.clone();
             tokio::spawn(async move {
                 loop {
@@ -106,6 +107,7 @@ impl Runtime {
         let native = match kind {
             AgentKind::Codex => self.codex_threads()?,
             AgentKind::Hermes => self.hermes_sessions()?,
+            AgentKind::Pi => vec![],
             AgentKind::Local => vec![],
         };
         let live = self.terminals.sessions(kind);
@@ -135,6 +137,7 @@ impl Runtime {
         let mut overrides = match session.kind {
             AgentKind::Codex => environment_overrides(&settings.codex_env),
             AgentKind::Hermes => environment_overrides(&settings.hermes_env),
+            AgentKind::Pi => environment_overrides(&settings.pi_env),
             AgentKind::Local => return Err(anyhow!("invalid agent")),
         };
         if session.kind == AgentKind::Hermes {
@@ -169,6 +172,11 @@ impl Runtime {
                 } else {
                     session.launch_args.clone()
                 });
+                args
+            }
+            AgentKind::Pi => {
+                let mut args = vec!["--agent".into(), normalize_profile(&session.profile)];
+                args.extend(preferred_args(&session.launch_args, &settings.pi_args));
                 args
             }
             AgentKind::Local => return Err(anyhow!("invalid agent")),
@@ -240,6 +248,23 @@ impl Runtime {
         out
     }
 
+    pub fn pi_agents(&self) -> Vec<String> {
+        let settings = self.settings();
+        if !settings.pi_agents.is_empty() {
+            return unique(settings.pi_agents);
+        }
+        let root = dirs_home().join(".pi/agents");
+        unique(
+            std::fs::read_dir(root)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        )
+    }
+
     pub fn rename_hermes(&self, session: &Session, title: &str) -> Result<()> {
         self.run_hermes(&[
             "-p",
@@ -268,12 +293,13 @@ impl Runtime {
                     &session.native_id,
                 ])?;
             }
+            AgentKind::Pi => {}
             AgentKind::Local => {}
         }
         Ok(())
     }
     pub fn history(&self, session: &Session) -> Result<Vec<Message>> {
-        if session.kind == AgentKind::Codex {
+        if matches!(session.kind, AgentKind::Codex | AgentKind::Pi) {
             return Ok(vec![]);
         }
         let out = self.run_hermes(&[
@@ -396,6 +422,7 @@ impl Runtime {
             stdin,
             stdout,
             next: 0,
+            timeout: Duration::from_secs(30),
         };
         app.call(
             "initialize",
@@ -473,6 +500,7 @@ impl Runtime {
         let vars = match kind {
             AgentKind::Codex => &settings.codex_env,
             AgentKind::Hermes => &settings.hermes_env,
+            AgentKind::Pi => &settings.pi_env,
             AgentKind::Local => unreachable!(),
         };
         let mut overrides = environment_overrides(vars);
@@ -504,6 +532,7 @@ impl Runtime {
         let value = match kind {
             AgentKind::Codex => settings.codex_bin,
             AgentKind::Hermes => settings.hermes_bin,
+            AgentKind::Pi => settings.pi_bin,
             AgentKind::Local => self.shell(),
         };
         resolve_binary(&value, kind.as_str())
@@ -522,6 +551,7 @@ struct AppServer {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next: u64,
+    timeout: Duration,
 }
 impl AppServer {
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -533,7 +563,31 @@ impl AppServer {
         )?;
         self.stdin.write_all(b"\n")?;
         self.stdin.flush()?;
+        let deadline = Instant::now() + self.timeout;
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!("Codex app-server request timed out"));
+            }
+            if self.stdout.buffer().is_empty() {
+                let mut pollfd = libc::pollfd {
+                    fd: self.stdout.get_ref().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let timeout = remaining.as_millis().min(i32::MAX as u128) as i32;
+                let ready = unsafe { libc::poll(&mut pollfd, 1, timeout.max(1)) };
+                if ready == 0 {
+                    return Err(anyhow!("Codex app-server request timed out"));
+                }
+                if ready < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(error.into());
+                }
+            }
             let mut line = String::new();
             if self.stdout.read_line(&mut line)? == 0 {
                 return Err(anyhow!("Codex app-server exited"));
@@ -777,9 +831,34 @@ fn command_with_profiles(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, os::unix::fs::PermissionsExt, thread};
+    use std::{fs, os::unix::fs::PermissionsExt, thread, time::Instant};
 
     use super::*;
+
+    #[test]
+    fn app_server_call_times_out_when_codex_stops_replying() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read request; sleep 2"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut app = AppServer {
+            child,
+            stdin,
+            stdout,
+            next: 0,
+            timeout: Duration::from_millis(100),
+        };
+
+        let started = Instant::now();
+        let error = app.call("thread/list", json!({})).unwrap_err();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+    }
 
     #[test]
     fn discovered_native_session_replaces_its_unbound_terminal_session() {
