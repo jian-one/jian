@@ -6,8 +6,11 @@ import { api, onSocketEvent } from '../../shared/api';
 
 type NoteState = { state: string };
 type NoteUpdate = { update?: string };
-const toBase64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
-const fromBase64 = (value: string) => Uint8Array.from(atob(value), char => char.charCodeAt(0));
+const toBase64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const fromBase64 = (value: string) => {
+  const standard = value.replace(/-/g, '+').replace(/_/g, '/');
+  return Uint8Array.from(atob(standard + '='.repeat((4 - standard.length % 4) % 4)), char => char.charCodeAt(0));
+};
 const cacheKey = (username: string) => `jian.quick-note.${username}`;
 
 function replaceText(node: HTMLTextAreaElement, next: string) {

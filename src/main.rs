@@ -28,7 +28,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use bcrypt::{DEFAULT_COST, hash, verify};
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
@@ -468,6 +471,12 @@ fn save_quick_note(store: &Store, username: &str, update: Vec<u8>) -> QuickNoteR
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))
 }
 
+fn decode_quick_note_update(value: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .or_else(|_| STANDARD.decode(value))
+}
+
 async fn quick_note(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
     let username = require(&state, &headers)?;
     match state.quick_notes.get(username).await {
@@ -482,7 +491,7 @@ async fn put_quick_note(
     Json(input): Json<QuickNoteUpdate>,
 ) -> Api {
     let username = require(&state, &headers)?;
-    let update = match URL_SAFE_NO_PAD.decode(&input.update) {
+    let update = match decode_quick_note_update(&input.update) {
         Ok(update) if update.len() <= QUICK_NOTE_STATE_LIMIT => update,
         Ok(_) => {
             return fail(
@@ -497,12 +506,13 @@ async fn put_quick_note(
             );
         }
     };
+    let broadcast_update = URL_SAFE_NO_PAD.encode(&update);
     if let Err((status, error)) = state.quick_notes.put(username.clone(), update).await {
         return fail(status, error);
     }
     let _ = state.quick_note_updates.send(QuickNoteEvent {
         username,
-        update: input.update,
+        update: broadcast_update,
     });
     no_content()
 }
@@ -699,6 +709,7 @@ async fn release_terminal(
     AxumPath(id): AxumPath<String>,
 ) -> Api {
     require(&state, &headers)?;
+    state.locals.write().unwrap().remove(&id);
     if let Err(e) = state.runtime.terminals.stop(&id) {
         return fail(StatusCode::NOT_FOUND, e);
     }
@@ -717,6 +728,7 @@ async fn restart_terminal(
 }
 async fn release_all(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
     require(&state, &headers)?;
+    state.locals.write().unwrap().clear();
     if let Err(e) = state.runtime.terminals.stop_all() {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
@@ -1680,6 +1692,19 @@ mod cli_tests {
                 .chars()
                 .count(),
             9
+        );
+    }
+
+    #[test]
+    fn quick_note_update_accepts_standard_and_urlsafe_base64() {
+        let bytes = [1, 2, 3, 4];
+        assert_eq!(
+            decode_quick_note_update(&STANDARD.encode(bytes)).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            decode_quick_note_update(&URL_SAFE_NO_PAD.encode(bytes)).unwrap(),
+            bytes
         );
     }
 }
