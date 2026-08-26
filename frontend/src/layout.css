@@ -61,6 +61,11 @@
     overflow: hidden;
   }
 
+  .workspace-view {
+    width: 100%;
+    height: var(--mobile-viewport-height, 100dvh);
+  }
+
   .mobile-nav-toggle {
     position: fixed;
     z-index: 22;
@@ -113,7 +118,7 @@
   .conversation {
     width: 100%;
     min-width: 0;
-    height: var(--mobile-viewport-height, 100dvh);
+    height: auto;
   }
 
   .conversation > header {
@@ -162,7 +167,7 @@
   .settings-page {
     display: block;
     width: 100%;
-    height: var(--mobile-viewport-height, 100dvh);
+    height: auto;
     overflow: auto;
   }
 

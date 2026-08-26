@@ -770,6 +770,21 @@ async fn agent_create(
     if input.workspace.is_empty() {
         return fail(StatusCode::BAD_REQUEST, "workspace is required");
     }
+    if kind == AgentKind::Pi {
+        let profile = if input.profile.trim().is_empty() {
+            "default"
+        } else {
+            input.profile.trim()
+        };
+        if !state.runtime.pi_agents().iter().any(|name| name == profile) {
+            return fail(StatusCode::BAD_REQUEST, "Pi 角色不存在");
+        }
+        if let Some(fixed) = state.runtime.pi_workspace(profile) {
+            if expand_path(&input.workspace) != fixed {
+                return fail(StatusCode::BAD_REQUEST, "Pi 角色只能使用其角色目录");
+            }
+        }
+    }
     if !state.runtime.available(kind) {
         return fail(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -782,7 +797,7 @@ async fn agent_create(
             },
         );
     }
-    let workspace = match std::path::absolute(&input.workspace) {
+    let workspace = match std::path::absolute(expand_path(&input.workspace)) {
         Ok(v) => v,
         Err(_) => return fail(StatusCode::BAD_REQUEST, "invalid workspace"),
     };

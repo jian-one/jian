@@ -1,5 +1,9 @@
 # Jian
 
+Code navigation in this repository starts with `codegraph_codegraph_explore` (a
+`.codegraph/` index is present): pass a question or symbol names, treat the
+returned source as already read, and use text search only to fill gaps.
+
 ## Project purpose
 
 Jian is a same-origin, cookie-authenticated browser workspace for local Bash,

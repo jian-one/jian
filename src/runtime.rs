@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     io::{BufRead, BufReader, Write},
     os::fd::AsRawFd,
     path::{Path, PathBuf},
@@ -107,7 +108,14 @@ impl Runtime {
         let native = match kind {
             AgentKind::Codex => self.codex_threads()?,
             AgentKind::Hermes => self.hermes_sessions()?,
-            AgentKind::Pi => vec![],
+            AgentKind::Pi => self
+                .pi_agents()
+                .into_iter()
+                .map(|profile| self.pi_sessions(&profile))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
             AgentKind::Local => vec![],
         };
         let live = self.terminals.sessions(kind);
@@ -133,7 +141,11 @@ impl Runtime {
 
     pub fn start_agent(&self, mut session: Session) -> Result<()> {
         let settings = self.settings();
-        let binary = self.binary(session.kind)?;
+        let binary = if session.kind == AgentKind::Pi {
+            self.pi_entry(&session.profile)?
+        } else {
+            self.binary(session.kind)?
+        };
         let mut overrides = match session.kind {
             AgentKind::Codex => environment_overrides(&settings.codex_env),
             AgentKind::Hermes => environment_overrides(&settings.hermes_env),
@@ -174,12 +186,15 @@ impl Runtime {
                 });
                 args
             }
-            AgentKind::Pi => {
-                let mut args = vec!["--agent".into(), normalize_profile(&session.profile)];
-                args.extend(preferred_args(&session.launch_args, &settings.pi_args));
-                args
-            }
+            AgentKind::Pi => preferred_args(&session.launch_args, &settings.pi_args),
             AgentKind::Local => return Err(anyhow!("invalid agent")),
+        };
+        let args = if session.kind == AgentKind::Pi && !session.native_id.is_empty() {
+            let mut resume = vec!["--session".into(), session.native_id.clone()];
+            resume.extend(args);
+            resume
+        } else {
+            args
         };
         let env = merge_environment(local_environment(), &overrides);
         let mut command = vec![binary.to_string_lossy().into_owned()];
@@ -249,12 +264,9 @@ impl Runtime {
     }
 
     pub fn pi_agents(&self) -> Vec<String> {
-        let settings = self.settings();
-        if !settings.pi_agents.is_empty() {
-            return unique(settings.pi_agents);
-        }
         let root = dirs_home().join(".pi/agents");
-        unique(
+        let mut agents = vec!["default".into()];
+        agents.extend(
             std::fs::read_dir(root)
                 .into_iter()
                 .flatten()
@@ -262,7 +274,56 @@ impl Runtime {
                 .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
                 .map(|entry| entry.file_name().to_string_lossy().into_owned())
                 .collect::<Vec<_>>(),
-        )
+        );
+        unique(agents)
+    }
+
+    fn pi_sessions(&self, profile: &str) -> Result<Vec<Session>> {
+        let root = if profile == "default" {
+            dirs_home().join(".pi/agent/sessions")
+        } else {
+            dirs_home()
+                .join(".pi/agents")
+                .join(profile)
+                .join("sessions")
+        };
+        let mut files = Vec::new();
+        collect_pi_session_files(&root, profile == "default", &mut files);
+        files.sort_by_key(|path| {
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        });
+        files
+            .into_iter()
+            .map(|path| parse_pi_session(&path, profile))
+            .collect::<Result<Vec<_>>>()
+            .map(|rows| rows.into_iter().flatten().collect())
+    }
+
+    pub fn pi_workspace(&self, profile: &str) -> Option<PathBuf> {
+        (normalize_profile(profile) != "default")
+            .then(|| dirs_home().join(".pi/agents").join(profile))
+    }
+
+    fn pi_entry(&self, profile: &str) -> Result<PathBuf> {
+        let profile = normalize_profile(profile);
+        let path = if profile == "default" {
+            let agent = dirs_home().join(".pi/agent/pi-agent");
+            if agent.is_file() {
+                agent
+            } else {
+                dirs_home().join(".pi/agent/pi-default")
+            }
+        } else {
+            dirs_home()
+                .join(".pi/agents")
+                .join(&profile)
+                .join(format!("pi-{profile}"))
+        };
+        path.is_file()
+            .then_some(path)
+            .ok_or_else(|| anyhow!("Pi role entry unavailable: {profile}"))
     }
 
     pub fn rename_hermes(&self, session: &Session, title: &str) -> Result<()> {
@@ -528,11 +589,14 @@ impl Runtime {
         Ok(output.stdout)
     }
     fn binary(&self, kind: AgentKind) -> Result<PathBuf> {
+        if kind == AgentKind::Pi {
+            return self.pi_entry("default");
+        }
         let settings = self.settings();
         let value = match kind {
             AgentKind::Codex => settings.codex_bin,
             AgentKind::Hermes => settings.hermes_bin,
-            AgentKind::Pi => settings.pi_bin,
+            AgentKind::Pi => unreachable!(),
             AgentKind::Local => self.shell(),
         };
         resolve_binary(&value, kind.as_str())
@@ -716,6 +780,85 @@ fn normalize_profile(value: &str) -> String {
     } else {
         value.trim().into()
     }
+}
+
+fn collect_pi_session_files(root: &Path, recurse: bool, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
+            files.push(path);
+        } else if recurse && path.is_dir() {
+            collect_pi_session_files(&path, true, files);
+        }
+    }
+}
+
+fn parse_pi_session(path: &Path, profile: &str) -> Result<Option<Session>> {
+    let text = fs::read_to_string(path)?;
+    let mut lines = text.lines();
+    let Some(first) = lines.next() else {
+        return Ok(None);
+    };
+    let header: Value = serde_json::from_str(first)?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return Ok(None);
+    }
+    let native_id = header.get("id").and_then(Value::as_str).unwrap_or_default();
+    let workspace = header
+        .get("cwd")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if native_id.is_empty() || workspace.is_empty() {
+        return Ok(None);
+    }
+    let mut title = String::new();
+    let mut updated_at = json_time(header.get("timestamp"));
+    for line in lines {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        updated_at = value
+            .get("timestamp")
+            .map(|timestamp| json_time(Some(timestamp)))
+            .filter(|time| *time > updated_at)
+            .unwrap_or(updated_at);
+        if title.is_empty()
+            && value.get("type").and_then(Value::as_str) == Some("message")
+            && value
+                .get("message")
+                .and_then(|message| message.get("role"))
+                .and_then(Value::as_str)
+                == Some("user")
+        {
+            title = value
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+    }
+    Ok(Some(Session {
+        id: format!("native-pi-{profile}-{native_id}"),
+        kind: AgentKind::Pi,
+        native_id: path.to_string_lossy().into_owned(),
+        profile: profile.into(),
+        src: String::new(),
+        channel: String::new(),
+        workspace: workspace.into(),
+        yolo: false,
+        launch_args: vec![],
+        title: title.trim().chars().take(80).collect::<String>(),
+        status: "ended".into(),
+        created_at: json_time(header.get("timestamp")),
+        updated_at,
+    }))
 }
 fn unique(values: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
