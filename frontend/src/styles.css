@@ -1276,33 +1276,11 @@ input:focus-visible,
 }
 
 .workspace-view > .conversation,
-.workspace-view > .settings-page {
+.conversation > .settings-page {
   flex: 1;
   min-height: 0;
 }
 
-.workspace-view-tabs {
-  display: flex;
-  flex: none;
-  gap: 2px;
-  padding: 8px 18px 0;
-  background: var(--header);
-  border-bottom: 1px solid var(--line);
-}
-
-.workspace-view-tab {
-  padding: 8px 14px 9px;
-  color: var(--muted);
-  background: transparent;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.workspace-view-tab:hover,
-.workspace-view-tab[data-state="active"] { color: var(--ink); }
-.workspace-view-tab[data-state="active"] { border-bottom-color: var(--signal); font-weight: 650; }
 
 .context-bar {
   display: flex;

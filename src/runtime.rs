@@ -337,6 +337,21 @@ impl Runtime {
         ])
         .map(|_| ())
     }
+    pub fn rename_pi(&self, session: &Session, title: &str) -> Result<()> {
+        let content = fs::read_to_string(&session.native_id)?;
+        let mut lines = content.lines();
+        let header = lines.next().ok_or_else(|| anyhow!("empty Pi session"))?;
+        let mut value: serde_json::Value = serde_json::from_str(header)?;
+        value["name"] = serde_json::Value::String(title.into());
+        let mut updated = serde_json::to_string(&value)?;
+        updated.push('\n');
+        updated.push_str(&lines.collect::<Vec<_>>().join("\n"));
+        if content.ends_with('\n') {
+            updated.push('\n');
+        }
+        fs::write(&session.native_id, updated)?;
+        Ok(())
+    }
     pub fn delete_native(&self, session: &Session) -> Result<()> {
         if session.native_id.is_empty() {
             return Ok(());
@@ -354,7 +369,7 @@ impl Runtime {
                     &session.native_id,
                 ])?;
             }
-            AgentKind::Pi => {}
+            AgentKind::Pi => fs::remove_file(&session.native_id)?,
             AgentKind::Local => {}
         }
         Ok(())

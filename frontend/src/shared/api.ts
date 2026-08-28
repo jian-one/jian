@@ -7,6 +7,7 @@ let connecting: Promise<void> | null = null;
 let reconnectTimer = 0;
 let reconnectDelay = 1000;
 let heartbeatTimer = 0;
+let authRefreshTimer = 0;
 let pongTimer = 0;
 let nextID = 1;
 let keepAlive = false;
@@ -36,8 +37,9 @@ const wsURL = () => `${location.protocol === 'https:' ? 'wss' : 'ws'}://${locati
 
 function stopHeartbeat() {
   window.clearInterval(heartbeatTimer);
+  window.clearInterval(authRefreshTimer);
   window.clearTimeout(pongTimer);
-  heartbeatTimer = pongTimer = 0;
+  heartbeatTimer = authRefreshTimer = pongTimer = 0;
 }
 
 function scheduleReconnect() {
@@ -67,6 +69,11 @@ function connect(): Promise<void> {
         ws.send(JSON.stringify({ type: 'ping' }));
         pongTimer = window.setTimeout(() => ws.close(), 10000);
       }, 15000);
+      authRefreshTimer = window.setInterval(() => {
+        void authRequest<{ authenticated: boolean }>('/auth/status', { method: 'GET' })
+          .then(status => { if (!status.authenticated) ws.close(); })
+          .catch(() => ws.close());
+      }, 15 * 60 * 1000);
       resolve();
     };
     ws.onmessage = event => {

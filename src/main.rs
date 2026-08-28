@@ -49,6 +49,7 @@ use crate::{
 };
 
 const COOKIE: &str = "jian_session";
+const SESSION_TTL_SECS: i64 = 24 * 60 * 60;
 const QUICK_NOTE_STATE_LIMIT: usize = 1024 * 1024;
 const QUICK_NOTE_TEXT_LIMIT: usize = 100_000;
 
@@ -317,8 +318,14 @@ fn cookie(headers: &HeaderMap) -> Option<String> {
 }
 fn current(state: &AppState, headers: &HeaderMap) -> Option<String> {
     let token = cookie(headers)?;
-    let session: AuthSession = state.store.get("auth_sessions", &token_hash(&token)).ok()?;
-    (session.expires > chrono::Utc::now()).then_some(session.username)
+    let key = token_hash(&token);
+    let mut session: AuthSession = state.store.get("auth_sessions", &key).ok()?;
+    if session.expires <= chrono::Utc::now() {
+        return None;
+    }
+    session.expires = chrono::Utc::now() + chrono::Duration::seconds(SESSION_TTL_SECS);
+    state.store.put("auth_sessions", &key, &session).ok()?;
+    Some(session.username)
 }
 fn require(state: &AppState, headers: &HeaderMap) -> std::result::Result<String, Response> {
     current(state, headers).ok_or_else(|| {
@@ -367,7 +374,7 @@ async fn login(
     let token = URL_SAFE_NO_PAD.encode(raw);
     let session = AuthSession {
         username: input.username.clone(),
-        expires: chrono::Utc::now() + chrono::Duration::hours(24),
+        expires: chrono::Utc::now() + chrono::Duration::seconds(SESSION_TTL_SECS),
     };
     if let Err(e) = state
         .store
@@ -386,7 +393,7 @@ async fn login(
     let mut rsp = response(StatusCode::OK, json!({"username": input.username}));
     rsp.headers_mut().insert(
         header::SET_COOKIE,
-        set_cookie(&token, state.secure_cookie, 86400),
+        set_cookie(&token, state.secure_cookie, SESSION_TTL_SECS as i32),
     );
     Ok(rsp)
 }
@@ -401,7 +408,19 @@ async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
 }
 async fn auth_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
     match current(&state, &headers) {
-        Some(username) => ok(json!({"authenticated":true,"username":username})),
+        Some(username) => {
+            let mut response = response(
+                StatusCode::OK,
+                json!({"authenticated":true,"username":username}),
+            );
+            if let Some(token) = cookie(&headers) {
+                response.headers_mut().insert(
+                    header::SET_COOKIE,
+                    set_cookie(&token, state.secure_cookie, SESSION_TTL_SECS as i32),
+                );
+            }
+            Ok(response)
+        }
         None => ok(json!({"authenticated":false})),
     }
 }
@@ -852,7 +871,7 @@ async fn agent_rename(
     input: Rename,
 ) -> Api {
     require(state, headers)?;
-    if kind != AgentKind::Hermes {
+    if kind == AgentKind::Codex {
         return fail(StatusCode::CONFLICT, "Codex 原生会话不支持重命名");
     }
     if input.title.trim().is_empty() {
@@ -862,7 +881,12 @@ async fn agent_rename(
         Ok(v) => v,
         Err(_) => return fail(StatusCode::NOT_FOUND, "session not found"),
     };
-    if let Err(e) = state.runtime.rename_hermes(&session, input.title.trim()) {
+    let result = if kind == AgentKind::Pi {
+        state.runtime.rename_pi(&session, input.title.trim())
+    } else {
+        state.runtime.rename_hermes(&session, input.title.trim())
+    };
+    if let Err(e) = result {
         return fail(StatusCode::BAD_GATEWAY, e);
     }
     session.title = input.title.trim().into();
@@ -1062,8 +1086,9 @@ async fn session_terminal(
             return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
         }
     }
+    let auth_headers = headers.clone();
     Ok(ws
-        .on_upgrade(move |socket| terminal_socket(socket, state.runtime.clone(), id))
+        .on_upgrade(move |socket| terminal_socket(socket, state, auth_headers, id))
         .into_response())
 }
 fn find_terminal_session(state: &AppState, kind: AgentKind, id: &str) -> Option<Session> {
@@ -1105,9 +1130,18 @@ async fn api_websocket(
 ) -> Api {
     let username = require(&state, &headers)?;
     same_origin(&headers)?;
-    Ok(ws
+    let token = cookie(&headers);
+    let secure_cookie = state.secure_cookie;
+    let mut response = ws
         .on_upgrade(move |socket| api_socket(socket, state, headers, username))
-        .into_response())
+        .into_response();
+    if let Some(token) = token {
+        response.headers_mut().insert(
+            header::SET_COOKIE,
+            set_cookie(&token, secure_cookie, SESSION_TTL_SECS as i32),
+        );
+    }
+    Ok(response)
 }
 
 async fn api_socket(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap, username: String) {
@@ -1154,6 +1188,7 @@ async fn api_socket(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap,
             continue;
         };
         if value.get("type").and_then(Value::as_str) == Some("ping") {
+            let _ = current(&state, &headers);
             let _ = outgoing
                 .send(WsMessage::Text(json!({"type":"pong"}).to_string().into()))
                 .await;
@@ -1224,8 +1259,8 @@ fn rpc_target(method: &str, path: &str) -> std::result::Result<(Method, Uri), &'
     Ok((method, uri))
 }
 
-async fn terminal_socket(socket: WebSocket, runtime: Arc<Runtime>, id: String) {
-    let Ok((buffer, mut events, _guard)) = runtime.terminals.subscribe(&id) else {
+async fn terminal_socket(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap, id: String) {
+    let Ok((buffer, mut events, _guard)) = state.runtime.terminals.subscribe(&id) else {
         return;
     };
     let (mut sender, mut receiver) = socket.split();
@@ -1261,7 +1296,19 @@ async fn terminal_socket(socket: WebSocket, runtime: Arc<Runtime>, id: String) {
                     match value.get("type").and_then(Value::as_str) {
                         Some("input") => {
                             if let Some(data) = value.get("data").and_then(Value::as_str) {
-                                let _ = runtime.terminals.send(&id, data);
+                                let _ = state.runtime.terminals.send(&id, data);
+                            }
+                        }
+                        Some("attachment") => {
+                            let Some(data) = value.get("data").and_then(Value::as_str) else { continue };
+                            if data.len() > 16 * 1024 * 1024 { continue; }
+                            let Ok(bytes) = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data) else { continue };
+                            let extension = value.get("name").and_then(Value::as_str).and_then(|name| std::path::Path::new(name).extension()).and_then(|ext| ext.to_str()).filter(|ext| ext.len() <= 10).unwrap_or("bin");
+                            let directory = std::env::temp_dir().join("jian-attachments");
+                            if std::fs::create_dir_all(&directory).is_err() { continue; }
+                            let path = directory.join(format!("{}.{}", uuid::Uuid::new_v4(), extension));
+                            if std::fs::write(&path, bytes).is_ok() {
+                                let _ = state.runtime.terminals.send(&id, &format!("{} ", path.display()));
                             }
                         }
                         Some("resize") => {
@@ -1269,14 +1316,17 @@ async fn terminal_socket(socket: WebSocket, runtime: Arc<Runtime>, id: String) {
                                 value.get("cols").and_then(Value::as_u64).and_then(|v| u16::try_from(v).ok()),
                                 value.get("rows").and_then(Value::as_u64).and_then(|v| u16::try_from(v).ok()),
                             ) {
-                                let _ = runtime.terminals.resize(&id, cols, rows);
+                                let _ = state.runtime.terminals.resize(&id, cols, rows);
                             }
                         }
-                        Some("interrupt") => { let _ = runtime.terminals.send(&id, "\x03"); }
-                        Some("ping") => match sender.send(WsMessage::Text(json!({"type":"pong"}).to_string().into())).await {
+                        Some("interrupt") => { let _ = state.runtime.terminals.send(&id, "\x03"); }
+                        Some("ping") => {
+                            let _ = current(&state, &headers);
+                            match sender.send(WsMessage::Text(json!({"type":"pong"}).to_string().into())).await {
                             Ok(()) => {}
                             Err(_) => break,
-                        },
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1627,6 +1677,50 @@ mod cli_tests {
             HeaderValue::from_static("https://example.com"),
         );
         assert!(same_origin(&headers).is_err());
+    }
+
+    #[test]
+    fn active_auth_session_slides_forward() {
+        let root = std::env::temp_dir().join(format!("jian-auth-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(root.join("jian.db")).unwrap();
+        let token = "test-token";
+        let before = chrono::Utc::now() + chrono::Duration::hours(1);
+        store
+            .put(
+                "auth_sessions",
+                &token_hash(token),
+                &AuthSession {
+                    username: "admin".into(),
+                    expires: before,
+                },
+            )
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("jian_session=test-token"),
+        );
+        let state = AppState {
+            store: Arc::new(store),
+            runtime: Runtime::new(AgentSettings::default()),
+            locals: RwLock::new(HashMap::new()),
+            attempts: Mutex::new(HashMap::new()),
+            quick_notes: QuickNoteWorker::start(Arc::new(
+                Store::open(root.join("notes.db")).unwrap(),
+            ))
+            .unwrap(),
+            quick_note_updates: broadcast::channel(1).0,
+            secure_cookie: false,
+        };
+
+        assert_eq!(current(&state, &headers).as_deref(), Some("admin"));
+        let refreshed: AuthSession = state
+            .store
+            .get("auth_sessions", &token_hash(token))
+            .unwrap();
+        assert!(refreshed.expires > before);
+        drop(state);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
