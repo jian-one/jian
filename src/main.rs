@@ -558,8 +558,10 @@ fn merged_settings(state: &AppState, username: &str) -> AgentSettings {
         defaults.hermes_args = saved.hermes_args;
         defaults.codex_env = saved.codex_env;
         defaults.hermes_env = saved.hermes_env;
-        defaults.pi_bin = saved.pi_bin;
-        defaults.pi_agents = saved.pi_agents;
+        if !saved.pi_default.is_empty() {
+            defaults.pi_default = saved.pi_default;
+        }
+        defaults.pi_roles = saved.pi_roles;
         defaults.pi_args = saved.pi_args;
         defaults.pi_env = saved.pi_env;
         if saved.agent_toggles_set {
@@ -577,9 +579,6 @@ fn settings_view(state: &AppState, username: &str) -> (AgentSettings, Vec<String
     let mut settings = merged_settings(state, username);
     if settings.hermes_profiles.is_empty() {
         settings.hermes_profiles = available.clone();
-    }
-    if settings.pi_agents.is_empty() {
-        settings.pi_agents = state.runtime.pi_agents();
     }
     (settings, available)
 }
@@ -600,7 +599,7 @@ async fn save_settings(
     input.codex_bin = input.codex_bin.trim().to_string();
     input.hermes_bin = input.hermes_bin.trim().to_string();
     input.hermes_home = input.hermes_home.trim().to_string();
-    input.pi_bin = input.pi_bin.trim().to_string();
+    input.pi_default = input.pi_default.trim().to_string();
     if input.codex_bin.is_empty() {
         input.codex_bin = current.codex_bin
     }
@@ -610,15 +609,35 @@ async fn save_settings(
     if input.hermes_home.is_empty() {
         input.hermes_home = current.hermes_home
     }
-    if input.pi_bin.is_empty() {
-        input.pi_bin = current.pi_bin
+    if input.pi_default.is_empty() {
+        input.pi_default = current.pi_default
     }
     input.path = std::env::var("PATH").unwrap_or_default();
     input.local_enabled = true;
     input.agent_toggles_set = true;
     input.local_profiles = normalize_profiles(&input.local_profiles);
     input.hermes_profiles = normalize_profiles(&input.hermes_profiles);
-    input.pi_agents = normalize_profiles(&input.pi_agents);
+    let mut role_names = std::collections::HashSet::new();
+    if input.pi_roles.iter().any(|role| {
+        role.name.trim().is_empty()
+            || role.entry.trim().is_empty()
+            || role.home.trim().is_empty()
+            || role.name.trim() == "default"
+    }) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "Pi 角色的名称、入口路径和主目录均为必填",
+        );
+    }
+    for role in &mut input.pi_roles {
+        role.name = role.name.trim().to_string();
+        role.entry = role.entry.trim().to_string();
+        role.home = role.home.trim().to_string();
+        role_names.insert(role.name.clone());
+    }
+    if role_names.len() != input.pi_roles.len() {
+        return fail(StatusCode::BAD_REQUEST, "Pi 角色名称不能重复");
+    }
     input.codex_args = clean_args(&input.codex_args);
     input.hermes_args = clean_args(&input.hermes_args);
     input.pi_args = clean_args(&input.pi_args);
@@ -831,7 +850,7 @@ async fn agent_create(
     );
     session.profile = input.profile;
     session.yolo = input.yolo;
-    let mut settings = merged_settings(state, &username);
+    let settings = merged_settings(state, &username);
     session.launch_args = input.launch_args.unwrap_or_else(|| {
         if kind == AgentKind::Codex {
             settings.codex_args.clone()
@@ -842,14 +861,6 @@ async fn agent_create(
     if let Err(e) = state.runtime.start_agent(session.clone()) {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
-    if kind == AgentKind::Codex {
-        settings.codex_args = session.launch_args.clone()
-    } else if kind == AgentKind::Hermes {
-        settings.hermes_args = session.launch_args.clone()
-    } else {
-        settings.pi_args = session.launch_args.clone()
-    }
-    let _ = state.store.save_settings(&username, &settings);
     Ok((StatusCode::CREATED, Json(session)).into_response())
 }
 async fn agent_get(state: &Arc<AppState>, headers: &HeaderMap, kind: AgentKind, id: &str) -> Api {
@@ -1275,6 +1286,13 @@ async fn terminal_socket(socket: WebSocket, state: Arc<AppState>, headers: Heade
     }
     let _ = sender
         .send(WsMessage::Text(
+            json!({"session_id":id,"seq":0,"type":"session.replay.complete","payload":{}})
+                .to_string()
+                .into(),
+        ))
+        .await;
+    let _ = sender
+        .send(WsMessage::Text(
             json!({"session_id":id,"seq":0,"type":"session.started","payload":{"running":true}})
                 .to_string()
                 .into(),
@@ -1653,6 +1671,17 @@ mod cli_tests {
         assert_eq!(canonical_command("rs"), "restart");
         assert_eq!(canonical_command("st"), "status");
         assert!(STATUS_ARGS.contains(&"--no-pager"));
+    }
+
+    #[test]
+    fn terminal_socket_replay_events_precede_session_start() {
+        let source = include_str!("main.rs");
+        let output = source.find(r#"\"type\":\"pty.output"#).unwrap();
+        let complete = source
+            .find(r#"\"type\":\"session.replay.complete"#)
+            .unwrap();
+        let started = source.find(r#"\"type\":\"session.started"#).unwrap();
+        assert!(output < complete && complete < started);
     }
 
     #[test]

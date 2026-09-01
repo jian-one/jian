@@ -14,7 +14,8 @@ export type LocalSession = {
 export type TerminalSession = { id: string };
 export type BrowseResult = { path: string; parent: string; entries: { name: string; directory: boolean }[] };
 export type EnvironmentVariable = { key: string; value: string };
-export type AgentSettings = { codex_bin: string; path: string; hermes_home: string; hermes_bin: string; hermes_profiles: string[]; pi_bin: string; pi_agents: string[]; pi_args: string[]; pi_env: EnvironmentVariable[]; local_profiles: string[]; codex_args: string[]; hermes_args: string[]; codex_env: EnvironmentVariable[]; hermes_env: EnvironmentVariable[]; local_enabled: boolean; codex_enabled: boolean; hermes_enabled: boolean; pi_enabled: boolean; agent_toggles_set?: boolean };
+export type PiRole = { name: string; entry: string; home: string };
+export type AgentSettings = { codex_bin: string; path: string; hermes_home: string; hermes_bin: string; hermes_profiles: string[]; pi_default: string; pi_roles: PiRole[]; pi_args: string[]; pi_env: EnvironmentVariable[]; local_profiles: string[]; codex_args: string[]; hermes_args: string[]; codex_env: EnvironmentVariable[]; hermes_env: EnvironmentVariable[]; local_enabled: boolean; codex_enabled: boolean; hermes_enabled: boolean; pi_enabled: boolean; agent_toggles_set?: boolean };
 export type SettingsResponse = { settings: AgentSettings; available_profiles: string[]; available_pi_agents: string[] };
 export type TerminalStatus = { id: string; label: 'local' | 'codex' | 'hermes' | 'pi'; title: string; workspace: string; profile?: string; running: boolean; busy: boolean; subscribers: number };
 export type TerminalStatusResponse = { active_pool: TerminalStatus[] };
@@ -78,7 +79,11 @@ export const displayTitle = (session?: { title?: string } | null) => {
 };
 export const rawChannel = (session?: { src?: string; source?: string; channel?: string; kind?: string } | null) => (session?.src || session?.source || session?.channel || (session?.kind === 'codex' ? 'codex' : '')).trim();
 export const displayChannel = (session?: Session | null) => `通道：${channelNames[rawChannel(session).toLowerCase()] || rawChannel(session) || '未标注'}`;
-export const displayWorkspace = (session?: { workspace?: string } | null) => `工作目录：${session?.workspace?.trim() || '未知工作区'}`;
+export const displayWorkspacePath = (workspace?: string) => {
+  const value = workspace?.trim() || '';
+  return value === '/home/gaofei' ? '~' : value.startsWith('/home/gaofei/') ? `~${value.slice('/home/gaofei'.length)}` : value;
+};
+export const displayWorkspace = (session?: { workspace?: string } | null) => `工作目录：${displayWorkspacePath(session?.workspace) || '未知工作区'}`;
 export const sessionTime = (session: Session) => Date.parse(session.updated_at || session.created_at || '') || 0;
 export const byLastActiveDesc = (a: Session, b: Session) => sessionTime(b) - sessionTime(a);
 export const activeView = (session: Session): Session => ({ ...session, title: displayTitle(session) });

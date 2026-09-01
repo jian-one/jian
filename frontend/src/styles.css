@@ -2194,6 +2194,32 @@ input:focus-visible,
   border-radius: 6px;
 }
 
+.workspace-hidden-files {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 20px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.workspace-hidden-files button {
+  display: grid;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  color: var(--on-signal);
+  background: var(--input);
+  border: 1px solid var(--line-strong);
+  border-radius: 4px;
+  place-items: center;
+}
+
+.workspace-hidden-files button[data-state="checked"] {
+  background: var(--signal);
+  border-color: var(--signal);
+}
+
 .directory-list {
   flex: 1;
   /* Let the fixed-height picker give space back to the launch controls on

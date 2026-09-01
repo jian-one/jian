@@ -13,7 +13,8 @@ export const normalizeAgentSettings = (settings: AgentSettings): AgentSettings =
   hermes_env: settings.hermes_env || [],
   pi_args: settings.pi_args || [],
   pi_env: settings.pi_env || [],
-  pi_agents: settings.pi_agents || [],
+  pi_default: settings.pi_default || '',
+  pi_roles: settings.pi_roles || [],
   hermes_profiles: settings.hermes_profiles || [],
 });
 

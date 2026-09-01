@@ -18,7 +18,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { Collapsible, Tabs } from "radix-ui";
+import { Checkbox, Collapsible, Tabs } from "radix-ui";
 import { QuickNote } from "./features/quick-note/QuickNote";
 import {
   beginSessionLoad,
@@ -449,12 +449,14 @@ function WorkspacePicker({
     [manual, setManual] = useState("~"),
     [launchArgs, setLaunchArgs] = useState<string[]>([]),
     [loading, setLoading] = useState(false),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [showHidden, setShowHidden] = useState(false);
   const launchArgumentRefs = useRef<(HTMLInputElement | null)[]>([]);
   const browseVersion = useRef<SessionLoadVersion>({ current: 0 });
   const dialogRef = useRef<HTMLElement>(null);
   useDialogFocus(close, dialogRef);
   const recent = recentWorkspaces(sessions);
+  const visibleEntries = entries.filter((entry) => showHidden || !entry.name.startsWith("."));
   const browse = async (path: string) => {
     const version = beginSessionLoad(browseVersion.current);
     setLoading(true);
@@ -570,11 +572,17 @@ function WorkspacePicker({
           />
           <button type="submit">前往</button>
         </form>
+        <label className="workspace-hidden-files" htmlFor="show-hidden-files">
+          <Checkbox.Root id="show-hidden-files" checked={showHidden} onCheckedChange={(checked) => setShowHidden(checked === true)}>
+            <Checkbox.Indicator>✓</Checkbox.Indicator>
+          </Checkbox.Root>
+          显示隐藏文件
+        </label>
         <div className="directory-list">
           {loading ? (
             <p className="muted">正在读取目录…</p>
-          ) : entries.length ? (
-            entries.map((x) => (
+          ) : visibleEntries.length ? (
+            visibleEntries.map((x) => (
               <button key={x.name} onClick={() => enter(x.name)}>
                 <FolderOpen />
                 <span>{x.name}</span>
@@ -993,6 +1001,7 @@ function AgentTerminal({
 }
 
 type OpenSession = Session | LocalSession;
+const settingsTabKey = "jian.settings-tab-open";
 
 const openSessionKey = (session: OpenSession) =>
   `${session.kind}:${session.kind === "hermes" || session.kind === "pi" ? `${session.profile || "default"}:` : ""}${session.id}`;
@@ -1003,6 +1012,8 @@ const openSessionLabel = (session: OpenSession) =>
     ? "Local"
     : session.kind === "hermes"
       ? "Hermes"
+      : session.kind === "pi"
+        ? "Pi"
       : "Codex";
 const readSessionCache = (username: string, kind: Kind): Session[] => {
   try {
@@ -1051,10 +1062,16 @@ function SessionTabs({
   const [dropKey, setDropKey] = useState<string | null>(null);
   const sessionKeys = sessions.map(openSessionKey);
   const [order, setOrder] = useState(() => [...sessionKeys, "settings"]);
-  const [settingsVisible, setSettingsVisible] = useState(true);
+  const [settingsVisible, setSettingsVisible] = useState(
+    () => settingsOpen || sessionStorage.getItem(settingsTabKey) === "1",
+  );
   useEffect(() => {
     if (settingsOpen) setSettingsVisible(true);
   }, [settingsOpen]);
+  useEffect(() => {
+    if (settingsVisible) sessionStorage.setItem(settingsTabKey, "1");
+    else sessionStorage.removeItem(settingsTabKey);
+  }, [settingsVisible]);
   useEffect(() => {
     setOrder((current) => {
       const next = [
@@ -1716,7 +1733,13 @@ function App() {
       setProfile(targetProfile);
     }
     if (targetKind === "pi" && targetProfile && targetProfile !== "default") {
-      void create(`~/.pi/agents/${targetProfile}`, [], targetProfile);
+      void api<SettingsResponse>("/settings")
+        .then(({ settings }) => {
+          const role = settings.pi_roles.find((item) => item.name === targetProfile);
+          if (role) void create(role.home, [], targetProfile);
+          else setError("Pi 角色不存在");
+        })
+        .catch((e) => setError(errorMessage(e)));
     } else setPicking(true);
   };
   const showMore = (listKind: Kind, listProfile = "") => {

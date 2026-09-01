@@ -1,6 +1,6 @@
 import { DropdownMenu } from 'radix-ui';
 import { CircleStop, MoreHorizontal, Pencil, Trash2, Unplug } from 'lucide-react';
-import { channelNames, displayTitle, rawChannel, statusView, type Kind, type Session } from '../../shared/model';
+import { channelNames, displayTitle, displayWorkspacePath, rawChannel, statusView, type Kind, type Session } from '../../shared/model';
 
 type Props = {
   rows: Session[];
@@ -34,7 +34,7 @@ export function SessionList({ rows, listKind, listProfile = '', activeID, connec
       return <div className={'session-row ' + (activeID === session.id ? 'active' : '')} key={session.id}>
         <button className="session" onClick={() => onSelect(session)}>
           <span className={'session-state ' + view.tone} aria-label={view.label} />
-          <span className="session-copy"><strong title={title}>{title}</strong><small title={session.workspace}>{session.workspace || '未知工作区'}</small>{listKind !== 'codex' && <small title={channel}>{channel}</small>}</span>
+          <span className="session-copy"><strong title={title}>{title}</strong><small title={session.workspace}>{displayWorkspacePath(session.workspace) || '未知工作区'}</small>{listKind !== 'codex' && <small title={channel}>{channel}</small>}</span>
         </button>
         <div className="session-menu"><SessionActions kind={listKind} session={session} connected={connectedID === session.id} onDialog={onDialog} onDisconnect={onDisconnect} onRelease={onRelease} /></div>
       </div>;

@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    model::{AgentKind, AgentSettings, EnvVar, Message, Session},
+    model::{AgentKind, AgentSettings, EnvVar, Message, PiRole, Session},
     store::dirs_home,
     terminal::{TerminalManager, TerminalSpec},
 };
@@ -264,31 +264,29 @@ impl Runtime {
     }
 
     pub fn pi_agents(&self) -> Vec<String> {
-        let root = dirs_home().join(".pi/agents");
+        let settings = self.settings();
         let mut agents = vec!["default".into()];
-        agents.extend(
-            std::fs::read_dir(root)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-        );
+        agents.extend(settings.pi_roles.into_iter().map(|role| role.name));
         unique(agents)
+    }
+
+    fn pi_role(&self, profile: &str) -> Option<PiRole> {
+        self.settings()
+            .pi_roles
+            .into_iter()
+            .find(|role| role.name == normalize_profile(profile))
     }
 
     fn pi_sessions(&self, profile: &str) -> Result<Vec<Session>> {
         let root = if profile == "default" {
             dirs_home().join(".pi/agent/sessions")
         } else {
-            dirs_home()
-                .join(".pi/agents")
-                .join(profile)
-                .join("sessions")
+            self.pi_role(profile)
+                .map(|role| expand_pi_path(&role.home).join("sessions"))
+                .ok_or_else(|| anyhow!("Pi role unavailable: {profile}"))?
         };
         let mut files = Vec::new();
-        collect_pi_session_files(&root, profile == "default", &mut files);
+        collect_pi_session_files(&root, true, &mut files);
         files.sort_by_key(|path| {
             fs::metadata(path)
                 .and_then(|metadata| metadata.modified())
@@ -298,28 +296,28 @@ impl Runtime {
             .into_iter()
             .map(|path| parse_pi_session(&path, profile))
             .collect::<Result<Vec<_>>>()
-            .map(|rows| rows.into_iter().flatten().collect())
+            .map(|rows| {
+                rows.into_iter()
+                    .flatten()
+                    .filter(|session| {
+                        pi_workspace_matches(profile, &session.workspace, &self.settings().pi_roles)
+                    })
+                    .collect()
+            })
     }
 
     pub fn pi_workspace(&self, profile: &str) -> Option<PathBuf> {
-        (normalize_profile(profile) != "default")
-            .then(|| dirs_home().join(".pi/agents").join(profile))
+        self.pi_role(profile).map(|role| expand_pi_path(&role.home))
     }
 
     fn pi_entry(&self, profile: &str) -> Result<PathBuf> {
         let profile = normalize_profile(profile);
         let path = if profile == "default" {
-            let agent = dirs_home().join(".pi/agent/pi-agent");
-            if agent.is_file() {
-                agent
-            } else {
-                dirs_home().join(".pi/agent/pi-default")
-            }
+            expand_pi_path(&self.settings().pi_default)
         } else {
-            dirs_home()
-                .join(".pi/agents")
-                .join(&profile)
-                .join(format!("pi-{profile}"))
+            self.pi_role(&profile)
+                .map(|role| expand_pi_path(&role.entry))
+                .ok_or_else(|| anyhow!("Pi role unavailable: {profile}"))?
         };
         path.is_file()
             .then_some(path)
@@ -625,6 +623,25 @@ impl Runtime {
     }
 }
 
+fn expand_pi_path(value: &str) -> PathBuf {
+    value
+        .strip_prefix("~/")
+        .map_or_else(|| PathBuf::from(value), |rest| dirs_home().join(rest))
+}
+
+fn pi_workspace_matches(profile: &str, workspace: &str, roles: &[PiRole]) -> bool {
+    let workspace = Path::new(workspace);
+    if profile == "default" {
+        return !roles
+            .iter()
+            .any(|role| workspace.starts_with(expand_pi_path(&role.home)));
+    }
+    roles
+        .iter()
+        .find(|role| role.name == profile)
+        .is_some_and(|role| workspace.starts_with(expand_pi_path(&role.home)))
+}
+
 struct AppServer {
     child: Child,
     stdin: ChildStdin,
@@ -829,7 +846,8 @@ fn parse_pi_session(path: &Path, profile: &str) -> Result<Option<Session>> {
     if native_id.is_empty() || workspace.is_empty() {
         return Ok(None);
     }
-    let mut title = String::new();
+    let mut message_title = String::new();
+    let mut session_name = None;
     let mut updated_at = json_time(header.get("timestamp"));
     for line in lines {
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -840,7 +858,17 @@ fn parse_pi_session(path: &Path, profile: &str) -> Result<Option<Session>> {
             .map(|timestamp| json_time(Some(timestamp)))
             .filter(|time| *time > updated_at)
             .unwrap_or(updated_at);
-        if title.is_empty()
+        if value.get("type").and_then(Value::as_str) == Some("session_info") {
+            session_name = Some(
+                value
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string(),
+            );
+        }
+        if message_title.is_empty()
             && value.get("type").and_then(Value::as_str) == Some("message")
             && value
                 .get("message")
@@ -848,7 +876,7 @@ fn parse_pi_session(path: &Path, profile: &str) -> Result<Option<Session>> {
                 .and_then(Value::as_str)
                 == Some("user")
         {
-            title = value
+            message_title = value
                 .get("message")
                 .and_then(|message| message.get("content"))
                 .and_then(Value::as_array)
@@ -859,6 +887,9 @@ fn parse_pi_session(path: &Path, profile: &str) -> Result<Option<Session>> {
                 .join(" ");
         }
     }
+    let title = session_name
+        .filter(|name| !name.is_empty())
+        .unwrap_or(message_title);
     Ok(Some(Session {
         id: format!("native-pi-{profile}-{native_id}"),
         kind: AgentKind::Pi,
@@ -1042,6 +1073,63 @@ mod tests {
             preferred_args(&["custom".into()], &["default".into()]),
             ["custom"]
         );
+    }
+
+    #[test]
+    fn pi_sessions_do_not_cross_role_workspaces() {
+        let roles = [PiRole {
+            name: "swork".into(),
+            entry: "/bin/pi-swork".into(),
+            home: "/home/gaofei/.pi/agents/swork".into(),
+        }];
+        assert!(!pi_workspace_matches(
+            "default",
+            "/home/gaofei/.pi/agents/swork/workspace",
+            &roles
+        ));
+        assert!(pi_workspace_matches(
+            "swork",
+            "/home/gaofei/.pi/agents/swork/workspace",
+            &roles
+        ));
+        assert!(pi_workspace_matches(
+            "default",
+            "/home/gaofei/project",
+            &roles
+        ));
+    }
+
+    #[test]
+    fn pi_role_sessions_are_collected_recursively() {
+        let root = std::env::temp_dir().join(format!("jian-pi-sessions-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("2026-08-31")).unwrap();
+        let nested = root.join("2026-08-31/session.jsonl");
+        fs::write(&nested, "").unwrap();
+        let mut files = Vec::new();
+        collect_pi_session_files(&root, true, &mut files);
+        assert_eq!(files, [nested]);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pi_session_name_from_tui_overrides_first_message_title() {
+        let path =
+            std::env::temp_dir().join(format!("jian-pi-title-{}.jsonl", uuid::Uuid::new_v4()));
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session","id":"session-1","cwd":"/tmp","timestamp":"2026-08-31T00:00:00Z"}"#,
+                "\n",
+                r#"{"type":"message","message":{"role":"user","content":[{"text":"旧标题"}]}}"#,
+                "\n",
+                r#"{"type":"session_info","name":"TUI 标题"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let session = parse_pi_session(&path, "swork").unwrap().unwrap();
+        assert_eq!(session.title, "TUI 标题");
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
