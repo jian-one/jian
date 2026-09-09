@@ -812,11 +812,16 @@ function AgentTerminal({
     if (!element) return;
     let lastY: number | null = null,
       distance = 0,
-      moved = false;
+      moved = false,
+      holdTimer = 0,
+      held = false;
     const reset = () => {
+      window.clearTimeout(holdTimer);
+      holdTimer = 0;
       lastY = null;
       distance = 0;
       moved = false;
+      held = false;
     };
     const start = (event: TouchEvent) => {
       if (event.touches.length !== 1) {
@@ -826,8 +831,12 @@ function AgentTerminal({
       lastY = event.touches[0].clientY;
       distance = 0;
       moved = false;
+      held = false;
+      window.clearTimeout(holdTimer);
+      holdTimer = window.setTimeout(() => { held = true; }, 700);
     };
     const move = (event: TouchEvent) => {
+      if (held) return;
       if (lastY === null || event.touches.length !== 1) return;
       const currentY = event.touches[0].clientY;
       distance += lastY - currentY;
@@ -859,6 +868,7 @@ function AgentTerminal({
     element.addEventListener("touchend", end, { passive: true });
     element.addEventListener("touchcancel", reset, { passive: true });
     return () => {
+      window.clearTimeout(holdTimer);
       element.removeEventListener("touchstart", start);
       element.removeEventListener("touchmove", move);
       element.removeEventListener("touchend", end);

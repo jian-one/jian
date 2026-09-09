@@ -62,7 +62,7 @@ const checks = [
   ['empty titles have a visible fallback', source.includes("|| '无标题'")],
   ['channel labels are localized', source.includes("weixin: '微信'") && source.includes("dingtalk: '钉钉'")],
   ['mobile terminal controls stay touch friendly', source.includes('<Collapsible.Content forceMount') && theme.includes('height: 42px') && theme.includes('grid-template-columns: repeat(3, minmax(0, 1fr))')],
-  ['mobile terminal supports vertical touch scrolling', source.includes("addEventListener('touchmove'") && source.includes('term.scrollLines(lines)') && theme.includes('.terminal {\n    touch-action: none;')],
+  ['mobile terminal supports scrolling and long-press selection', source.includes('touchmove') && source.includes('term.scrollLines(lines)') && source.includes('held') && source.includes('holdTimer') && theme.includes('touch-action: auto;')],
   ['touch terminals use a dedicated IME input buffer', source.includes('attachTerminalInputBuffer') && source.includes('terminal-input-buffer') && source.includes('inputMode="text"') && theme.includes('.terminal-input-buffer')],
   ['IME preview follows the terminal theme', source.includes('terminal-input-preview') && theme.includes('color: var(--terminal-fg)') && theme.includes('background: var(--terminal-bg)')],
   ['touch terminal focus does not return to xterm textarea', source.includes('inputBufferRef.current.focus') && source.includes("xtermTextarea.inputMode = touchInput ? 'none' : 'text'") && !source.includes('termRef.current?.focus(); } };')],

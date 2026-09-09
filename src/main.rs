@@ -141,6 +141,7 @@ struct AppState {
     attempts: Mutex<HashMap<String, Vec<SystemTime>>>,
     quick_notes: QuickNoteWorker,
     quick_note_updates: broadcast::Sender<QuickNoteEvent>,
+    resize_owners: Mutex<HashMap<String, String>>,
     secure_cookie: bool,
 }
 
@@ -195,6 +196,7 @@ async fn run_server(config_path: Option<PathBuf>) -> Result<()> {
         attempts: Mutex::new(HashMap::new()),
         quick_notes,
         quick_note_updates,
+        resize_owners: Mutex::new(HashMap::new()),
         secure_cookie: std::env::var("JIAN_SECURE_COOKIE").as_deref() == Ok("1"),
     });
     let app = routes(state).fallback(static_asset);
@@ -1270,10 +1272,29 @@ fn rpc_target(method: &str, path: &str) -> std::result::Result<(Method, Uri), &'
     Ok((method, uri))
 }
 
+fn claim_resize_owner(
+    owners: &mut HashMap<String, String>,
+    session_id: &str,
+    connection_id: &str,
+) -> bool {
+    if owners.contains_key(session_id) {
+        false
+    } else {
+        owners.insert(session_id.into(), connection_id.into());
+        true
+    }
+}
+
 async fn terminal_socket(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap, id: String) {
     let Ok((buffer, mut events, _guard)) = state.runtime.terminals.subscribe(&id) else {
         return;
     };
+    let connection_id = uuid::Uuid::new_v4().to_string();
+    let mut owns_resize = claim_resize_owner(
+        &mut state.resize_owners.lock().unwrap(),
+        &id,
+        &connection_id,
+    );
     let (mut sender, mut receiver) = socket.split();
     if !buffer.is_empty() {
         let _ = sender
@@ -1334,7 +1355,16 @@ async fn terminal_socket(socket: WebSocket, state: Arc<AppState>, headers: Heade
                                 value.get("cols").and_then(Value::as_u64).and_then(|v| u16::try_from(v).ok()),
                                 value.get("rows").and_then(Value::as_u64).and_then(|v| u16::try_from(v).ok()),
                             ) {
-                                let _ = state.runtime.terminals.resize(&id, cols, rows);
+                                if !owns_resize {
+                                    owns_resize = claim_resize_owner(
+                                        &mut state.resize_owners.lock().unwrap(),
+                                        &id,
+                                        &connection_id,
+                                    );
+                                }
+                                if owns_resize {
+                                    let _ = state.runtime.terminals.resize(&id, cols, rows);
+                                }
                             }
                         }
                         Some("interrupt") => { let _ = state.runtime.terminals.send(&id, "\x03"); }
@@ -1351,6 +1381,12 @@ async fn terminal_socket(socket: WebSocket, state: Arc<AppState>, headers: Heade
                 Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => break,
                 _ => {}
             }
+        }
+    }
+    if owns_resize {
+        let mut owners = state.resize_owners.lock().unwrap();
+        if owners.get(&id) == Some(&connection_id) {
+            owners.remove(&id);
         }
     }
 }
@@ -1674,6 +1710,15 @@ mod cli_tests {
     }
 
     #[test]
+    fn resize_owner_allows_only_one_connection_and_releases() {
+        let mut owners = HashMap::new();
+        assert!(claim_resize_owner(&mut owners, "session", "pc"));
+        assert!(!claim_resize_owner(&mut owners, "session", "mobile"));
+        owners.remove("session");
+        assert!(claim_resize_owner(&mut owners, "session", "mobile"));
+    }
+
+    #[test]
     fn terminal_socket_replay_events_precede_session_start() {
         let source = include_str!("main.rs");
         let output = source.find(r#"\"type\":\"pty.output"#).unwrap();
@@ -1739,6 +1784,7 @@ mod cli_tests {
             ))
             .unwrap(),
             quick_note_updates: broadcast::channel(1).0,
+            resize_owners: Mutex::new(HashMap::new()),
             secure_cookie: false,
         };
 
@@ -1764,6 +1810,7 @@ mod cli_tests {
             attempts: Mutex::new(HashMap::new()),
             quick_notes: QuickNoteWorker::start(store).unwrap(),
             quick_note_updates: broadcast::channel(1).0,
+            resize_owners: Mutex::new(HashMap::new()),
             secure_cookie: false,
         };
         assert_eq!(

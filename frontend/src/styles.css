@@ -2564,7 +2564,7 @@ input:focus-visible,
   }
 
   .terminal {
-    touch-action: none;
+    touch-action: auto;
   }
 
   .terminal-tools {
