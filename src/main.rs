@@ -652,27 +652,88 @@ async fn save_settings(
 
 #[derive(Deserialize)]
 struct BrowseQuery {
-    path: Option<String>,
+    path: String,
+    #[serde(default = "default_browse_type")]
+    r#type: String,
+    file_ext: Option<String>,
 }
+
+fn default_browse_type() -> String {
+    "all".into()
+}
+
 async fn browse(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(query): Query<BrowseQuery>,
 ) -> Api {
     require(&state, &headers)?;
-    let path = expand_path(query.path.as_deref().unwrap_or("~"));
-    let path = match fs::canonicalize(&path) {
+    let filter = match query.r#type.as_str() {
+        "all" => None,
+        "dir" | "directory" => Some(true),
+        "file" => Some(false),
+        value => return fail(StatusCode::BAD_REQUEST, format!("invalid type: {value}")),
+    };
+    let file_ext = query
+        .file_ext
+        .as_deref()
+        .map(|value| value.trim_start_matches('.').to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let home = match fs::canonicalize(dirs_home()) {
         Ok(v) => v,
+        Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let path = expand_path(&query.path);
+    let path = match fs::canonicalize(&path) {
+        Ok(v) if v.starts_with(&home) => v,
+        Ok(_) => return fail(StatusCode::FORBIDDEN, "path is outside the home directory"),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return fail(StatusCode::FORBIDDEN, e);
+        }
         Err(e) => return fail(StatusCode::BAD_REQUEST, e),
     };
+    if !path.is_dir() {
+        return fail(StatusCode::BAD_REQUEST, "path is not a directory");
+    }
     let entries = match fs::read_dir(&path) {
         Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return fail(StatusCode::FORBIDDEN, e);
+        }
         Err(e) => return fail(StatusCode::BAD_REQUEST, e),
     };
-    let values:Vec<_>=entries.flatten().map(|e|json!({"name":e.file_name().to_string_lossy(),"directory":e.file_type().is_ok_and(|t|t.is_dir())})).collect();
-    ok(
-        json!({"path":path,"parent":path.parent().unwrap_or(Path::new("/")).to_string_lossy(),"entries":values}),
-    )
+    let values: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let directory = entry.file_type().ok()?.is_dir();
+            if filter.is_some_and(|want_directory| directory != want_directory) {
+                return None;
+            }
+            if !directory {
+                if let Some(extension) = &file_ext {
+                    if entry
+                        .path()
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .map(str::to_ascii_lowercase)
+                        .as_deref()
+                        != Some(extension)
+                    {
+                        return None;
+                    }
+                }
+            }
+            Some(json!({
+                "name": entry.file_name().to_string_lossy(),
+                "directory": directory,
+            }))
+        })
+        .collect();
+    let parent = path
+        .parent()
+        .filter(|parent| parent.starts_with(&home))
+        .unwrap_or(&home);
+    ok(json!({"path":path,"parent":parent.to_string_lossy(),"entries":values}))
 }
 
 #[derive(Deserialize, Default)]
