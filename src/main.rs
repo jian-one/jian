@@ -227,6 +227,7 @@ fn api_routes(state: Arc<AppState>) -> Router {
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/me", get(me))
         .route("/api/workspaces/browse", get(browse))
+        .route("/api/workspaces/file", get(read_workspace_file))
         .route("/api/local/sessions", post(create_local).get(list_local))
         .route("/api/local/sessions/{id}", delete(remove_local))
         .route("/api/local/sessions/{id}/terminal", get(local_terminal))
@@ -662,6 +663,24 @@ fn default_browse_type() -> String {
     "all".into()
 }
 
+fn resolve_workspace_path(value: &str) -> std::result::Result<PathBuf, (StatusCode, String)> {
+    let home = match fs::canonicalize(dirs_home()) {
+        Ok(v) => v,
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+    match fs::canonicalize(expand_path(value)) {
+        Ok(path) if path.starts_with(&home) => Ok(path),
+        Ok(_) => Err((
+            StatusCode::FORBIDDEN,
+            "path is outside the home directory".into(),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err((StatusCode::FORBIDDEN, e.to_string()))
+        }
+        Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
+    }
+}
+
 async fn browse(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -679,18 +698,13 @@ async fn browse(
         .as_deref()
         .map(|value| value.trim_start_matches('.').to_ascii_lowercase())
         .filter(|value| !value.is_empty());
-    let home = match fs::canonicalize(dirs_home()) {
-        Ok(v) => v,
-        Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, e),
+    let path = match resolve_workspace_path(&query.path) {
+        Ok(path) => path,
+        Err((status, error)) => return fail(status, error),
     };
-    let path = expand_path(&query.path);
-    let path = match fs::canonicalize(&path) {
-        Ok(v) if v.starts_with(&home) => v,
-        Ok(_) => return fail(StatusCode::FORBIDDEN, "path is outside the home directory"),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            return fail(StatusCode::FORBIDDEN, e);
-        }
-        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+    let home = match fs::canonicalize(dirs_home()) {
+        Ok(home) => home,
+        Err(error) => return fail(StatusCode::INTERNAL_SERVER_ERROR, error),
     };
     if !path.is_dir() {
         return fail(StatusCode::BAD_REQUEST, "path is not a directory");
@@ -734,6 +748,41 @@ async fn browse(
         .filter(|parent| parent.starts_with(&home))
         .unwrap_or(&home);
     ok(json!({"path":path,"parent":parent.to_string_lossy(),"entries":values}))
+}
+
+#[derive(Deserialize)]
+struct WorkspaceFileQuery {
+    path: String,
+}
+
+async fn read_workspace_file(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<WorkspaceFileQuery>,
+) -> Api {
+    require(&state, &headers)?;
+    let path = match resolve_workspace_path(&query.path) {
+        Ok(path) => path,
+        Err((status, error)) => return fail(status, error),
+    };
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {}
+        Ok(_) => return fail(StatusCode::BAD_REQUEST, "path is not a file"),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return fail(StatusCode::FORBIDDEN, e);
+        }
+        Err(e) => return fail(StatusCode::BAD_REQUEST, e),
+    }
+    match fs::read_to_string(&path) {
+        Ok(content) => ok(json!({"path": path, "content": content})),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            fail(StatusCode::FORBIDDEN, e)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            fail(StatusCode::BAD_REQUEST, "file is not valid UTF-8")
+        }
+        Err(e) => fail(StatusCode::BAD_REQUEST, e),
+    }
 }
 
 #[derive(Deserialize, Default)]
