@@ -31,12 +31,13 @@ test('session normalization and saved-profile lookup have one shared rule', () =
   assert.equal(savedSession(rows, 'newer', 'hermes', 'work')?.id, 'newer');
 });
 
-test('the app passes explicit Hermes home selection into native-session restoration', () => {
+test('the app keeps profile-aware restoration while list navigation reads the cache first', () => {
   const source = readFileSync(new URL('../src/main.tsx', import.meta.url), 'utf8');
 
   assert.match(source, /shouldRestoreNativeSession\(/);
-  assert.match(source, /explicitHome:\s*target === 'hermes' && hermesHomeSelected\.current/);
-  assert.match(source, /const selectProfile = \(nextProfile: string\) => \{[\s\S]*localStorage\.removeItem\(activeSessionKey\('hermes', nextProfile\)\)/);
+  assert.match(source, /explicitHome:\s*target === "hermes" && hermesHomeSelected\.current/);
+  assert.match(source, /refresh \? `\/agents\/\$\{target\}\/sessions\/refresh` : `\/agents\/\$\{target\}\/sessions\/cache`/);
+  assert.match(source, /const selectProfile = \(nextProfile: string\) => \{[\s\S]*localStorage\.removeItem\(activeSessionKey\(kind, nextProfile\)\)/);
 });
 
 test('closing the final native session tab clears its persisted restore key', () => {
@@ -51,7 +52,7 @@ test('terminal release errors are caught and shown in a dialog', () => {
   const main = readFileSync(new URL('../src/main.tsx', import.meta.url), 'utf8');
   const settings = readFileSync(new URL('../src/features/settings/SettingsPage.tsx', import.meta.url), 'utf8');
 
-  assert.match(main, /const release = async \(\) => \{[\s\S]*catch \(e\) \{ setError\(errorMessage\(e\)\); \}/);
-  assert.match(main, /<ErrorDialog open=\{!!error\}/);
+  assert.match(main, /const release = async \(\) => \{[\s\S]*catch \(e\) \{\s*setError\(errorMessage\(e\)\);/);
+  assert.match(main, /<ErrorDialog\s+open=\{!!error\}/);
   assert.match(settings, /<ErrorDialog open=\{!!error\}/);
 });

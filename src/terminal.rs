@@ -58,6 +58,7 @@ struct TerminalState {
 #[derive(Default)]
 pub struct TerminalManager {
     active: RwLock<HashMap<String, Arc<Terminal>>>,
+    pids: Mutex<HashMap<String, i32>>,
 }
 
 impl TerminalManager {
@@ -84,6 +85,7 @@ impl TerminalManager {
             }
         }
         let child = pair.slave.spawn_command(command)?;
+        let pid = child.process_id().map(|pid| pid as i32);
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
@@ -107,6 +109,9 @@ impl TerminalManager {
             .write()
             .unwrap()
             .insert(id.clone(), terminal.clone());
+        if let Some(pid) = pid {
+            self.pids.lock().unwrap().insert(id.clone(), pid);
+        }
         let manager = Arc::downgrade(self);
         std::thread::spawn(move || {
             let mut chunk = [0_u8; 4096];
@@ -122,7 +127,16 @@ impl TerminalManager {
             terminal.state.lock().unwrap().running = false;
             let _ = terminal.child.lock().unwrap().wait();
             if let Some(manager) = manager.upgrade() {
-                manager.active.write().unwrap().remove(&id);
+                let is_current = manager
+                    .active
+                    .read()
+                    .unwrap()
+                    .get(&id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &terminal));
+                if is_current {
+                    manager.active.write().unwrap().remove(&id);
+                    manager.pids.lock().unwrap().remove(&id);
+                }
             }
         });
         Ok(())
@@ -175,24 +189,22 @@ impl TerminalManager {
     }
 
     pub fn stop(&self, id: &str) -> Result<()> {
-        let Some(terminal) = self.active.read().unwrap().get(id).cloned() else {
-            return Ok(());
-        };
-        terminal.state.lock().unwrap().running = false;
-        if let Some(pid) = terminal.child.lock().unwrap().process_id() {
-            let descendants = descendants_of(pid as i32);
-            // portable-pty creates a new Unix session, so its pid is also the process group id.
-            let rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-            if rc != 0 {
-                terminal.child.lock().unwrap().kill()?;
-            }
-            for descendant in descendants {
-                unsafe { libc::kill(descendant, libc::SIGKILL) };
-            }
-        } else {
+        let terminal = self.active.read().unwrap().get(id).cloned();
+        let pid = terminal
+            .as_ref()
+            .and_then(|terminal| terminal.child.lock().unwrap().process_id())
+            .map(|pid| pid as i32)
+            .or_else(|| self.pids.lock().unwrap().get(id).copied());
+        if let Some(terminal) = &terminal {
+            terminal.state.lock().unwrap().running = false;
+        }
+        if let Some(pid) = pid {
+            kill_process_tree(pid);
+        } else if let Some(terminal) = terminal {
             terminal.child.lock().unwrap().kill()?;
         }
         self.active.write().unwrap().remove(id);
+        self.pids.lock().unwrap().remove(id);
         Ok(())
     }
 
@@ -305,6 +317,18 @@ fn descendants_of(root: i32) -> Vec<i32> {
         }
     }
     descendants
+}
+
+fn kill_process_tree(pid: i32) {
+    let descendants = descendants_of(pid);
+    // portable-pty creates a new Unix session, so its pid is also the process group id.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+        libc::kill(pid, libc::SIGKILL);
+        for descendant in descendants {
+            libc::kill(descendant, libc::SIGKILL);
+        }
+    }
 }
 
 impl Terminal {
@@ -433,6 +457,57 @@ mod tests {
             !alive,
             "detached descendant {pid} survived terminal release"
         );
+    }
+
+    #[test]
+    fn stop_kills_recorded_process_after_terminal_was_removed() {
+        let manager = Arc::new(TerminalManager::default());
+        let session = Session::new(AgentKind::Codex, "/tmp".into(), "Codex".into());
+        let pid_file =
+            std::env::temp_dir().join(format!("jian-terminal-{}.pid", uuid::Uuid::new_v4()));
+        manager
+            .start(TerminalSpec {
+                session: session.clone(),
+                label: AgentKind::Codex,
+                cwd: "/tmp".into(),
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("echo $$ > {}; exec sleep 30", pid_file.display()),
+                ],
+                env: std::env::vars().map(|(k, v)| format!("{k}={v}")).collect(),
+            })
+            .unwrap();
+        for _ in 0..100 {
+            if pid_file.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        manager.active.write().unwrap().remove(&session.id);
+        manager.stop(&session.id).unwrap();
+        let mut alive = true;
+        for _ in 0..100 {
+            alive = std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, fields)| fields.split_whitespace().next())
+                    != Some("Z")
+            });
+            if !alive {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if alive {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_file(pid_file);
+        assert!(!alive, "recorded process {pid} survived terminal release");
     }
 
     #[test]

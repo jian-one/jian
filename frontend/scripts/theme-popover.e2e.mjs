@@ -9,6 +9,7 @@ const chromePort = port + 1000;
 const temporary = await mkdtemp(join(tmpdir(), 'jian-theme-e2e-'));
 const config = join(temporary, 'config.json');
 const processes = [];
+const browser = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH || '/usr/bin/google-chrome';
 
 const start = (command, args, options = {}) => {
   const child = spawn(command, args, { stdio: 'ignore', detached: true, ...options });
@@ -74,7 +75,7 @@ try {
   });
   await waitFor(async () => (await fetch(`http://127.0.0.1:${port}/api/auth/status`)).ok, 'Jian server');
 
-  start('/usr/bin/google-chrome', [
+  start(browser, [
     '--headless=new', '--no-sandbox', '--disable-gpu',
     `--remote-debugging-port=${chromePort}`,
     `--user-data-dir=${join(temporary, 'chrome')}`,

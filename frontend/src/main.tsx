@@ -69,7 +69,6 @@ import {
 } from "./features/terminal/themes";
 import { recentWorkspaces } from "./shared/persistence";
 import { MenuPopup } from "./shared/ui/Popup";
-import { ConfirmDialog } from "./shared/ui/ConfirmDialog";
 import { ErrorDialog } from "./shared/ui/ErrorDialog";
 import { mountTerminal } from "./features/terminal/mountTerminal";
 import { SessionDialog } from "./features/session-catalog/SessionDialog";
@@ -92,28 +91,13 @@ function StatusMenu({
   connected,
   onReconnect,
   onRelease,
-  onRestart,
 }: {
   status: ReturnType<typeof statusView>;
   connected: boolean;
   onReconnect: () => void;
   onRelease: () => Promise<void>;
-  onRestart?: () => Promise<void>;
 }) {
   const [open, setOpen] = useState(false);
-  const [confirm, setConfirm] = useState<"restart" | "release" | null>(null);
-  const [busy, setBusy] = useState(false);
-  const confirmAction = async () => {
-    setBusy(true);
-    try {
-      if (confirm === "release") await onRelease();
-      else if (onRestart) await onRestart();
-      else window.dispatchEvent(new Event("jian-restart-terminal"));
-      setConfirm(null);
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
     <div className="terminal-status-menu">
       <MenuPopup
@@ -143,7 +127,7 @@ function StatusMenu({
               disabled={!connected}
               onClick={() => {
                 setOpen(false);
-                setConfirm("restart");
+                window.dispatchEvent(new Event("jian-restart-terminal"));
               }}
             >
               <RefreshCw />
@@ -152,7 +136,7 @@ function StatusMenu({
             <button
               onClick={() => {
                 setOpen(false);
-                setConfirm("release");
+                void onRelease();
               }}
             >
               <Trash2 />
@@ -160,20 +144,6 @@ function StatusMenu({
             </button>
           </>
         }
-      />
-      <ConfirmDialog
-        open={!!confirm}
-        title={confirm === "release" ? "释放当前会话？" : "重启当前会话？"}
-        description={
-          confirm === "release"
-            ? "当前 terminal 协程和 PTY 子进程都会被完全释放，打开的会话标签也会关闭。"
-            : "将重新加载当前 agent 的环境变量、Local profile 和启动参数，然后强制重启当前 PTY。正在执行的任务会中断。"
-        }
-        confirmLabel={confirm === "release" ? "确认释放" : "确认重启"}
-        danger
-        busy={busy}
-        onConfirm={() => void confirmAction()}
-        onClose={() => setConfirm(null)}
       />
     </div>
   );
@@ -1271,6 +1241,7 @@ function App() {
     [active, setActive] = useState<OpenSession | null>(null),
     [openSessions, setOpenSessions] = useState<OpenSession[]>([]),
     [activeKey, setActiveKey] = useState<string | null>(null),
+    [secondary, setSecondary] = useState<Session | null>(null),
     [profiles, setProfiles] = useState<string[]>([]),
     [profile, setProfile] = useState(
       () => localStorage.getItem(activeProfileKey) || "default",
@@ -1306,7 +1277,7 @@ function App() {
     );
     setUser(status.authenticated ? status.username || null : null);
   };
-  const load = async (target = kind) => {
+  const load = async (target = kind, refresh = false) => {
     const currentTarget = target === kind;
     const t = currentTarget
       ? beginSessionLoad(token.current)
@@ -1318,9 +1289,10 @@ function App() {
     if (cached.length && currentTarget) setAll(cached);
     try {
       const rows = normalizeSessions(
-        await api<Session[]>(`/agents/${target}/sessions/refresh`, {
-          method: "POST",
-        }),
+        await api<Session[]>(
+          refresh ? `/agents/${target}/sessions/refresh` : `/agents/${target}/sessions/cache`,
+          refresh ? { method: "POST" } : undefined,
+        ),
       );
       if (currentTarget && !isCurrentSessionLoad(token.current, t)) return true;
       sessionCache.current[target] = rows;
@@ -1642,7 +1614,7 @@ function App() {
     if (refreshingKind) return;
     setRefreshingKind(k);
     setProgress("正在刷新会话…");
-    if (await load(k)) setProgress("已刷新");
+    if (await load(k, true)) setProgress("已刷新");
     else setProgress("刷新失败");
     setRefreshingKind(null);
   };
@@ -1709,6 +1681,8 @@ function App() {
     if (target.kind === "local")
       setLocalSessions((rows) => rows.filter((item) => item.id !== target.id));
     closeTab(openSessionKey(target));
+    if (secondary?.id === target.id && secondary.kind === target.kind)
+      setSecondary(null);
     if (target.kind !== "local") await load(target.kind);
   };
   // Keep the existing Hermes restore-key contract covered while Pi uses the same profile flow.
@@ -1768,6 +1742,10 @@ function App() {
     setAgentEnabled((value) => ({ ...value, [target]: enabled }));
     localStorage.setItem(`jian.${target}-enabled`, String(enabled));
     if (!enabled && area === target) selectArea("local");
+  };
+  const openSecondary = (session: Session) => {
+    if (active && openSessionKey(active) === openSessionKey(session)) return;
+    setSecondary(activeView(session));
   };
   const connected = !!active && connectedSessionID === active.id;
   const activeKind = active?.kind === "local" ? "local" : active?.kind || area;
@@ -1846,6 +1824,7 @@ function App() {
         }
         connectedSessionID={connectedSessionID}
         onDisconnect={disconnect}
+        onOpenSecondary={openSecondary}
         visibleCount={(listKind, listProfile = "") =>
           visibleCounts[`${listKind}:${listProfile}`] || 8
         }
@@ -1952,21 +1931,28 @@ function App() {
             />
           ) : active ? (
             terminalAttached ? (
-              <AgentTerminal
-                key={`${active.id}:${terminalRevision}`}
-                session={active}
-                terminalTheme={terminalTheme}
-                terminalPath={activeKind}
-                onProgress={setProgress}
-                onStatus={(value) => {
-                  setProgress(value);
-                  if (value === "running") setConnectedSessionID(active.id);
-                  else setConnectedSessionID(null);
-                  setActive(
-                    (current) => current && { ...current, status: value },
-                  );
-                }}
-              />
+              <div className={secondary ? "terminal-split" : "terminal-single"}>
+                <div className="terminal-pane primary-pane">
+                  {secondary && <div className="terminal-pane-label"><span>主终端</span><small>{displayTitle(active)}</small></div>}
+                  <AgentTerminal
+                    key={`${active.id}:${terminalRevision}`}
+                    session={active}
+                    terminalTheme={terminalTheme}
+                    terminalPath={activeKind}
+                    onProgress={setProgress}
+                    onStatus={(value) => {
+                      setProgress(value);
+                      if (value === "running") setConnectedSessionID(active.id);
+                      else setConnectedSessionID(null);
+                      setActive((current) => current && { ...current, status: value });
+                    }}
+                  />
+                </div>
+                {secondary && <div className="terminal-pane secondary-pane">
+                  <div className="terminal-pane-label"><span>右侧终端</span><small title={secondary.workspace}>{displayTitle(secondary)}</small><button className="icon" aria-label="关闭右侧终端" title="关闭右侧终端" onClick={() => setSecondary(null)}><X /></button></div>
+                  <AgentTerminal key={`secondary:${secondary.kind}:${secondary.id}`} session={secondary} terminalTheme={terminalTheme} terminalPath={secondary.kind} onProgress={() => {}} onStatus={() => {}} />
+                </div>}
+              </div>
             ) : (
               <div className="terminal-disconnected">
                 <span>终端已断开</span>
