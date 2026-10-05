@@ -52,7 +52,7 @@ test('terminal release errors are caught and shown in a dialog', () => {
   const main = readFileSync(new URL('../src/main.tsx', import.meta.url), 'utf8');
   const settings = readFileSync(new URL('../src/features/settings/SettingsPage.tsx', import.meta.url), 'utf8');
 
-  assert.match(main, /const release = async \(\) => \{[\s\S]*catch \(e\) \{\s*setError\(errorMessage\(e\)\);/);
+  assert.match(main, /const confirmOperation = async \(\) => \{[\s\S]*catch \(e\) \{\s*setError\(errorMessage\(e\)\);/);
   assert.match(main, /<ErrorDialog\s+open=\{!!error\}/);
   assert.match(settings, /<ErrorDialog open=\{!!error\}/);
 });

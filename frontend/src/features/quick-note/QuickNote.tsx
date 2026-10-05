@@ -23,23 +23,29 @@ function replaceText(node: HTMLTextAreaElement, next: string) {
 }
 
 export function QuickNote({ username }: { username: string }) {
-  const textarea = useRef<HTMLTextAreaElement>(null), doc = useRef(new Y.Doc()), composing = useRef(false), pending = useRef<string[]>([]), syncing = useRef(false);
+  const textarea = useRef<HTMLTextAreaElement>(null), doc = useRef(new Y.Doc()), composing = useRef(false), pending = useRef<string[]>([]), loaded = useRef(false), cached = useRef(true), mounted = useRef(true), syncing = useRef(false);
+  const [syncStatus, setSyncStatus] = useState('已保存');
   const [open, setOpen] = useState(false);
   const text = doc.current.getText('body');
-  const persist = () => { try { localStorage.setItem(cacheKey(username), JSON.stringify({ state: toBase64(Y.encodeStateAsUpdate(doc.current)), pending: pending.current })); } catch {} };
+  const persist = () => { try { localStorage.setItem(cacheKey(username), JSON.stringify({ state: toBase64(Y.encodeStateAsUpdate(doc.current)), pending: pending.current })); } catch { cached.current = false; } };
   const flush = async () => {
     if (syncing.current) return;
     syncing.current = true;
-    while (pending.current[0]) {
+    setSyncStatus('待同步');
+    try {
+      if (!loaded.current) { const value = await api<NoteState>('/quick-note'); if (!mounted.current) { syncing.current = false; return; } Y.applyUpdate(doc.current, fromBase64(value.state), 'remote'); loaded.current = true; sync(); }
+    } catch { syncing.current = false; setSyncStatus('读取失败，请重试'); return; }
+    while (mounted.current && pending.current[0]) {
       try { await api('/quick-note', { method: 'PUT', body: JSON.stringify({ update: pending.current[0] }) }); pending.current.shift(); persist(); }
-      catch { break; }
+      catch { setSyncStatus(cached.current ? '同步失败，已保留本地副本' : '同步失败，本地存储不可用，请保留此页面'); break; }
     }
     syncing.current = false;
+    if (!pending.current.length) setSyncStatus('已保存');
   };
   const sync = () => { if (!composing.current && textarea.current) replaceText(textarea.current, text.toString()); };
 
   useEffect(() => {
-    let active = true;
+    mounted.current = true;
     try {
       const saved = JSON.parse(localStorage.getItem(cacheKey(username)) || '{}') as { state?: string; pending?: string[] };
       if (saved.state) Y.applyUpdate(doc.current, fromBase64(saved.state), 'cache');
@@ -54,8 +60,8 @@ export function QuickNote({ username }: { username: string }) {
       const update = (message as NoteUpdate).update;
       if (update) try { Y.applyUpdate(doc.current, fromBase64(update), 'remote'); } catch {}
     });
-    void api<NoteState>('/quick-note').then(value => { if (active) { Y.applyUpdate(doc.current, fromBase64(value.state), 'remote'); sync(); void flush(); } }).catch(() => {});
-    return () => { active = false; remove(); doc.current.off('update', update); };
+    void flush();
+    return () => { mounted.current = false; remove(); doc.current.off('update', update); };
   }, [username]);
 
   const change = (event: ChangeEvent<HTMLTextAreaElement>) => {
@@ -66,5 +72,5 @@ export function QuickNote({ username }: { username: string }) {
     doc.current.transact(() => { if (previousEnd > start) text.delete(start, previousEnd - start); if (nextEnd > start) text.insert(start, next.slice(start, nextEnd)); });
   };
 
-  return <Tooltip.Provider delayDuration={250}><Popover.Root open={open} onOpenChange={setOpen}><Tooltip.Root><Tooltip.Trigger asChild><Popover.Trigger asChild><button className="quick-note-toggle" aria-label="快速记事本"><NotebookPen /></button></Popover.Trigger></Tooltip.Trigger><Tooltip.Portal><Tooltip.Content className="tooltip" side="left">快速记事本<Tooltip.Arrow /></Tooltip.Content></Tooltip.Portal></Tooltip.Root><Popover.Portal><Popover.Content className="quick-note" side="left" align="center" sideOffset={12} onOpenAutoFocus={event => { event.preventDefault(); textarea.current?.focus(); }}><label htmlFor="quick-note-body">快速记事本</label><textarea id="quick-note-body" ref={textarea} defaultValue={text.toString()} onChange={change} onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; sync(); }} placeholder="随手记下想法…" maxLength={100000} /></Popover.Content></Popover.Portal></Popover.Root></Tooltip.Provider>;
+  return <Tooltip.Provider delayDuration={250}><Popover.Root open={open} onOpenChange={setOpen}><Tooltip.Root><Tooltip.Trigger asChild><Popover.Trigger asChild><button className="quick-note-toggle" aria-label="快速记事本"><NotebookPen /></button></Popover.Trigger></Tooltip.Trigger><Tooltip.Portal><Tooltip.Content className="tooltip" side="left">快速记事本<Tooltip.Arrow /></Tooltip.Content></Tooltip.Portal></Tooltip.Root><Popover.Portal><Popover.Content className="quick-note" side="bottom" align="end" sideOffset={12} onOpenAutoFocus={event => { event.preventDefault(); textarea.current?.focus(); }}><label htmlFor="quick-note-body">快速记事本</label><div className="note-sync-status" role="status"><span>{syncStatus}</span>{syncStatus !== '已保存' && <button type="button" onClick={() => void flush()}>重试同步</button>}</div><textarea id="quick-note-body" ref={textarea} defaultValue={text.toString()} onChange={change} onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; sync(); }} placeholder="随手记下想法…" maxLength={100000} /></Popover.Content></Popover.Portal></Popover.Root></Tooltip.Provider>;
 }

@@ -1,24 +1,11 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { type Terminal } from "@xterm/xterm";
-import "@xterm/xterm/css/xterm.css";
-import {
-  ArrowDown,
-  ArrowLeft,
-  ArrowRight,
-  ArrowUp,
-  ChevronDown,
-  ChevronLeft,
-  Folder,
-  FolderOpen,
-  Home,
-  Menu,
-  Plus,
-  RefreshCw,
-  Trash2,
-  X,
-} from "lucide-react";
-import { Checkbox, Collapsible, Tabs } from "radix-ui";
+import { ChevronDown, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { SessionTabs } from "./features/session-catalog/SessionTabs";
+import { WorkspacePicker } from "./features/session-catalog/WorkspacePicker";
+import { AgentTerminal } from "./features/terminal/AgentTerminal";
+import { ConfirmDialog } from "./shared/ui/ConfirmDialog";
+import { openSessionKey, openSessionTitle, openSessionLabel, connectionView, type OpenSession, type ConnectionState } from "./shared/model";
 import { QuickNote } from "./features/quick-note/QuickNote";
 import {
   beginSessionLoad,
@@ -30,6 +17,7 @@ import {
   type SessionLoadVersion,
 } from "./session-load-guard";
 import { api, errorMessage } from "./shared/api";
+import { adjacentTab, moveTab } from "./session-tabs";
 import {
   activeKindKey,
   activeAreaKey,
@@ -42,46 +30,32 @@ import {
   activeSessionKey,
   selectedSessionKey,
   sessionCacheKey,
-  navScrollKey,
   initialKind,
   initialTheme,
   initialTerminalFontSize,
   displayTitle,
-  displayChannel,
-  displayWorkspace,
   activeView,
   statusView,
   isMobile,
   type Kind,
   type LocalSession,
-  type TerminalSession,
   type Theme,
   type Session,
-  type BrowseResult,
-  type AgentSettings,
   type SettingsResponse,
 } from "./shared/model";
 import {
   initialTerminalTheme,
-  terminalThemeColors,
-  terminalThemes,
   type TerminalTheme,
 } from "./features/terminal/themes";
-import { recentWorkspaces } from "./shared/persistence";
 import { MenuPopup } from "./shared/ui/Popup";
 import { ErrorDialog } from "./shared/ui/ErrorDialog";
-import { mountTerminal } from "./features/terminal/mountTerminal";
 import { SessionDialog } from "./features/session-catalog/SessionDialog";
 import { Login } from "./features/auth/Login";
-import { useDialogFocus } from "./shared/ui/useDialogFocus";
 import { SidebarNavigation } from "./features/navigation/SidebarNavigation";
 import { SettingsPage } from "./features/settings/SettingsPage";
-import { ProfileFilePicker } from "./shared/ui/ProfileFilePicker";
 import { AgentIcon } from "./shared/ui/AgentIcon";
-import { EnvironmentVariables } from "./shared/ui/EnvironmentVariables";
-import { ThemeControls } from "./shared/ui/ThemeControls";
-import { TerminalFontSizeControl } from "./shared/ui/TerminalFontSizeControl";
-import { isPasteShortcut } from "./terminal-input-buffer";
+import { SessionContext } from "./shared/ui/SessionContext";
+import { WorkbenchTools } from "./shared/ui/WorkbenchTools";
 
 import "./styles.css";
 import "./layout.css";
@@ -149,852 +123,6 @@ function StatusMenu({
   );
 }
 
-function AgentSettingsDialog({
-  kind,
-  close,
-  saved,
-}: {
-  kind: Kind | "local";
-  close: () => void;
-  saved: () => void;
-}) {
-  const ref = useRef<HTMLDivElement>(null);
-  const launchArgumentRefs = useRef<(HTMLInputElement | null)[]>([]);
-  const [settings, setSettings] = useState<AgentSettings | null>(null);
-  const [available, setAvailable] = useState<string[]>([]);
-  const [profilePath, setProfilePath] = useState("");
-  const [profilePicking, setProfilePicking] = useState(false);
-  const [error, setError] = useState("");
-  const [saving, setSaving] = useState(false);
-  useDialogFocus(close, ref);
-  useEffect(() => {
-    void api<SettingsResponse>("/settings")
-      .then((value) => {
-        setSettings({
-          ...value.settings,
-          local_profiles: value.settings.local_profiles?.length
-            ? value.settings.local_profiles
-            : ["~/.bashrc"],
-          codex_args: value.settings.codex_args || [],
-          hermes_args: value.settings.hermes_args || [],
-          pi_args: value.settings.pi_args || [],
-          codex_env: value.settings.codex_env || [],
-          hermes_env: value.settings.hermes_env || [],
-          pi_env: value.settings.pi_env || [],
-        });
-        setAvailable(
-          kind === "hermes"
-            ? value.available_profiles
-            : value.available_pi_agents,
-        );
-      })
-      .catch((e) => setError(errorMessage(e)));
-  }, []);
-  const save = async () => {
-    if (!settings) return;
-    setSaving(true);
-    setError("");
-    try {
-      await api<AgentSettings>("/settings", {
-        method: "PUT",
-        body: JSON.stringify(settings),
-      });
-      saved();
-      close();
-    } catch (e) {
-      setError(errorMessage(e));
-    } finally {
-      setSaving(false);
-    }
-  };
-  const toggleProfile = (profile: string) =>
-    setSettings((value) =>
-      value
-        ? {
-            ...value,
-            hermes_profiles: value.hermes_profiles.includes(profile)
-              ? value.hermes_profiles.filter((item) => item !== profile)
-              : [...value.hermes_profiles, profile],
-          }
-        : value,
-    );
-  const addLocalProfile = (candidate = profilePath) => {
-    const path = candidate.trim();
-    if (!path) return;
-    setSettings((value) =>
-      value && !value.local_profiles.includes(path)
-        ? { ...value, local_profiles: [...value.local_profiles, path] }
-        : value,
-    );
-    setProfilePath("");
-  };
-  const removeLocalProfile = (path: string) =>
-    setSettings((value) =>
-      value
-        ? {
-            ...value,
-            local_profiles: value.local_profiles.filter(
-              (item) => item !== path,
-            ),
-          }
-        : value,
-    );
-  const launchArgs =
-    settings?.[`${kind}_args` as "codex_args" | "hermes_args" | "pi_args"] ||
-    [];
-  const updateLaunchArg = (index: number, argument: string) =>
-    setSettings((value) => {
-      if (!value) return value;
-      const key = `${kind}_args` as "codex_args" | "hermes_args" | "pi_args";
-      const args = [...value[key]];
-      args[index] = argument;
-      return { ...value, [key]: args };
-    });
-  const addLaunchArg = () => {
-    const index = launchArgs.length;
-    setSettings((value) => {
-      if (!value) return value;
-      const key = `${kind}_args` as "codex_args" | "hermes_args" | "pi_args";
-      return { ...value, [key]: [...value[key], ""] };
-    });
-    requestAnimationFrame(() => launchArgumentRefs.current[index]?.focus());
-  };
-  const removeLaunchArg = (index: number) =>
-    setSettings((value) => {
-      if (!value) return value;
-      const key = `${kind}_args` as "codex_args" | "hermes_args" | "pi_args";
-      return {
-        ...value,
-        [key]: value[key].filter((_, item) => item !== index),
-      };
-    });
-  const environmentVariables =
-    kind === "local" || !settings ? null : (
-      <EnvironmentVariables
-        values={
-          settings[`${kind}_env` as "codex_env" | "hermes_env" | "pi_env"]
-        }
-        onChange={(values) =>
-          setSettings((value) =>
-            value ? { ...value, [`${kind}_env`]: values } : value,
-          )
-        }
-      />
-    );
-  const launchArguments = (
-    <fieldset className="profile-settings launch-arguments">
-      <legend>启动参数</legend>
-      <small>每项为一个独立参数，保存后应用于新建和重启的会话。</small>
-      <div className="launch-argument-list">
-        {launchArgs.map((argument, index) => (
-          <div key={index}>
-            <input
-              ref={(element) => {
-                launchArgumentRefs.current[index] = element;
-              }}
-              value={argument}
-              onChange={(event) => updateLaunchArg(index, event.target.value)}
-              placeholder="例如 --model 或 gpt-5"
-              aria-label={`启动参数 ${index + 1}`}
-            />
-            <button
-              type="button"
-              className="icon"
-              aria-label={`移除启动参数 ${index + 1}`}
-              title="移除参数"
-              onClick={() => removeLaunchArg(index)}
-            >
-              <Trash2 />
-            </button>
-          </div>
-        ))}
-      </div>
-      <button
-        type="button"
-        className="icon launch-argument-add"
-        onClick={addLaunchArg}
-        aria-label="添加启动参数"
-        title="添加启动参数"
-      >
-        +
-      </button>
-    </fieldset>
-  );
-  const title =
-    kind === "local"
-      ? "Local Bash"
-      : kind === "codex"
-        ? "Codex"
-        : kind === "hermes"
-          ? "Hermes"
-          : "Pi";
-  return (
-    <div className="dialog-overlay" role="presentation">
-      <section
-        className="dialog agent-settings"
-        ref={ref}
-        role="dialog"
-        aria-modal="true"
-        aria-label={`${title} 设置`}
-      >
-        <header>
-          <span className="eyebrow">{kind.toUpperCase()} SESSIONS</span>
-          <h2>{kind === "local" ? "Bash 启动文件" : `${title} 会话设置`}</h2>
-          <p>
-            {kind === "local"
-              ? "新建的 Bash 终端会按此顺序加载文件。"
-              : "恢复会话优先使用以下设置"}
-          </p>
-        </header>
-        {error && (
-          <p className="error" role="alert">
-            {error}
-          </p>
-        )}
-        {!settings ? (
-          <p className="muted">正在读取设置…</p>
-        ) : (
-          <div className="setting-fields">
-            {kind === "local" ? (
-              <fieldset className="profile-settings local-profile-settings">
-                <legend>自动加载的 profile 文件</legend>
-                <small>第一个文件固定为 ~/.bashrc，不能删除。</small>
-                <div className="local-profile-list">
-                  {settings.local_profiles.map((path, index) => (
-                    <div key={path}>
-                      <span title={path}>{path}</span>
-                      {index === 0 ? (
-                        <small>固定</small>
-                      ) : (
-                        <button
-                          className="icon"
-                          aria-label={`移除 ${path}`}
-                          title="移除文件"
-                          onClick={() => removeLocalProfile(path)}
-                        >
-                          <Trash2 />
-                        </button>
-                      )}
-                    </div>
-                  ))}
-                </div>
-              </fieldset>
-            ) : (
-              <>
-                {environmentVariables}
-                {launchArguments}
-              </>
-            )}
-          </div>
-        )}
-        <footer>
-          <button className="secondary" onClick={close}>
-            取消
-          </button>
-          <button onClick={() => void save()} disabled={!settings || saving}>
-            {saving ? "正在保存…" : "保存设置"}
-          </button>
-        </footer>
-      </section>
-    </div>
-  );
-}
-
-function WorkspacePicker({
-  sessions,
-  close,
-  select,
-  profile,
-  kind,
-}: {
-  sessions: Session[];
-  close: () => void;
-  select: (path: string, launchArgs: string[]) => Promise<void>;
-  profile?: string;
-  kind: Kind;
-}) {
-  const [current, setCurrent] = useState(""),
-    [parent, setParent] = useState(""),
-    [entries, setEntries] = useState<BrowseResult["entries"]>([]),
-    [manual, setManual] = useState("~"),
-    [launchArgs, setLaunchArgs] = useState<string[]>([]),
-    [loading, setLoading] = useState(false),
-    [error, setError] = useState(""),
-    [showHidden, setShowHidden] = useState(false);
-  const launchArgumentRefs = useRef<(HTMLInputElement | null)[]>([]);
-  const browseVersion = useRef<SessionLoadVersion>({ current: 0 });
-  const dialogRef = useRef<HTMLElement>(null);
-  useDialogFocus(close, dialogRef);
-  const recent = recentWorkspaces(sessions);
-  const visibleEntries = entries.filter((entry) => showHidden || !entry.name.startsWith("."));
-  const browse = async (path: string) => {
-    const version = beginSessionLoad(browseVersion.current);
-    setLoading(true);
-    setError("");
-    try {
-      const r = await api<BrowseResult>(
-        `/workspaces/browse?path=${encodeURIComponent(path)}`,
-      );
-      if (!isCurrentSessionLoad(browseVersion.current, version)) return;
-      setCurrent(r.path);
-      setParent(r.parent);
-      setManual(r.path);
-      setEntries(r.entries.filter((x) => x.directory));
-    } catch (e) {
-      if (isCurrentSessionLoad(browseVersion.current, version))
-        setError(errorMessage(e));
-    } finally {
-      if (isCurrentSessionLoad(browseVersion.current, version))
-        setLoading(false);
-    }
-  };
-  useEffect(() => {
-    void browse("~");
-    void api<SettingsResponse>("/settings")
-      .then((value) =>
-        setLaunchArgs(
-          value.settings[
-            `${kind}_args` as "codex_args" | "hermes_args" | "pi_args"
-          ] || [],
-        ),
-      )
-      .catch(() => {});
-  }, [kind]);
-  const enter = (name: string) =>
-    void browse(current === "/" ? `/${name}` : `${current}/${name}`);
-  const updateLaunchArg = (index: number, argument: string) =>
-    setLaunchArgs((value) =>
-      value.map((item, itemIndex) => (itemIndex === index ? argument : item)),
-    );
-  const addLaunchArg = () => {
-    const index = launchArgs.length;
-    setLaunchArgs((value) => [...value, ""]);
-    requestAnimationFrame(() => launchArgumentRefs.current[index]?.focus());
-  };
-  const removeLaunchArg = (index: number) =>
-    setLaunchArgs((value) =>
-      value.filter((_, itemIndex) => itemIndex !== index),
-    );
-  return (
-    <div
-      className="workspace-overlay"
-      onMouseDown={(e) => e.target === e.currentTarget && close()}
-    >
-      <section
-        ref={dialogRef}
-        className="workspace-picker"
-        role="dialog"
-        aria-modal="true"
-        aria-label="选择工作目录"
-      >
-        <header>
-          <div>
-            <span className="eyebrow">
-              {kind === "hermes" ? `Hermes · ${profile || "default"}` : "Codex"}
-            </span>
-            <h3>选择工作目录</h3>
-            <span>新会话将在此目录启动</span>
-          </div>
-          <button className="icon" aria-label="关闭目录选择器" onClick={close}>
-            <X />
-          </button>
-        </header>
-        {recent.length > 0 && (
-          <div className="recent-workspaces">
-            <strong>最近使用</strong>
-            <div>
-              {recent.map((p) => (
-                <button key={p} onClick={() => void browse(p)} title={p}>
-                  {p}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
-        <form
-          className="workspace-path"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void browse(manual);
-          }}
-        >
-          <button
-            type="button"
-            aria-label="用户主目录"
-            title="用户主目录"
-            onClick={() => void browse("~")}
-          >
-            <Home />
-          </button>
-          <button
-            type="button"
-            aria-label="上级目录"
-            title="上级目录"
-            disabled={!parent || parent === current}
-            onClick={() => void browse(parent)}
-          >
-            <ChevronLeft />
-          </button>
-          <input
-            value={manual}
-            onChange={(e) => setManual(e.target.value)}
-            aria-label="文件目录路径"
-          />
-          <button type="submit">前往</button>
-        </form>
-        <label className="workspace-hidden-files" htmlFor="show-hidden-files">
-          <Checkbox.Root id="show-hidden-files" checked={showHidden} onCheckedChange={(checked) => setShowHidden(checked === true)}>
-            <Checkbox.Indicator>✓</Checkbox.Indicator>
-          </Checkbox.Root>
-          显示隐藏文件
-        </label>
-        <div className="directory-list">
-          {loading ? (
-            <p className="muted">正在读取目录…</p>
-          ) : visibleEntries.length ? (
-            visibleEntries.map((x) => (
-              <button key={x.name} onClick={() => enter(x.name)}>
-                <FolderOpen />
-                <span>{x.name}</span>
-                <ChevronDown />
-              </button>
-            ))
-          ) : (
-            <div className="picker-empty">
-              <Folder />
-              <p>当前目录没有子目录</p>
-            </div>
-          )}
-        </div>
-        <fieldset className="workspace-launch-args">
-          <legend>启动参数</legend>
-          <div className="launch-argument-list">
-            {launchArgs.map((argument, index) => (
-              <div key={index}>
-                <input
-                  ref={(element) => {
-                    launchArgumentRefs.current[index] = element;
-                  }}
-                  value={argument}
-                  onChange={(event) =>
-                    updateLaunchArg(index, event.target.value)
-                  }
-                  placeholder="例如 --model 或 gpt-5"
-                  aria-label={`启动参数 ${index + 1}`}
-                />
-                <button
-                  type="button"
-                  className="icon"
-                  aria-label={`移除启动参数 ${index + 1}`}
-                  title="移除参数"
-                  onClick={() => removeLaunchArg(index)}
-                >
-                  <Trash2 />
-                </button>
-              </div>
-            ))}
-          </div>
-          <button
-            type="button"
-            className="icon launch-argument-add"
-            onClick={addLaunchArg}
-            aria-label="添加启动参数"
-            title="添加启动参数"
-          >
-            +
-          </button>
-        </fieldset>
-        {error && <p className="error workspace-error">{error}</p>}
-        <footer>
-          <span title={current}>{current || "~"}</span>
-          <button
-            type="button"
-            disabled={loading || !current}
-            onClick={async () => {
-              setLoading(true);
-              await select(
-                current,
-                launchArgs.filter((argument) => argument.trim()),
-              );
-            }}
-          >
-            在此启动会话
-          </button>
-        </footer>
-      </section>
-    </div>
-  );
-}
-
-function AgentTerminal({
-  session,
-  onStatus,
-  onProgress,
-  terminalPath = "codex",
-  terminalTheme,
-  terminalFontSize = initialTerminalFontSize(),
-  onTerminalFontSizeChange = (size) =>
-    window.dispatchEvent(
-      new CustomEvent("jian-terminal-font-size", { detail: size }),
-    ),
-}: {
-  session: TerminalSession;
-  onStatus: (v: string) => void;
-  onProgress: (v: string) => void;
-  terminalPath?: Kind | "local";
-  terminalTheme: TerminalTheme;
-  terminalFontSize?: number;
-  onTerminalFontSizeChange?: (size: number) => void;
-}) {
-  const host = useRef<HTMLDivElement>(null),
-    inputBufferRef = useRef<HTMLTextAreaElement>(null),
-    previewRef = useRef<HTMLSpanElement>(null),
-    wsRef = useRef<WebSocket | null>(null),
-    termRef = useRef<Terminal | null>(null);
-  const [fontSize, setFontSize] = useState(terminalFontSize);
-  const changeFontSize = (size: number) => {
-    setFontSize(size);
-    onTerminalFontSizeChange(size);
-  };
-  const [toolsOpen, setToolsOpen] = useState(false);
-  const usesTouchInput = () =>
-    window.matchMedia("(pointer: coarse), (hover: none)").matches;
-  const focus = () => {
-    if (
-      document.querySelector(
-        '[role="dialog"][aria-modal="true"], [role="dialog"][data-state="open"]',
-      )
-    )
-      return;
-    if (usesTouchInput() && inputBufferRef.current)
-      inputBufferRef.current.focus({ preventScroll: true });
-    else termRef.current?.focus();
-  };
-  const copySelection = () => {
-    const term = termRef.current;
-    if (!term?.hasSelection()) return false;
-    const selected = term.getSelection();
-    const fallback = () => {
-      const copy = document.createElement("textarea");
-      copy.value = selected;
-      copy.style.position = "fixed";
-      copy.style.opacity = "0";
-      document.body.append(copy);
-      copy.select();
-      try {
-        document.execCommand("copy");
-      } catch {}
-      copy.remove();
-    };
-    const pending = navigator.clipboard?.writeText(selected);
-    if (pending) void pending.catch(fallback);
-    else fallback();
-    term.clearSelection();
-    focus();
-    return true;
-  };
-  const send = (data: string) => {
-    if (data === "\u0003" && copySelection()) return;
-    const ws = wsRef.current;
-    if (ws?.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "input", data }));
-    requestAnimationFrame(focus);
-  };
-  const sendAttachment = async (file: Blob, name?: string) => {
-    const data = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(String(reader.result).split(",", 2)[1] || "");
-      reader.onerror = () => reject(reader.error);
-      reader.readAsDataURL(file);
-    });
-    const ws = wsRef.current;
-    if (data && ws?.readyState === WebSocket.OPEN) {
-      const extension = ({ "application/pdf": "pdf", "application/msword": "doc", "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx", "text/plain": "txt" } as Record<string, string>)[file.type] || file.type.split("/", 2)[1] || "bin";
-      ws.send(JSON.stringify({ type: "attachment", name: name || `clipboard.${extension}`, mime: file.type, data }));
-    }
-  };
-  const pasteClipboard = async (event?: ClipboardEvent) => {
-    const clipboard = event?.clipboardData;
-    const file = clipboard
-      ? Array.from(clipboard.items || []).find(item => item.kind === "file")?.getAsFile() || Array.from(clipboard.files || [])[0]
-      : undefined;
-    if (file) {
-      event?.preventDefault();
-      await sendAttachment(file, file instanceof File ? file.name : undefined);
-      return;
-    }
-    if (event && usesTouchInput()) return;
-    if (!event) {
-      try {
-        for (const item of await navigator.clipboard?.read() || []) {
-          const type = item.types.find(value => !value.startsWith("text/"));
-          if (type) {
-            await sendAttachment(await item.getType(type));
-            return;
-          }
-        }
-      } catch {}
-    }
-    const text = clipboard?.getData("text/plain") || await navigator.clipboard?.readText();
-    if (text) {
-      event?.preventDefault();
-      send(text);
-      return;
-    }
-    try { document.execCommand("paste"); } catch {}
-  };
-  useEffect(() => {
-    if (!host.current) return;
-    return mountTerminal({
-      host: host.current,
-      inputBuffer: inputBufferRef.current,
-      preview: previewRef.current,
-      terminalRef: termRef,
-      socketRef: wsRef,
-      sessionID: session.id,
-      terminalPath,
-      theme: terminalTheme,
-      fontSize,
-      focus,
-      send,
-      onStatus,
-      onProgress,
-    });
-  }, [session.id, terminalPath]);
-  useEffect(() => {
-    const change = (event: Event) =>
-      setFontSize((event as CustomEvent<number>).detail);
-    window.addEventListener("jian-terminal-font-size", change);
-    return () => window.removeEventListener("jian-terminal-font-size", change);
-  }, []);
-  useEffect(() => {
-    if (termRef.current)
-      termRef.current.options.theme = terminalThemes[terminalTheme];
-  }, [terminalTheme]);
-  useEffect(() => {
-    if (termRef.current) {
-      termRef.current.options.fontSize = fontSize;
-      window.dispatchEvent(new Event("resize"));
-    }
-  }, [fontSize]);
-  useEffect(() => {
-    const element = host.current;
-    if (!element) return;
-    let lastY: number | null = null,
-      distance = 0,
-      moved = false,
-      holdTimer = 0,
-      held = false;
-    const reset = () => {
-      window.clearTimeout(holdTimer);
-      holdTimer = 0;
-      lastY = null;
-      distance = 0;
-      moved = false;
-      held = false;
-    };
-    const start = (event: TouchEvent) => {
-      if (event.touches.length !== 1) {
-        reset();
-        return;
-      }
-      lastY = event.touches[0].clientY;
-      distance = 0;
-      moved = false;
-      held = false;
-      window.clearTimeout(holdTimer);
-      holdTimer = window.setTimeout(() => { held = true; }, 700);
-    };
-    const move = (event: TouchEvent) => {
-      if (held) return;
-      if (lastY === null || event.touches.length !== 1) return;
-      const currentY = event.touches[0].clientY;
-      distance += lastY - currentY;
-      lastY = currentY;
-      if (!moved && Math.abs(distance) < 4) return;
-      moved = true;
-      if (event.cancelable) event.preventDefault();
-      const term = termRef.current;
-      if (!term) return;
-      const lineHeight = Math.max(
-        12,
-        (term.options.fontSize ?? 15) * (term.options.lineHeight ?? 1),
-      );
-      const lines =
-        distance > 0
-          ? Math.floor(distance / lineHeight)
-          : Math.ceil(distance / lineHeight);
-      if (lines !== 0) {
-        term.scrollLines(lines);
-        distance -= lines * lineHeight;
-      }
-    };
-    const end = () => {
-      if (!moved) focus();
-      reset();
-    };
-    element.addEventListener("touchstart", start, { passive: true });
-    element.addEventListener("touchmove", move, { passive: false });
-    element.addEventListener("touchend", end, { passive: true });
-    element.addEventListener("touchcancel", reset, { passive: true });
-    return () => {
-      window.clearTimeout(holdTimer);
-      element.removeEventListener("touchstart", start);
-      element.removeEventListener("touchmove", move);
-      element.removeEventListener("touchend", end);
-      element.removeEventListener("touchcancel", reset);
-    };
-  }, [session.id]);
-  const paste = () => {
-    focus();
-    try {
-      document.execCommand("paste");
-    } catch {}
-  };
-  const toggleTools = () =>
-    requestAnimationFrame(() => window.dispatchEvent(new Event("resize")));
-  return (
-    <section
-      className="terminal-area"
-      style={
-        {
-          "--terminal-bg": terminalThemeColors[terminalTheme].background,
-          "--terminal-fg": terminalThemeColors[terminalTheme].foreground,
-        } as CSSProperties
-      }
-    >
-      <div
-        className="terminal-stage"
-        onKeyDownCapture={event => {
-          if (!isPasteShortcut(event.nativeEvent)) return;
-          event.preventDefault();
-          void pasteClipboard();
-        }}
-        onPaste={event => void pasteClipboard(event.nativeEvent)}
-      >
-        <div className="terminal" ref={host} />
-        <textarea
-          ref={inputBufferRef}
-          className="terminal-input-buffer"
-          aria-label="终端输入"
-          autoCapitalize="none"
-          autoComplete="off"
-          autoCorrect="off"
-          enterKeyHint="enter"
-          inputMode="text"
-          spellCheck={false}
-          tabIndex={-1}
-        />
-        <span
-          ref={previewRef}
-          className="terminal-input-preview"
-          aria-hidden="true"
-        />
-      </div>
-      <Collapsible.Root
-        className={"terminal-tools " + (toolsOpen ? "open" : "")}
-        open={toolsOpen}
-        onOpenChange={setToolsOpen}
-        onAnimationEnd={toggleTools}
-      >
-        <Collapsible.Trigger asChild>
-          <button className="terminal-tools-toggle">
-            {toolsOpen ? "收起终端按键" : "终端按键"}
-            <ChevronDown />
-          </button>
-        </Collapsible.Trigger>
-        <Collapsible.Content
-          forceMount
-          className="terminal-controls"
-          role="toolbar"
-          aria-label="终端控制键"
-        >
-          <TerminalFontSizeControl
-            compact
-            size={fontSize}
-            onChange={changeFontSize}
-          />
-          <div className="terminal-navigation">
-            <button onPointerDown={focus} onClick={() => send("\u001b")}>
-              ESC
-            </button>
-            <button
-              aria-label="方向键上"
-              onPointerDown={focus}
-              onClick={() => send("\u001b[A")}
-            >
-              <ArrowUp />
-            </button>
-            <button
-              aria-label="退格"
-              onPointerDown={focus}
-              onClick={() => send("\u007f")}
-            >
-              DEL
-            </button>
-            <button
-              aria-label="方向键左"
-              onPointerDown={focus}
-              onClick={() => send("\u001b[D")}
-            >
-              <ArrowLeft />
-            </button>
-            <button
-              aria-label="方向键下"
-              onPointerDown={focus}
-              onClick={() => send("\u001b[B")}
-            >
-              <ArrowDown />
-            </button>
-            <button
-              aria-label="方向键右"
-              onPointerDown={focus}
-              onClick={() => send("\u001b[C")}
-            >
-              <ArrowRight />
-            </button>
-          </div>
-          <div className="terminal-functions">
-            <button onPointerDown={focus} onClick={() => send("\t")}>
-              TAB
-            </button>
-            <button onPointerDown={focus} onClick={() => send("\u001b[Z")}>
-              SHIFT+TAB
-            </button>
-            <button onPointerDown={focus} onClick={() => send("/")}>
-              /
-            </button>
-            <button onPointerDown={focus} onClick={() => send("\u0003")}>
-              CTRL+C
-            </button>
-            <button onPointerDown={focus} onClick={() => void pasteClipboard()}>
-              CTRL+V
-            </button>
-            <button onPointerDown={focus} onClick={() => send("\r")}>
-              Enter
-            </button>
-          </div>
-        </Collapsible.Content>
-      </Collapsible.Root>
-    </section>
-  );
-}
-
-type OpenSession = Session | LocalSession;
-const settingsTabKey = "jian.settings-tab-open";
-
-const openSessionKey = (session: OpenSession) =>
-  `${session.kind}:${session.kind === "hermes" || session.kind === "pi" ? `${session.profile || "default"}:` : ""}${session.id}`;
-const openSessionTitle = (session: OpenSession) =>
-  session.kind === "local" ? "Bash" : displayTitle(session);
-const openSessionLabel = (session: OpenSession) =>
-  session.kind === "local"
-    ? "Local"
-    : session.kind === "hermes"
-      ? "Hermes"
-      : session.kind === "pi"
-        ? "Pi"
-      : "Codex";
 const readSessionCache = (username: string, kind: Kind): Session[] => {
   try {
     const value = JSON.parse(
@@ -1018,206 +146,6 @@ const writeSessionCache = (
     );
   } catch {}
 };
-
-function SessionTabs({
-  sessions,
-  activeKey,
-  settingsOpen,
-  select,
-  openSettings,
-  closeSettings,
-  close,
-  reorder,
-}: {
-  sessions: OpenSession[];
-  activeKey: string | null;
-  settingsOpen: boolean;
-  select: (key: string) => void;
-  openSettings: () => void;
-  closeSettings: () => void;
-  close: (key: string) => void;
-  reorder: (from: string, to: string) => void;
-}) {
-  const [dragKey, setDragKey] = useState<string | null>(null);
-  const [dropKey, setDropKey] = useState<string | null>(null);
-  const sessionKeys = sessions.map(openSessionKey);
-  const [order, setOrder] = useState(() => [...sessionKeys, "settings"]);
-  const [settingsVisible, setSettingsVisible] = useState(
-    () => settingsOpen || sessionStorage.getItem(settingsTabKey) === "1",
-  );
-  useEffect(() => {
-    if (settingsOpen) setSettingsVisible(true);
-  }, [settingsOpen]);
-  useEffect(() => {
-    if (settingsVisible) sessionStorage.setItem(settingsTabKey, "1");
-    else sessionStorage.removeItem(settingsTabKey);
-  }, [settingsVisible]);
-  useEffect(() => {
-    setOrder((current) => {
-      const next = [
-        ...current.filter((key) => (key === "settings" ? settingsVisible : sessionKeys.includes(key))),
-        ...sessionKeys.filter((key) => !current.includes(key)),
-      ];
-      if (settingsVisible && !next.includes("settings")) next.push("settings");
-      return next.join("\0") === current.join("\0") ? current : next;
-    });
-  }, [sessions, settingsVisible]);
-  const removeSettings = () => {
-    setSettingsVisible(false);
-    setOrder((current) => current.filter((key) => key !== "settings"));
-    closeSettings();
-  };
-  const move = (from: string, to: string) => {
-    setOrder((current) => {
-      const fromIndex = current.indexOf(from);
-      const toIndex = current.indexOf(to);
-      if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return current;
-      const next = [...current];
-      const [tab] = next.splice(fromIndex, 1);
-      next.splice(toIndex, 0, tab);
-      return next;
-    });
-    if (from !== "settings" && to !== "settings") reorder(from, to);
-  };
-  return (
-    <Tabs.Root
-      className="session-tabs"
-      value={settingsOpen ? "settings" : activeKey || "terminal"}
-      onValueChange={(value) =>
-        value === "settings" ? openSettings() : select(value)
-      }
-      orientation="horizontal"
-    >
-      <Tabs.List className="session-tabs-list" aria-label="已打开的会话">
-        {order.map((key) => {
-          if (key === "settings")
-            return (
-              <Tabs.Trigger
-                key="settings"
-                className={
-                  "session-tab session-settings-tab " +
-                  (dragKey === "settings" ? "dragging " : "") +
-                  (dropKey === "settings" ? "drop-target" : "")
-                }
-                value="settings"
-                draggable
-                onDragStart={(event) => {
-                  setDragKey("settings");
-                  event.dataTransfer.setData("text/plain", "settings");
-                }}
-                onDragOver={(event) => {
-                  event.preventDefault();
-                  if (dragKey !== "settings") setDropKey("settings");
-                }}
-                onDrop={(event) => {
-                  event.preventDefault();
-                  const from =
-                    event.dataTransfer.getData("text/plain") || dragKey;
-                  if (from && from !== "settings") move(from, "settings");
-                  setDragKey(null);
-                  setDropKey(null);
-                }}
-                onDragEnd={() => {
-                  setDragKey(null);
-                  setDropKey(null);
-                }}
-              >
-                <span className="session-tab-kind">Jian</span>
-                <span className="session-tab-title">设置</span>
-                <span
-                  className="session-tab-close"
-                  role="button"
-                  tabIndex={-1}
-                  aria-label="关闭设置"
-                  title="关闭标签页"
-                  onClick={(event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    removeSettings();
-                  }}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      removeSettings();
-                    }
-                  }}
-                >
-                  <X />
-                </span>
-              </Tabs.Trigger>
-            );
-          const session = sessions.find((item) => openSessionKey(item) === key);
-          if (!session) return null;
-          return (
-            <Tabs.Trigger
-              className={
-                "session-tab " +
-                (dragKey === key ? "dragging " : "") +
-                (dropKey === key ? "drop-target" : "")
-              }
-              value={key}
-              key={key}
-              title={session.workspace}
-              draggable
-              onDragStart={(event) => {
-                setDragKey(key);
-                event.dataTransfer.effectAllowed = "move";
-                event.dataTransfer.setData("text/plain", key);
-              }}
-              onDragOver={(event) => {
-                event.preventDefault();
-                if (dragKey !== key) setDropKey(key);
-              }}
-              onDragLeave={() =>
-                setDropKey((value) => (value === key ? null : value))
-              }
-              onDrop={(event) => {
-                event.preventDefault();
-                const from =
-                  event.dataTransfer.getData("text/plain") || dragKey;
-                if (from && from !== key) move(from, key);
-                setDragKey(null);
-                setDropKey(null);
-              }}
-              onDragEnd={() => {
-                setDragKey(null);
-                setDropKey(null);
-              }}
-            >
-              <span className="session-tab-kind">
-                {openSessionLabel(session)}
-              </span>
-              <span className="session-tab-title">
-                {openSessionTitle(session)}
-              </span>
-              <span
-                className="session-tab-close"
-                role="button"
-                tabIndex={-1}
-                aria-label={`关闭 ${openSessionTitle(session)}`}
-                title="关闭标签页"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  close(key);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    close(key);
-                  }
-                }}
-              >
-                <X />
-              </span>
-            </Tabs.Trigger>
-          );
-        })}
-      </Tabs.List>
-    </Tabs.Root>
-  );
-}
 
 function App() {
   const startKind = initialKind();
@@ -1253,17 +181,41 @@ function App() {
     [terminalAttached, setTerminalAttached] = useState(true),
     [connectedSessionID, setConnectedSessionID] = useState<string | null>(null),
     [mobileNavigationOpen, setMobileNavigationOpen] = useState(false),
+    [compactNavigation, setCompactNavigation] = useState(isMobile),
+    [tabOrder, setTabOrder] = useState<string[]>(() => []),
     [picking, setPicking] = useState(false),
+    [settingsBusy, setSettingsBusyState] = useState(false),
+    [creating, setCreating] = useState(false),
     [dialog, setDialog] = useState<{
       mode: "rename" | "delete";
       session: Session;
     } | null>(null),
-    [settingsKind, setSettingsKind] = useState<Kind | "local" | null>(null),
+    [settingsTarget, setSettingsTarget] = useState<Kind | "local" | null>(null),
+    [settingsDirty, setSettingsDirty] = useState(false),
+    [discardOpen, setDiscardOpen] = useState(false),
+    [confirmation, setConfirmation] = useState<{ type: "release" | "restart" | "local-delete"; session: OpenSession } | null>(null),
+    [operationBusy, setOperationBusy] = useState(false),
+    [connection, setConnection] = useState<ConnectionState>("disconnected"),
+    [wideScreen, setWideScreen] = useState(() => window.matchMedia("(min-width: 1200px)").matches),
+    [catalogError, setCatalogError] = useState<{ kind: Kind; profile: string; message: string } | null>(null),
     [visibleCounts, setVisibleCounts] = useState<Record<string, number>>({});
   const token = useRef<SessionLoadVersion>({ current: 0 }),
-    sidebarRef = useRef<HTMLElement>(null),
     sessionCache = useRef<Partial<Record<Kind, Session[]>>>({}),
     hermesHomeSelected = useRef(false);
+  const settingsBusyRef = useRef(false), creatingRef = useRef(false), authEpoch = useRef(0);
+  const leavingSettings = useRef<(() => void) | null>(null);
+  const operationInFlight = useRef(false);
+  const requestNavigation = (action: () => void) => {
+    if (settingsBusyRef.current || creatingRef.current) return;
+    if (settingsOpen && settingsDirty) { leavingSettings.current = action; setDiscardOpen(true); }
+    else action();
+  };
+  const openSettings = (target: Kind | "local" | null = null) => {
+    if (navigationLocked()) return;
+    setSettingsTarget(target); setSettingsOpen(true); setMobileNavigationOpen(false);
+  };
+  const setSettingsBusy = (busy: boolean) => { settingsBusyRef.current = busy; setSettingsBusyState(busy); };
+  const navigationLocked = () => settingsBusyRef.current || creatingRef.current;
   const [terminalTheme, setTerminalTheme] =
       useState<TerminalTheme>(initialTerminalTheme),
     [terminalFontSize, setTerminalFontSize] = useState(initialTerminalFontSize);
@@ -1303,18 +255,18 @@ function App() {
           sessions.map(
             (session) =>
               rows.find(
-                (row) => row.id === session.id && row.kind === session.kind,
+                (row) => openSessionKey(row) === openSessionKey(session),
               ) || session,
           ),
         );
         setActive((session) =>
           session?.kind === target
             ? rows.find(
-                (row) => row.id === session.id && row.kind === session.kind,
+                (row) => openSessionKey(row) === openSessionKey(session),
               ) || session
             : session,
         );
-        setError("");
+        setCatalogError(value => value?.kind === target && value.profile === profile ? null : value);
       }
       if (
         currentTarget &&
@@ -1327,7 +279,7 @@ function App() {
       ) {
         const restored = savedSession(
           rows,
-          localStorage.getItem(activeSessionKey(target, profile)),
+          localStorage.getItem(activeSessionKey(target, profile)) || (target === "pi" ? localStorage.getItem(activeSessionKey(target)) : null),
           target,
           profile,
         );
@@ -1340,7 +292,7 @@ function App() {
       return true;
     } catch (e) {
       if (currentTarget && isCurrentSessionLoad(token.current, t))
-        setError(errorMessage(e));
+        setCatalogError({ kind: target, profile, message: errorMessage(e) });
       return false;
     }
   };
@@ -1350,9 +302,14 @@ function App() {
     setConnectedSessionID(null);
     setProgress("");
   };
-  const activate = (session: OpenSession) => {
-    setSettingsOpen(false);
+  const activate = (session: OpenSession, completingCreation = false) => {
+    if (navigationLocked() && !completingCreation) return;
     const key = openSessionKey(session);
+    if (!settingsOpen && tabsRef.current.selected === key && tabsRef.current.attached) {
+      setMobileNavigationOpen(false);
+      return;
+    }
+    setSettingsOpen(false);
     setOpenSessions((current) =>
       current.some((item) => openSessionKey(item) === key)
         ? current
@@ -1360,18 +317,20 @@ function App() {
     );
     setActiveKey(key);
     setActive(session);
+    if (secondary && openSessionKey(secondary) === key) setSecondary(null);
     setTerminalAttached(true);
     setConnectedSessionID(null);
+    setConnection("connecting");
     setProgress("正在加载会话…");
     setArea(session.kind);
     localStorage.setItem(selectedSessionKey(session, profile), session.id);
     if (session.kind === "local") localStorage.setItem(activeAreaKey, "local");
     else {
-      const nextProfile = session.profile || profile;
+      const nextProfile = session.profile || "default";
       localStorage.setItem(activeAreaKey, session.kind);
       localStorage.setItem(activeKindKey, session.kind);
       setKind(session.kind);
-      if (session.kind === "hermes") {
+      if (session.kind === "hermes" || session.kind === "pi") {
         hermesHomeSelected.current = false;
         localStorage.setItem(activeProfileKey, nextProfile);
         setProfile(nextProfile);
@@ -1422,13 +381,43 @@ function App() {
         .catch(() => setProfiles([]));
   }, [user, kind]);
   useEffect(() => {
-    const frame = requestAnimationFrame(() => {
-      if (sidebarRef.current)
-        sidebarRef.current.scrollTop =
-          Number(localStorage.getItem(navScrollKey(kind, profile))) || 0;
+    const media = window.matchMedia('(max-width: 800px)');
+    const update = () => { setCompactNavigation(media.matches); setMobileNavigationOpen(false); };
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, []);
+  useEffect(() => {
+    if (!compactNavigation) return;
+    const viewport = window.visualViewport;
+    let frame = 0;
+    const update = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        document.documentElement.style.setProperty('--dialog-viewport-height', `${viewport?.height || window.innerHeight}px`);
+        document.documentElement.style.setProperty('--dialog-viewport-top', `${viewport?.offsetTop || 0}px`);
+      });
+    };
+    update(); viewport?.addEventListener('resize', update); viewport?.addEventListener('scroll', update); window.addEventListener('resize', update);
+    return () => {
+      cancelAnimationFrame(frame); viewport?.removeEventListener('resize', update); viewport?.removeEventListener('scroll', update); window.removeEventListener('resize', update);
+      document.documentElement.style.removeProperty('--dialog-viewport-height'); document.documentElement.style.removeProperty('--dialog-viewport-top');
+    };
+  }, [compactNavigation]);
+  useEffect(() => {
+    const keys = openSessions.map(openSessionKey);
+    setTabOrder(current => {
+      const next = [...current.filter(key => keys.includes(key)), ...keys.filter(key => !current.includes(key))];
+      return next.join('\0') === current.join('\0') ? current : next;
     });
-    return () => cancelAnimationFrame(frame);
-  }, [kind, profile, all.length]);
+  }, [openSessions]);
+  useEffect(() => { sessionStorage.removeItem("jian.settings-tab-open"); }, []);
+  useEffect(() => {
+    const media = window.matchMedia("(min-width: 1200px)");
+    const update = () => setWideScreen(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
   useEffect(() => {
     localStorage.setItem(interfaceThemeKey, theme);
   }, [theme]);
@@ -1499,18 +488,7 @@ function App() {
   }, [user]);
   useEffect(() => {
     const restart = () => {
-      if (!active) return;
-      setProgress("正在重启会话…");
-      void api(`/settings/terminals/${encodeURIComponent(active.id)}/restart`, {
-        method: "POST",
-      })
-        .then(() => {
-          setTerminalAttached(true);
-          setConnectedSessionID(null);
-          setTerminalRevision((value) => value + 1);
-          setProgress("正在重新连接…");
-        })
-        .catch((e) => setError(errorMessage(e)));
+      if (active) setConfirmation({ type: "restart", session: active });
     };
     window.addEventListener("jian-restart-terminal", restart);
     return () => window.removeEventListener("jian-restart-terminal", restart);
@@ -1522,7 +500,7 @@ function App() {
       const target =
         localSessions.find((session) => session.id === id) ||
         all.find((session) => session.id === id);
-      if (target) activate(target);
+      if (target) requestNavigation(() => activate(target));
     };
     window.addEventListener("jian-enter-terminal", enter);
     return () => window.removeEventListener("jian-enter-terminal", enter);
@@ -1530,6 +508,7 @@ function App() {
   useEffect(() => {
     const releaseAll = () => {
       setOpenSessions([]);
+      setSecondary(null);
       clearActive();
       setTerminalAttached(false);
       setProgress("已释放所有会话");
@@ -1541,105 +520,84 @@ function App() {
     return () =>
       window.removeEventListener("jian-release-all-terminals", releaseAll);
   }, [profile]);
+  const tabsRef = useRef({ order: tabOrder, selected: activeKey, sessions: openSessions, underlying: activeKey, attached: terminalAttached });
+  tabsRef.current = { order: tabOrder, selected: activeKey, sessions: openSessions, underlying: activeKey, attached: terminalAttached };
   if (!ready) return null;
   if (!user) return <Login done={me} />;
+  const currentAuthEpoch = authEpoch.current;
+  const isCurrentUser = () => currentAuthEpoch === authEpoch.current;
   const choose = (s: Session) => activate(activeView(s));
   const chooseLocal = (session: LocalSession) => activate(session);
   const selectTab = (key: string) => {
+    if (navigationLocked()) return;
     const session = openSessions.find((item) => openSessionKey(item) === key);
     if (session) activate(session);
   };
-  const reorderTabs = (from: string, to: string) =>
-    setOpenSessions((current) => {
-      const fromIndex = current.findIndex(
-        (item) => openSessionKey(item) === from,
-      );
-      const toIndex = current.findIndex((item) => openSessionKey(item) === to);
-      if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return current;
-      const next = [...current];
-      const [moved] = next.splice(fromIndex, 1);
-      next.splice(toIndex, 0, moved);
-      return next;
-    });
+  const reorderTabs = (from: string, to: string) => {
+    if (!navigationLocked()) setTabOrder(current => moveTab(current, from, to));
+  };
   const closeTab = (key: string) => {
-    const index = openSessions.findIndex(
-      (item) => openSessionKey(item) === key,
-    );
-    const closed = openSessions[index];
+    const { order, selected, sessions, underlying } = tabsRef.current;
+    const closed = sessions.find(item => openSessionKey(item) === key);
     if (!closed) return;
-    const next = openSessions.filter((item) => openSessionKey(item) !== key);
-    setOpenSessions(next);
-    if (key !== activeKey) return;
-    const replacement = next[Math.max(0, index - 1)] || next[0];
-    if (replacement) {
-      activate(replacement);
+    setSecondary(current => current && openSessionKey(current) === key ? null : current);
+    const replacement = adjacentTab(order, key);
+    setTabOrder(current => current.filter(item => item !== key));
+    setOpenSessions(current => current.filter(item => openSessionKey(item) !== key));
+    if (closed && localStorage.getItem(selectedSessionKey(closed, profile)) === closed.id)
+      localStorage.removeItem(selectedSessionKey(closed, profile));
+    if (key !== selected) {
+      if (key === underlying) clearActive();
       return;
     }
-    localStorage.removeItem(selectedSessionKey(closed, profile));
-    clearActive();
+    const next = sessions.find(item => openSessionKey(item) === replacement);
+    if (next) activate(next); else clearActive();
   };
   const createLocal = async () => {
-    try {
-      const x = await api<LocalSession>("/local/sessions", {
-        method: "POST",
-        body: JSON.stringify({}),
-      });
-      setLocalSessions((rows) => [x, ...rows]);
-      chooseLocal(x);
-    } catch (e) {
-      setError(errorMessage(e));
-    }
+    try { await create(undefined, [], "default", "local"); }
+    catch (e) { setError(errorMessage(e)); }
   };
   const removeLocal = async (session: LocalSession) => {
-    try {
-      await api(`/local/sessions/${encodeURIComponent(session.id)}`, {
-        method: "DELETE",
-      });
-      setLocalSessions((rows) => rows.filter((x) => x.id !== session.id));
-      const key = openSessionKey(session);
-      setOpenSessions((rows) =>
-        rows.filter((item) => openSessionKey(item) !== key),
-      );
-      if (activeKey === key) {
-        localStorage.removeItem(selectedSessionKey(session));
-        localStorage.removeItem(activeAreaKey);
-        setActive(null);
-        setActiveKey(null);
-      }
-    } catch (e) {
-      setError(errorMessage(e));
-    }
+    await api(`/local/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
+    setLocalSessions(rows => rows.filter(item => item.id !== session.id));
+    closeTab(openSessionKey(session));
   };
   const refresh = async (k: Kind) => {
     if (refreshingKind) return;
     setRefreshingKind(k);
-    setProgress("正在刷新会话…");
-    if (await load(k, true)) setProgress("已刷新");
-    else setProgress("刷新失败");
+    await load(k, true);
     setRefreshingKind(null);
   };
   const create = async (
-    workspace: string,
+    workspace: string | undefined,
     launchArgs: string[] = [],
     targetProfile = profile,
+    targetKind: Kind | "local" = kind,
   ) => {
-    invalidateSessionLoads(token.current);
-    const x = activeView(
-      await api<Session>(`/agents/${kind}/sessions`, {
+    if (navigationLocked()) return;
+    creatingRef.current = true; setCreating(true);
+    const epoch = authEpoch.current;
+    try {
+      if (targetKind === "pi" && workspace === undefined) {
+        const { settings } = await api<SettingsResponse>("/settings");
+        if (epoch !== authEpoch.current) return;
+        const role = settings.pi_roles.find(item => item.name === targetProfile);
+        if (!role) throw new Error("Pi 角色不存在");
+        workspace = role.home;
+      }
+      invalidateSessionLoads(token.current);
+      const x = await api<OpenSession>(targetKind === "local" ? "/local/sessions" : `/agents/${targetKind}/sessions`, {
         method: "POST",
-        body: JSON.stringify({
-          workspace,
-          launch_args: launchArgs,
-          ...(kind === "hermes" || kind === "pi"
-            ? { profile: targetProfile }
-            : {}),
-        }),
-      }),
-    );
-    invalidateSessionLoads(token.current);
-    setPicking(false);
-    choose(x);
-    await load(kind);
+        body: JSON.stringify(targetKind === "local" ? {} : { workspace, launch_args: launchArgs, ...(targetKind === "hermes" || targetKind === "pi" ? { profile: targetProfile } : {}) }),
+      });
+      if (epoch !== authEpoch.current) return;
+      invalidateSessionLoads(token.current);
+      setPicking(false);
+      if (x.kind === "local") setLocalSessions(rows => [x, ...rows]);
+      activate(x.kind === "local" ? x : activeView(x), true);
+      if (targetKind !== "local") void load(targetKind);
+    } catch (e) { if (epoch === authEpoch.current) throw e; }
+    finally { if (epoch === authEpoch.current) { creatingRef.current = false; setCreating(false); } }
   };
   const manage = async (
     mode: "rename" | "delete",
@@ -1661,14 +619,7 @@ function App() {
       sessionCache.current[kind] = (sessionCache.current[kind] || []).filter(
         (item) => item.id !== s.id,
       );
-      const key = openSessionKey(s);
-      setOpenSessions((rows) =>
-        rows.filter((item) => openSessionKey(item) !== key),
-      );
-      if (activeKey === key) {
-        setActive(null);
-        setActiveKey(null);
-      }
+      closeTab(openSessionKey(s));
       localStorage.removeItem(selectedSessionKey(s, profile));
     }
     setDialog(null);
@@ -1688,6 +639,7 @@ function App() {
   // Keep the existing Hermes restore-key contract covered while Pi uses the same profile flow.
   // const selectProfile = (nextProfile: string) => { localStorage.removeItem(activeSessionKey('hermes', nextProfile)); };
   const selectArea = (nextArea: Kind | "local") => {
+    if (navigationLocked()) return;
     setSettingsOpen(false);
     localStorage.setItem(activeAreaKey, nextArea);
     localStorage.setItem(activeKindKey, nextArea);
@@ -1696,6 +648,7 @@ function App() {
     else clearActive();
   };
   const selectProfile = (nextProfile: string) => {
+    if (navigationLocked()) return;
     setSettingsOpen(false);
     hermesHomeSelected.current = kind === "hermes";
     localStorage.setItem(activeAreaKey, kind);
@@ -1707,6 +660,8 @@ function App() {
     setProfile(nextProfile);
   };
   const openWorkspace = (targetKind: Kind, targetProfile?: string) => {
+    if (navigationLocked()) return;
+    setMobileNavigationOpen(false);
     setSettingsOpen(false);
     localStorage.setItem(activeAreaKey, targetKind);
     localStorage.setItem(activeKindKey, targetKind);
@@ -1717,13 +672,7 @@ function App() {
       setProfile(targetProfile);
     }
     if (targetKind === "pi" && targetProfile && targetProfile !== "default") {
-      void api<SettingsResponse>("/settings")
-        .then(({ settings }) => {
-          const role = settings.pi_roles.find((item) => item.name === targetProfile);
-          if (role) void create(role.home, [], targetProfile);
-          else setError("Pi 角色不存在");
-        })
-        .catch((e) => setError(errorMessage(e)));
+      void create(undefined, [], targetProfile, targetKind).catch(e => setError(errorMessage(e)));
     } else setPicking(true);
   };
   const showMore = (listKind: Kind, listProfile = "") => {
@@ -1731,21 +680,27 @@ function App() {
     setVisibleCounts((value) => ({ ...value, [key]: (value[key] || 8) + 8 }));
   };
   const logout = () => {
+    authEpoch.current++; settingsBusyRef.current = false; creatingRef.current = false;
+    setSettingsBusyState(false); setCreating(false);
+    setSettingsOpen(false); setSettingsTarget(null); setPicking(false);
     void api("/auth/logout", { method: "POST" }).then(() => {
       Object.keys(localStorage)
         .filter((key) => key.startsWith("jian.") && key !== themeKey)
         .forEach((key) => localStorage.removeItem(key));
       setUser(null);
-    });
+      setPicking(false); setSettingsTarget(null); setError("");
+    }).catch(e => setError(errorMessage(e)));
   };
   const updateAgentEnabled = async (target: Kind, enabled: boolean) => {
     setAgentEnabled((value) => ({ ...value, [target]: enabled }));
     localStorage.setItem(`jian.${target}-enabled`, String(enabled));
-    if (!enabled && area === target) selectArea("local");
+
   };
   const openSecondary = (session: Session) => {
     if (active && openSessionKey(active) === openSessionKey(session)) return;
-    setSecondary(activeView(session));
+    const target = activeView(session);
+    setOpenSessions(current => current.some(item => openSessionKey(item) === openSessionKey(target)) ? current : [...current, target]);
+    setSecondary(target);
   };
   const connected = !!active && connectedSessionID === active.id;
   const activeKind = active?.kind === "local" ? "local" : active?.kind || area;
@@ -1756,47 +711,39 @@ function App() {
     if (key === activeKey) {
       setTerminalAttached(false);
       setConnectedSessionID(null);
+      setConnection("disconnected");
       setProgress("已断开连接");
     }
     closeTab(key);
   };
-  const release = async () => {
-    if (!active) return;
+  const currentStatus = connectionView(active ? connection : "disconnected");
+  const confirmOperation = async () => {
+    if (!confirmation || operationInFlight.current) return;
+    const { type, session } = confirmation;
+    operationInFlight.current = true; setOperationBusy(true);
     try {
-      await releaseSession(active);
-    } catch (e) {
-      setError(errorMessage(e));
-    }
+      if (type === "release") await releaseSession(session);
+      else if (type === "local-delete" && session.kind === "local") await removeLocal(session);
+      else if (type === "restart") {
+        await api(`/settings/terminals/${encodeURIComponent(session.id)}/restart`, { method: "POST" });
+        if (active && openSessionKey(active) === openSessionKey(session)) {
+          setTerminalAttached(true); setConnectedSessionID(null);
+          setConnection("connecting"); setTerminalRevision(value => value + 1);
+        }
+      }
+      setConfirmation(null);
+    } catch (e) { setError(errorMessage(e)); }
+    finally { operationInFlight.current = false; setOperationBusy(false); }
   };
-  const currentStatus = statusView(
-    connected
-      ? progress || active?.status
-      : terminalAttached
-        ? progress || active?.status
-        : "已断开连接",
-  );
   const reconnect = () => {
     setTerminalAttached(true);
     setConnectedSessionID(null);
+    setConnection("connecting");
     setProgress("正在重新连接…");
     setTerminalRevision((v) => v + 1);
   };
   return (
     <div className={"app " + (mobileNavigationOpen ? "nav-mobile-open" : "")}>
-      <button
-        className="icon mobile-nav-toggle"
-        onClick={() => setMobileNavigationOpen((open) => !open)}
-        aria-label={mobileNavigationOpen ? "关闭导航" : "打开导航"}
-      >
-        {mobileNavigationOpen ? <X /> : <Menu />}
-      </button>
-      {mobileNavigationOpen && (
-        <button
-          className="nav-scrim"
-          aria-label="关闭导航"
-          onClick={() => setMobileNavigationOpen(false)}
-        />
-      )}
       <SidebarNavigation
         active={active}
         currentKind={area}
@@ -1804,24 +751,24 @@ function App() {
         profiles={profiles}
         sessions={all}
         localSessions={localSessions}
-        sidebarRef={sidebarRef}
-        onScroll={(scrollTop) =>
-          localStorage.setItem(navScrollKey(kind, profile), String(scrollTop))
-        }
-        onAreaChange={selectArea}
-        onProfileChange={selectProfile}
-        onSelectSession={choose}
-        onSelectLocal={chooseLocal}
-        onCreateLocal={() => void createLocal()}
-        onRemoveLocal={(session) => void removeLocal(session)}
-        onOpenWorkspace={openWorkspace}
+        compact={compactNavigation}
+        navigationOpen={mobileNavigationOpen}
+        onNavigationOpenChange={setMobileNavigationOpen}
+        handingOffFocus={settingsOpen || picking || !!dialog || !!error || !!confirmation || discardOpen}
+        busy={settingsBusy || creating}
+        creating={creating}
+        onAreaChange={next => requestNavigation(() => selectArea(next))}
+        onProfileChange={next => requestNavigation(() => selectProfile(next))}
+        onSelectSession={next => requestNavigation(() => choose(next))}
+        onSelectLocal={next => requestNavigation(() => chooseLocal(next))}
+        onCreateLocal={() => requestNavigation(() => void createLocal())}
+        onRemoveLocal={session => setConfirmation({ type: "local-delete", session })}
+        onOpenWorkspace={(target, nextProfile) => requestNavigation(() => openWorkspace(target, nextProfile))}
         onRefresh={(target) => void refresh(target)}
         refreshingKind={refreshingKind}
-        onSettings={setSettingsKind}
-        onDialog={(mode, session) => setDialog({ mode, session })}
-        onRelease={(session) =>
-          void releaseSession(session).catch((e) => setError(errorMessage(e)))
-        }
+        onSettings={target => openSettings(target)}
+        onDialog={(mode, session) => { if (navigationLocked()) return; setMobileNavigationOpen(false); setDialog({ mode, session }); }}
+        onRelease={session => setConfirmation({ type: "release", session })}
         connectedSessionID={connectedSessionID}
         onDisconnect={disconnect}
         onOpenSecondary={openSecondary}
@@ -1830,127 +777,74 @@ function App() {
         }
         onShowMore={showMore}
         username={user}
-        onLogout={logout}
+        onLogout={() => settingsBusyRef.current ? logout() : requestNavigation(logout)}
         settingsOpen={settingsOpen}
-        onSettingsPage={() => {
-          setSettingsOpen((open) => !open);
-          setMobileNavigationOpen(false);
-        }}
+        onSettingsPage={() => openSettings()}
+        catalogError={catalogError?.kind === area && ((area !== "hermes" && area !== "pi") || catalogError.profile === profile) ? catalogError.message : ""}
       />
       <div className="workspace-view">
-        <main className="conversation">
-          <header className="context-bar">
-            <div className="context-copy">
-              <span className="agent-label">
-                <AgentIcon kind={activeKind} />
-                {activeKind === "local"
-                  ? "Local · Bash"
-                  : activeKind === "hermes"
-                    ? `Hermes · ${active?.kind === "hermes" ? active.profile || profile : profile}`
-                    : "Codex"}
-              </span>
-              {active ? (
-                <>
-                  <h2 title={active.id}>
-                    {active.kind === "local" ? "Bash" : displayTitle(active)}
-                  </h2>
-                  <div className="session-meta">
-                    <span title={active.workspace}>
-                      {displayWorkspace(active)}
-                    </span>
-                    {active.kind !== "codex" && (
-                      <span>
-                        {active.kind === "local"
-                          ? "通道：本地终端"
-                          : displayChannel(active)}
-                      </span>
-                    )}
-                  </div>
-                </>
-              ) : (
-                <>
-                  <h2>
-                    {activeKind === "local"
-                      ? "Local 工作区"
-                      : activeKind === "hermes"
-                        ? "Hermes 工作区"
-                        : "Codex 工作区"}
-                  </h2>
-                  <span className="muted">
-                    {activeKind === "local"
-                      ? "选择一个本地会话，或新建一个本地终端"
-                      : "选择现有会话，或在工作目录中启动新会话"}
-                  </span>
-                </>
-              )}
-            </div>
-            <div className="context-actions">
-              <ThemeControls
-                interfaceTheme={theme}
-                terminalTheme={terminalTheme}
-                onInterfaceThemeChange={setTheme}
-                onTerminalThemeChange={setTerminalTheme}
-              />
-              <div className="mobile-terminal-font-size">
-                <TerminalFontSizeControl
-                  compact
-                  size={terminalFontSize}
-                  onChange={changeFontSize}
-                />
-              </div>
-              <StatusMenu
-                status={currentStatus}
-                connected={connected}
-                onReconnect={reconnect}
-                onRelease={release}
-              />
-            </div>
-          </header>
-          <SessionTabs
-            sessions={openSessions}
-            activeKey={activeKey}
-            settingsOpen={settingsOpen}
-            select={selectTab}
-              openSettings={() => setSettingsOpen(true)}
-              closeSettings={() => setSettingsOpen(false)}
-            close={closeTab}
-            reorder={reorderTabs}
-          />
-          <ErrorDialog
-            open={!!error}
-            message={error}
-            onClose={() => setError("")}
-          />
-          {settingsOpen ? (
-            <SettingsPage
+        {settingsOpen ? (
+          <SettingsPage
               theme={theme}
               onThemeChange={setTheme}
               terminalTheme={terminalTheme}
               onTerminalThemeChange={setTerminalTheme}
+              onBack={() => requestNavigation(() => { setConnection(terminalAttached ? "connecting" : "disconnected"); setSettingsOpen(false); })}
+              targetAgent={settingsTarget}
+              onDirtyChange={setSettingsDirty}
+              terminalFontSize={terminalFontSize}
+              onTerminalFontSizeChange={changeFontSize}
               onAgentEnabledChange={updateAgentEnabled}
+              busy={settingsBusy}
+              onBusyChange={setSettingsBusy}
+              isCurrentUser={isCurrentUser}
             />
-          ) : active ? (
+        ) : <main className="conversation">
+          <header className="context-bar">
+            <SessionContext session={active} kind={activeKind} profile={profile} />
+            <div className="context-actions">
+              <QuickNote key={user} username={user} />
+              <WorkbenchTools theme={theme} terminalTheme={terminalTheme} fontSize={terminalFontSize}
+                onThemeChange={setTheme} onTerminalThemeChange={setTerminalTheme} onFontSizeChange={changeFontSize} />
+              {active && <StatusMenu
+                status={currentStatus}
+                connected={connected}
+                onReconnect={reconnect}
+                onRelease={async () => { if (active) setConfirmation({ type: "release", session: active }); }}
+              />}
+            </div>
+          </header>
+          <SessionTabs
+            sessions={openSessions}
+            order={tabOrder}
+            value={activeKey}
+            select={selectTab}
+            close={closeTab}
+            reorder={reorderTabs}
+            locked={settingsBusy || creating}
+          />
+          {active ? (
             terminalAttached ? (
-              <div className={secondary ? "terminal-split" : "terminal-single"}>
+              <div className={secondary && wideScreen ? "terminal-split" : "terminal-single"}>
                 <div className="terminal-pane primary-pane">
-                  {secondary && <div className="terminal-pane-label"><span>主终端</span><small>{displayTitle(active)}</small></div>}
+                  {secondary && wideScreen && <div className="terminal-pane-label"><span>主终端</span><small>{displayTitle(active)}</small></div>}
                   <AgentTerminal
-                    key={`${active.id}:${terminalRevision}`}
+                    key={`${openSessionKey(active)}:${terminalRevision}`}
                     session={active}
                     terminalTheme={terminalTheme}
                     terminalPath={activeKind}
                     onProgress={setProgress}
                     onStatus={(value) => {
-                      setProgress(value);
+                      setConnection(value === "running" ? "connected" : value === "ended" ? "ended" : "reconnecting");
                       if (value === "running") setConnectedSessionID(active.id);
                       else setConnectedSessionID(null);
-                      setActive((current) => current && { ...current, status: value });
+                      if (value === "running" || value === "ended") setActive((current) => current && { ...current, status: value });
                     }}
                   />
                 </div>
-                {secondary && <div className="terminal-pane secondary-pane">
+                {secondary && wideScreen && <div className="terminal-pane secondary-pane">
                   <div className="terminal-pane-label"><span>右侧终端</span><small title={secondary.workspace}>{displayTitle(secondary)}</small><button className="icon" aria-label="关闭右侧终端" title="关闭右侧终端" onClick={() => setSecondary(null)}><X /></button></div>
-                  <AgentTerminal key={`secondary:${secondary.kind}:${secondary.id}`} session={secondary} terminalTheme={terminalTheme} terminalPath={secondary.kind} onProgress={() => {}} onStatus={() => {}} />
+                  <AgentTerminal key={`secondary:${openSessionKey(secondary)}`} session={secondary} terminalTheme={terminalTheme} terminalPath={secondary.kind} onProgress={() => {}} onStatus={() => {}} />
                 </div>}
               </div>
             ) : (
@@ -1972,7 +866,7 @@ function App() {
                   ? "LOCAL · HOME"
                   : activeKind === "hermes"
                     ? `HERMES · ${profile}`
-                    : "CODEX"}
+                    : openSessionLabel({ kind: activeKind })}
               </span>
               <h1>
                 {activeKind === "local"
@@ -1985,27 +879,28 @@ function App() {
                   : "代理会在服务器拥有的终端中持续运行；关闭或刷新浏览器不会中止任务。"}
               </p>
               {activeKind === "local" ? (
-                <button onClick={() => void createLocal()}>
+                <button disabled={creating || settingsBusy} onClick={() => void createLocal()}>
                   <Plus />
-                  新建本地 Bash 会话
+                  {creating ? "正在创建…" : "新建本地 Bash 会话"}
                 </button>
               ) : (
-                <button onClick={() => openWorkspace(kind, profile)}>
+                <button disabled={creating || settingsBusy} onClick={() => openWorkspace(kind, profile)}>
                   <Plus />
                   选择目录并新建会话
                 </button>
               )}
             </div>
           )}
-        </main>
+        </main>}
       </div>
       {picking && (
         <WorkspacePicker
           sessions={all}
           profile={profile}
           kind={kind}
+          creating={creating}
           close={() => setPicking(false)}
-          select={create}
+          select={(path, args) => create(path, args, profile, kind)}
         />
       )}
       {dialog && (
@@ -2015,18 +910,14 @@ function App() {
           confirm={(title) => manage(dialog.mode, dialog.session, title)}
         />
       )}
-      {settingsKind && (
-        <AgentSettingsDialog
-          kind={settingsKind}
-          close={() => setSettingsKind(null)}
-          saved={() => {
-            void load();
-            if (settingsKind === "hermes")
-              void api<string[]>("/hermes/profiles").then(setProfiles);
-          }}
-        />
-      )}
-      <QuickNote username={user} />
+      <ConfirmDialog open={!!confirmation} title={confirmation?.type === "restart" ? "重启会话？" : confirmation?.type === "local-delete" ? "删除本地终端？" : "释放会话？"}
+        description={`“${confirmation ? openSessionTitle(confirmation.session) : ""}”的进程将停止，正在执行的任务会中断。`}
+        confirmLabel={confirmation?.type === "restart" ? "确认重启" : confirmation?.type === "local-delete" ? "确认删除" : "确认释放"}
+        danger busy={operationBusy} onConfirm={() => void confirmOperation()} onClose={() => { if (!operationInFlight.current) setConfirmation(null); }} />
+      <ConfirmDialog open={discardOpen} title="放弃未保存的修改？" cancelLabel="继续编辑" description="离开设置后，未保存的配置修改将丢失。" confirmLabel="放弃修改并离开"
+        onConfirm={() => { setDiscardOpen(false); setSettingsDirty(false); const action = leavingSettings.current; leavingSettings.current = null; action?.(); }}
+        onClose={() => { setDiscardOpen(false); leavingSettings.current = null; }} />
+      <ErrorDialog open={!!error} message={error} onClose={() => setError("")} />
     </div>
   );
 }

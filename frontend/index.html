@@ -1,15 +1,15 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="console">
+<html lang="zh-CN" data-theme="light">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#09100f" />
+    <meta name="theme-color" content="#f6f7f9" />
     <script>
       (() => {
-        const theme = localStorage.getItem('jian.theme');
-        if (theme === 'light' || theme === 'black') {
+        const theme = localStorage.getItem('jian.interface_theme') || localStorage.getItem('jian.theme') || 'light';
+        if (theme === 'light' || theme === 'black' || theme === 'console') {
           document.documentElement.dataset.theme = theme;
-          document.querySelector('meta[name="theme-color"]').setAttribute('content', theme === 'light' ? '#f5f7f4' : '#050505');
+          document.querySelector('meta[name="theme-color"]').setAttribute('content', theme === 'light' ? '#f6f7f9' : theme === 'black' ? '#050505' : '#09100f');
         }
       })();
     </script>

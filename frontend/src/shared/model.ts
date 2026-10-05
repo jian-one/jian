@@ -46,17 +46,17 @@ export const terminalFontSizeKey = 'jian.terminal_font_size';
 export const terminalFontSizeMin = 10;
 export const terminalFontSizeMax = 24;
 export const terminalFontSizeDefault = 15;
-export const activeSessionKey = (kind: Kind, profile?: string) => `jian.active_${kind}${kind === 'hermes' && profile ? `_${profile}` : ''}_session`;
+export const activeSessionKey = (kind: Kind, profile?: string) => `jian.active_${kind}${(kind === 'hermes' || kind === 'pi') && profile ? `_${profile}` : ''}_session`;
 export const selectedSessionKey = (session: Pick<LocalSession, 'kind'> | Pick<Session, 'kind' | 'profile'>, fallbackProfile = 'default') => session.kind === 'local' ? activeLocalSessionKey : activeSessionKey(session.kind, session.profile || fallbackProfile);
 export const sessionCacheKey = (username: string, kind: Kind) => `jian.session_cache.${encodeURIComponent(username)}.${kind}`;
-export const navScrollKey = (kind: Kind, profile: string) => `jian.nav_scroll_${kind}_${profile}`;
+export const navScrollKey = (kind: Kind | 'local', profile: string) => `jian.nav_scroll_${kind}_${profile}`;
 
 export const initialKind = (): Kind => ['codex', 'hermes', 'pi'].includes(localStorage.getItem(activeKindKey) || '') ? localStorage.getItem(activeKindKey) as Kind : 'codex';
 const readTheme = (key: string): Theme | null => {
   const value = localStorage.getItem(key);
   return value === 'light' || value === 'black' || value === 'console' ? value : null;
 };
-export const initialInterfaceTheme = (): Theme => readTheme(interfaceThemeKey) || readTheme(themeKey) || 'console';
+export const initialInterfaceTheme = (): Theme => readTheme(interfaceThemeKey) || readTheme(themeKey) || 'light';
 export const initialTheme = initialInterfaceTheme;
 export const clampTerminalFontSize = (value: number) => Math.min(terminalFontSizeMax, Math.max(terminalFontSizeMin, Math.round(value)));
 export const initialTerminalFontSize = () => {
@@ -66,7 +66,7 @@ export const initialTerminalFontSize = () => {
 };
 
 export const themeOptions: { id: Theme; label: string; description: string }[] = [
-  { id: 'console', label: '默认主题', description: '深绿信号与低照度工作台' },
+  { id: 'console', label: '深绿主题', description: '深绿信号与低照度工作台' },
   { id: 'light', label: '浅色主题', description: '日间阅读与清晰层级' },
   { id: 'black', label: '深色主题', description: '纯黑背景与中性高对比度' },
 ];
@@ -87,12 +87,29 @@ export const displayWorkspace = (session?: { workspace?: string } | null) => `�
 export const sessionTime = (session: Session) => Date.parse(session.updated_at || session.created_at || '') || 0;
 export const byLastActiveDesc = (a: Session, b: Session) => sessionTime(b) - sessionTime(a);
 export const activeView = (session: Session): Session => ({ ...session, title: displayTitle(session) });
+export type OpenSession = Session | LocalSession;
+export const openSessionKey = (session: OpenSession) =>
+  `${session.kind}:${session.kind === 'hermes' || session.kind === 'pi' ? `${session.profile || 'default'}:` : ''}${session.id}`;
+export const openSessionTitle = (session: OpenSession) => session.kind === 'local' ? session.title || 'Bash' : displayTitle(session);
+export const openSessionLabel = (session: Pick<OpenSession, 'kind'>) =>
+  ({ local: 'Local', codex: 'Codex', hermes: 'Hermes', pi: 'Pi' })[session.kind];
+
+export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'ended';
+export const connectionView = (state: ConnectionState) => ({
+  connecting: { tone: 'idle', label: '正在连接' },
+  connected: { tone: 'running', label: '已连接' },
+  reconnecting: { tone: 'waiting', label: '正在重连' },
+  disconnected: { tone: 'idle', label: '已断开连接' },
+  ended: { tone: 'ended', label: '进程已结束' },
+})[state];
 export const statusView = (value?: string) => {
-  const normalized = (value || 'idle').toLowerCase();
-  if (normalized === 'running' || normalized.includes('连接') || normalized.includes('恢复') || normalized.includes('加载')) return { tone: 'running', label: normalized === 'running' ? '运行中' : value! };
-  if (normalized === 'ended' || normalized.includes('结束')) return { tone: 'ended', label: '已结束' };
-  if (normalized.includes('失败') || normalized.includes('错误')) return { tone: 'error', label: value! };
-  return { tone: 'idle', label: normalized === 'idle' ? '未启动' : value! };
+  const normalized = (value || 'unknown').toLowerCase();
+  if (normalized === 'running') return { tone: 'running', label: '运行中' };
+  if (normalized === 'ended') return { tone: 'ended', label: '已结束' };
+  if (normalized === 'busy') return { tone: 'waiting', label: '忙碌中' };
+  if (normalized === 'idle') return { tone: 'idle', label: '空闲' };
+  if (normalized === 'error') return { tone: 'error', label: '失败' };
+  return { tone: 'idle', label: value || '状态未知' };
 };
 
 export const isMobile = () => window.matchMedia('(max-width: 800px)').matches;

@@ -3,6 +3,7 @@ import { CircleStop, Columns2, MoreHorizontal, Pencil, Trash2, Unplug } from 'lu
 import { channelNames, displayTitle, displayWorkspacePath, rawChannel, statusView, type Kind, type Session } from '../../shared/model';
 
 type Props = {
+  searching?: boolean; onClearFilter?: () => void;
   rows: Session[];
   listKind: Kind;
   listProfile?: string;
@@ -23,14 +24,14 @@ function SessionActions({ kind, session, connected, onDialog, onDisconnect, onRe
 }
 
 /** Session rows own their rendering rules; the workspace only supplies data and commands. */
-export function SessionList({ rows, listKind, listProfile = '', activeID, connectedID, visibleCount, onSelect, onDialog, onDisconnect, onRelease, onOpenSecondary, onShowMore }: Props) {
+export function SessionList({ searching, onClearFilter, rows, listKind, listProfile = '', activeID, connectedID, visibleCount, onSelect, onDialog, onDisconnect, onRelease, onOpenSecondary, onShowMore }: Props) {
   const shown = rows.slice(0, visibleCount);
   const hasMore = rows.length > shown.length;
   const key = `${listKind}:${listProfile}`;
   return <div className="session-list">
     {shown.map(session => {
       const title = displayTitle(session);
-      const view = connectedID === session.id ? statusView('running') : statusView(session.status);
+      const view = statusView(session.status);
       const channel = channelNames[rawChannel(session).toLowerCase()] || rawChannel(session) || '未标注通道';
       return <div className={'session-row ' + (activeID === session.id ? 'active' : '')} key={session.id}>
         <button className="session" onClick={() => onSelect(session)}>
@@ -40,7 +41,7 @@ export function SessionList({ rows, listKind, listProfile = '', activeID, connec
         <div className="session-menu"><SessionActions kind={listKind} session={session} connected={connectedID === session.id} onDialog={onDialog} onDisconnect={onDisconnect} onRelease={onRelease} onOpenSecondary={onOpenSecondary} /></div>
       </div>;
     })}
-    {!rows.length && <div className="nav-empty"><span>暂无会话</span><small>从右侧工作区新建一个 {listKind === 'hermes' ? 'Hermes' : 'Codex'} 会话</small></div>}
+    {!rows.length && <div className="nav-empty"><span>{searching ? '没有匹配的会话' : '暂无会话'}</span><small>{searching ? '尝试其他关键词或工作目录。' : `点击新建，开始一个 ${{ codex: 'Codex', hermes: 'Hermes', pi: 'Pi' }[listKind]} 会话。`}</small>{searching && <button onClick={onClearFilter}>清除筛选</button>}</div>}
     {hasMore ? <button className="session-more" onClick={onShowMore}>显示更多会话</button> : rows.length > 0 && <span className="session-end">已显示全部 {rows.length} 个会话</span>}
     <span aria-hidden="true" data-session-list-key={key} hidden />
   </div>;

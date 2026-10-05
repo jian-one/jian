@@ -1,7 +1,34 @@
-import type { AgentSettings } from '../../shared/model';
+import type { AgentSettings, SettingsResponse } from '../../shared/model';
+import { api } from '../../shared/api.ts';
 
 export type AgentKind = 'codex' | 'hermes' | 'pi';
 export type RosterKind = AgentKind | 'local';
+
+type SettingsField = keyof AgentSettings;
+const rosterFields: Record<RosterKind, SettingsField[]> = {
+  local: ['local_profiles'],
+  codex: ['codex_bin', 'codex_args', 'codex_env'],
+  hermes: ['hermes_home', 'hermes_bin', 'hermes_profiles', 'hermes_args', 'hermes_env'],
+  pi: ['pi_default', 'pi_roles', 'pi_args', 'pi_env'],
+};
+
+export const settingsFields = (kind: RosterKind, scope: 'roster' | 'dialog' | 'toggle' = 'roster'): SettingsField[] => {
+  if (scope === 'toggle') return kind === 'local' ? [] : [`${kind}_enabled`];
+  return scope === 'dialog' && kind !== 'local' ? [`${kind}_args`, `${kind}_env`] : rosterFields[kind];
+};
+
+export const mergeSettingsFields = (base: AgentSettings, source: AgentSettings, fields: SettingsField[]): AgentSettings => ({
+  ...base,
+  ...Object.fromEntries(fields.map(key => [key, source[key]])),
+});
+
+export async function saveAgentSettings(draft: AgentSettings, fields: SettingsField[], active: () => boolean) {
+  const { settings } = await api<SettingsResponse>('/settings');
+  if (!active()) throw new Error('设置页面已关闭');
+  return normalizeAgentSettings(await api<AgentSettings>('/settings', {
+    method: 'PUT', body: JSON.stringify(mergeSettingsFields(normalizeAgentSettings(settings), draft, fields)),
+  }));
+}
 
 export const normalizeAgentSettings = (settings: AgentSettings): AgentSettings => ({
 	...settings,
