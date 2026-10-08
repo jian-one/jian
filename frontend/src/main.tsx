@@ -1,11 +1,15 @@
 import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ChevronDown, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { ChevronDown, Plus, RefreshCw, Trash2, X, Minimize2, Maximize2, ListFilter, SlidersHorizontal } from "lucide-react";
+import { SessionSwitcher } from "./features/session-catalog/SessionSwitcher";
 import { SessionTabs } from "./features/session-catalog/SessionTabs";
 import { WorkspacePicker } from "./features/session-catalog/WorkspacePicker";
 import { AgentTerminal } from "./features/terminal/AgentTerminal";
 import { ConfirmDialog } from "./shared/ui/ConfirmDialog";
 import { openSessionKey, openSessionTitle, openSessionLabel, connectionView, type OpenSession, type ConnectionState } from "./shared/model";
+import { MobileWorkbench } from "./shared/ui/MobileWorkbench";
+import { useTerminalDrafts, type MobileInputMode } from "./features/terminal/mobile-state";
+import type { TerminalActions } from "./features/terminal/MobileTerminalInput";
 import { QuickNote } from "./features/quick-note/QuickNote";
 import {
   beginSessionLoad,
@@ -37,6 +41,7 @@ import {
   activeView,
   statusView,
   isMobile,
+  mobileMedia,
   type Kind,
   type LocalSession,
   type Theme,
@@ -178,6 +183,7 @@ function App() {
     [progress, setProgress] = useState(""),
     [refreshingKind, setRefreshingKind] = useState<Kind | null>(null),
     [terminalRevision, setTerminalRevision] = useState(0),
+    [secondaryRevision, setSecondaryRevision] = useState(0),
     [terminalAttached, setTerminalAttached] = useState(true),
     [connectedSessionID, setConnectedSessionID] = useState<string | null>(null),
     [mobileNavigationOpen, setMobileNavigationOpen] = useState(false),
@@ -191,7 +197,9 @@ function App() {
       session: Session;
     } | null>(null),
     [settingsTarget, setSettingsTarget] = useState<Kind | "local" | null>(null),
-    [settingsDirty, setSettingsDirty] = useState(false),
+    [settingsDirty, setSettingsDirty] = useState<string[]>([]),
+    [switcherOpen, setSwitcherOpen] = useState(false),
+    [focusMode, setFocusMode] = useState(false),
     [discardOpen, setDiscardOpen] = useState(false),
     [confirmation, setConfirmation] = useState<{ type: "release" | "restart" | "local-delete"; session: OpenSession } | null>(null),
     [operationBusy, setOperationBusy] = useState(false),
@@ -205,9 +213,14 @@ function App() {
   const settingsBusyRef = useRef(false), creatingRef = useRef(false), authEpoch = useRef(0);
   const leavingSettings = useRef<(() => void) | null>(null);
   const operationInFlight = useRef(false);
+  const primaryReconnect = useRef<(() => void) | null>(null);
+  const mobileActions = useRef<TerminalActions | null>(null), noteOpen = useRef<(() => void) | null>(null);
+  const [inputMode, setInputMode] = useState<MobileInputMode>('read');
+  const drafts = useTerminalDrafts(user);
+  useEffect(() => { setInputMode('read'); }, [activeKey, settingsOpen, compactNavigation]);
   const requestNavigation = (action: () => void) => {
     if (settingsBusyRef.current || creatingRef.current) return;
-    if (settingsOpen && settingsDirty) { leavingSettings.current = action; setDiscardOpen(true); }
+    if (settingsOpen && settingsDirty.length) { leavingSettings.current = action; setDiscardOpen(true); }
     else action();
   };
   const openSettings = (target: Kind | "local" | null = null) => {
@@ -230,6 +243,7 @@ function App() {
     setUser(status.authenticated ? status.username || null : null);
   };
   const load = async (target = kind, refresh = false) => {
+    const loadAuthEpoch = authEpoch.current;
     const currentTarget = target === kind;
     const t = currentTarget
       ? beginSessionLoad(token.current)
@@ -246,6 +260,7 @@ function App() {
           refresh ? { method: "POST" } : undefined,
         ),
       );
+      if (loadAuthEpoch !== authEpoch.current) return false;
       if (currentTarget && !isCurrentSessionLoad(token.current, t)) return true;
       sessionCache.current[target] = rows;
       if (user) writeSessionCache(user, target, rows);
@@ -291,7 +306,7 @@ function App() {
       }
       return true;
     } catch (e) {
-      if (currentTarget && isCurrentSessionLoad(token.current, t))
+      if (loadAuthEpoch === authEpoch.current && currentTarget && isCurrentSessionLoad(token.current, t))
         setCatalogError({ kind: target, profile, message: errorMessage(e) });
       return false;
     }
@@ -381,7 +396,7 @@ function App() {
         .catch(() => setProfiles([]));
   }, [user, kind]);
   useEffect(() => {
-    const media = window.matchMedia('(max-width: 800px)');
+    const media = window.matchMedia(mobileMedia);
     const update = () => { setCompactNavigation(media.matches); setMobileNavigationOpen(false); };
     media.addEventListener('change', update);
     return () => media.removeEventListener('change', update);
@@ -394,13 +409,17 @@ function App() {
       if (frame) return;
       frame = requestAnimationFrame(() => {
         frame = 0;
-        document.documentElement.style.setProperty('--dialog-viewport-height', `${viewport?.height || window.innerHeight}px`);
+        const root = document.documentElement;
+        root.style.setProperty('--mobile-viewport-height', Math.max(1, Math.round(viewport?.height || window.innerHeight)) + 'px');
+        root.style.setProperty('--mobile-viewport-offset', Math.round(viewport?.offsetTop || 0) + 'px');
+        root.style.setProperty('--dialog-viewport-height', `${viewport?.height || window.innerHeight}px`);
         document.documentElement.style.setProperty('--dialog-viewport-top', `${viewport?.offsetTop || 0}px`);
       });
     };
     update(); viewport?.addEventListener('resize', update); viewport?.addEventListener('scroll', update); window.addEventListener('resize', update);
     return () => {
       cancelAnimationFrame(frame); viewport?.removeEventListener('resize', update); viewport?.removeEventListener('scroll', update); window.removeEventListener('resize', update);
+      document.documentElement.style.removeProperty('--mobile-viewport-height'); document.documentElement.style.removeProperty('--mobile-viewport-offset');
       document.documentElement.style.removeProperty('--dialog-viewport-height'); document.documentElement.style.removeProperty('--dialog-viewport-top');
     };
   }, [compactNavigation]);
@@ -414,7 +433,7 @@ function App() {
   useEffect(() => { sessionStorage.removeItem("jian.settings-tab-open"); }, []);
   useEffect(() => {
     const media = window.matchMedia("(min-width: 1200px)");
-    const update = () => setWideScreen(media.matches);
+    const update = () => { setWideScreen(media.matches); if (media.matches) setFocusMode(false); };
     media.addEventListener("change", update);
     return () => media.removeEventListener("change", update);
   }, []);
@@ -482,9 +501,10 @@ function App() {
   }, [agentEnabled.codex, agentEnabled.hermes, agentEnabled.pi, area]);
   useEffect(() => {
     if (!user) return;
+    const loadAuthEpoch = authEpoch.current;
     void api<LocalSession[]>("/local/sessions")
-      .then(setLocalSessions)
-      .catch((e) => setError(errorMessage(e)));
+      .then(rows => { if (loadAuthEpoch === authEpoch.current) setLocalSessions(rows); })
+      .catch(e => { if (loadAuthEpoch === authEpoch.current) setError(errorMessage(e)); });
   }, [user]);
   useEffect(() => {
     const restart = () => {
@@ -680,13 +700,16 @@ function App() {
     setVisibleCounts((value) => ({ ...value, [key]: (value[key] || 8) + 8 }));
   };
   const logout = () => {
+    drafts.clear(); setInputMode('read');
     authEpoch.current++; settingsBusyRef.current = false; creatingRef.current = false;
     setSettingsBusyState(false); setCreating(false);
-    setSettingsOpen(false); setSettingsTarget(null); setPicking(false);
+    setSettingsOpen(false); setSettingsTarget(null); setPicking(false); setSwitcherOpen(false); setFocusMode(false);
     void api("/auth/logout", { method: "POST" }).then(() => {
       Object.keys(localStorage)
         .filter((key) => key.startsWith("jian.") && key !== themeKey)
         .forEach((key) => localStorage.removeItem(key));
+      invalidateSessionLoads(token.current); sessionCache.current = {};
+      setAll([]); setLocalSessions([]); setOpenSessions([]); setTabOrder([]); setSecondary(null); clearActive(); setCatalogError(null);
       setUser(null);
       setPicking(false); setSettingsTarget(null); setError("");
     }).catch(e => setError(errorMessage(e)));
@@ -725,11 +748,14 @@ function App() {
       if (type === "release") await releaseSession(session);
       else if (type === "local-delete" && session.kind === "local") await removeLocal(session);
       else if (type === "restart") {
-        await api(`/settings/terminals/${encodeURIComponent(session.id)}/restart`, { method: "POST" });
-        if (active && openSessionKey(active) === openSessionKey(session)) {
+        const restartingActive = active && openSessionKey(active) === openSessionKey(session);
+        const ended = restartingActive ? connection === "ended" : session.status === "ended";
+        // The terminal attach route starts ended PTYs after this explicit confirmation.
+        if (!ended) await api(`/settings/terminals/${encodeURIComponent(session.id)}/restart`, { method: "POST" });
+        if (restartingActive) {
           setTerminalAttached(true); setConnectedSessionID(null);
           setConnection("connecting"); setTerminalRevision(value => value + 1);
-        }
+        } else if (secondary && openSessionKey(secondary) === openSessionKey(session)) setSecondaryRevision(value => value + 1);
       }
       setConfirmation(null);
     } catch (e) { setError(errorMessage(e)); }
@@ -740,10 +766,11 @@ function App() {
     setConnectedSessionID(null);
     setConnection("connecting");
     setProgress("正在重新连接…");
-    setTerminalRevision((v) => v + 1);
+    if (primaryReconnect.current) primaryReconnect.current();
+    else setTerminalRevision((v) => v + 1);
   };
   return (
-    <div className={"app " + (mobileNavigationOpen ? "nav-mobile-open" : "")}>
+    <div className={"app " + (mobileNavigationOpen ? "nav-mobile-open " : "") + (focusMode && !settingsOpen ? "workbench-focused" : "")}>
       <SidebarNavigation
         active={active}
         currentKind={area}
@@ -754,7 +781,7 @@ function App() {
         compact={compactNavigation}
         navigationOpen={mobileNavigationOpen}
         onNavigationOpenChange={setMobileNavigationOpen}
-        handingOffFocus={settingsOpen || picking || !!dialog || !!error || !!confirmation || discardOpen}
+        handingOffFocus={settingsOpen || picking || !!dialog || !!error || !!confirmation || discardOpen || switcherOpen}
         busy={settingsBusy || creating}
         creating={creating}
         onAreaChange={next => requestNavigation(() => selectArea(next))}
@@ -800,11 +827,29 @@ function App() {
               isCurrentUser={isCurrentUser}
             />
         ) : <main className="conversation">
+          {compactNavigation && <MobileWorkbench session={active} kind={activeKind} profile={profile} connection={active ? connection : 'disconnected'}
+            focused={focusMode} mode={inputMode} busy={settingsBusy || creating} attached={terminalAttached} actions={mobileActions}
+            hasDraft={!!active && !!drafts.read(openSessionKey(active)).text}
+            onSwitch={() => setSwitcherOpen(true)} onNavigation={() => setMobileNavigationOpen(true)}
+            onCreate={() => activeKind === 'local' ? void createLocal() : openWorkspace(activeKind, profile)}
+            onSettings={() => openSettings()} onNote={() => noteOpen.current?.()} onFocus={() => setFocusMode(value => !value)}
+            onRelease={() => { if (active) setConfirmation({ type: 'release', session: active }); }}
+            onRestart={() => { if (active) setConfirmation({ type: 'restart', session: active }); }}
+            onDisconnect={() => disconnect()} onReconnect={reconnect}
+            theme={theme} terminalTheme={terminalTheme} fontSize={terminalFontSize}
+            onTheme={setTheme} onTerminalTheme={setTerminalTheme} onFontSize={changeFontSize} />}
+          <div className="focus-bar" hidden={!focusMode}>
+            <button className="icon" aria-label="退出专注模式" onClick={() => setFocusMode(false)}><Minimize2 /></button>
+            <strong title={active ? openSessionTitle(active) : ""}>{active ? openSessionTitle(active) : "工作台"}</strong>
+            <button className="icon session-switcher-trigger" aria-label="切换会话" onClick={() => setSwitcherOpen(true)}><ListFilter /></button>
+          </div>
           <header className="context-bar">
             <SessionContext session={active} kind={activeKind} profile={profile} />
             <div className="context-actions">
-              <QuickNote key={user} username={user} />
-              <WorkbenchTools theme={theme} terminalTheme={terminalTheme} fontSize={terminalFontSize}
+              {active && compactNavigation && !focusMode && <button className="icon focus-mode-trigger" aria-label="进入专注模式" onClick={() => setFocusMode(true)}><Maximize2 /></button>}
+
+              <QuickNote key={user} username={user} openRef={noteOpen} />
+              <WorkbenchTools extraActions={focusMode ? <div className="focus-extra-actions"><button onClick={() => noteOpen.current?.()}>快速记事本</button><button aria-label="设置" onClick={() => openSettings()}><SlidersHorizontal />设置</button></div> : undefined} theme={theme} terminalTheme={terminalTheme} fontSize={terminalFontSize}
                 onThemeChange={setTheme} onTerminalThemeChange={setTerminalTheme} onFontSizeChange={changeFontSize} />
               {active && <StatusMenu
                 status={currentStatus}
@@ -822,6 +867,7 @@ function App() {
             close={closeTab}
             reorder={reorderTabs}
             locked={settingsBusy || creating}
+            onSwitcher={() => setSwitcherOpen(true)}
           />
           {active ? (
             terminalAttached ? (
@@ -831,20 +877,24 @@ function App() {
                   <AgentTerminal
                     key={`${openSessionKey(active)}:${terminalRevision}`}
                     session={active}
+                    mobile={compactNavigation} inputMode={inputMode} onInputMode={setInputMode} actionsRef={mobileActions}
+                    draft={drafts.read(openSessionKey(active))} storageError={drafts.storageError}
+                    onDraft={draft => { if (isCurrentUser()) drafts.write(openSessionKey(active), draft); }}
+                    onUnsentText={text => { if (isCurrentUser()) { const key = openSessionKey(active); const draft = drafts.read(key); drafts.write(key, { ...draft, text: draft.text + text }); } }}
                     terminalTheme={terminalTheme}
                     terminalPath={activeKind}
                     onProgress={setProgress}
+                    reconnectRef={primaryReconnect}
+                    onRestart={() => setConfirmation({ type: "restart", session: active })}
+                    onConnectionChange={feedback => { setConnection(feedback.state); setConnectedSessionID(feedback.state === "connected" ? active.id : null); }}
                     onStatus={(value) => {
-                      setConnection(value === "running" ? "connected" : value === "ended" ? "ended" : "reconnecting");
-                      if (value === "running") setConnectedSessionID(active.id);
-                      else setConnectedSessionID(null);
-                      if (value === "running" || value === "ended") setActive((current) => current && { ...current, status: value });
+                      setActive(current => current && openSessionKey(current) === openSessionKey(active) ? { ...current, status: value } : current);
                     }}
                   />
                 </div>
                 {secondary && wideScreen && <div className="terminal-pane secondary-pane">
                   <div className="terminal-pane-label"><span>右侧终端</span><small title={secondary.workspace}>{displayTitle(secondary)}</small><button className="icon" aria-label="关闭右侧终端" title="关闭右侧终端" onClick={() => setSecondary(null)}><X /></button></div>
-                  <AgentTerminal key={`secondary:${openSessionKey(secondary)}`} session={secondary} terminalTheme={terminalTheme} terminalPath={secondary.kind} onProgress={() => {}} onStatus={() => {}} />
+                  <AgentTerminal key={`secondary:${openSessionKey(secondary)}:${secondaryRevision}`} session={secondary} terminalTheme={terminalTheme} terminalPath={secondary.kind} onProgress={() => {}} onStatus={value => setSecondary(current => current && openSessionKey(current) === openSessionKey(secondary) ? { ...current, status: value } : current)} onRestart={() => setConfirmation({ type: "restart", session: secondary })} />
                 </div>}
               </div>
             ) : (
@@ -893,6 +943,14 @@ function App() {
           )}
         </main>}
       </div>
+      {switcherOpen && <SessionSwitcher opened={openSessions} order={tabOrder} activeKey={activeKey}
+        enabled={agentEnabled} initialCatalog={{ ...Object.fromEntries((["codex", "hermes", "pi"] as Kind[]).map(target => [target, sessionCache.current[target] || readSessionCache(user, target)])), local: localSessions }}
+        onClose={() => setSwitcherOpen(false)}
+        onSelect={session => { setSwitcherOpen(false); requestNavigation(() => activate(session)); }}
+        onCatalog={(target, rows) => {
+          if (target === "local") setLocalSessions(rows as LocalSession[]);
+          else { sessionCache.current[target] = rows as Session[]; writeSessionCache(user, target, rows as Session[]); }
+        }} />}
       {picking && (
         <WorkspacePicker
           sessions={all}
@@ -911,11 +969,11 @@ function App() {
         />
       )}
       <ConfirmDialog open={!!confirmation} title={confirmation?.type === "restart" ? "重启会话？" : confirmation?.type === "local-delete" ? "删除本地终端？" : "释放会话？"}
-        description={`“${confirmation ? openSessionTitle(confirmation.session) : ""}”的进程将停止，正在执行的任务会中断。`}
+        description={confirmation?.type === "restart" && confirmation.session.status === "ended" ? "会话已结束，将在原工作目录启动新的终端进程。" : `“${confirmation ? openSessionTitle(confirmation.session) : ""}”的进程将停止，正在执行的任务会中断。`}
         confirmLabel={confirmation?.type === "restart" ? "确认重启" : confirmation?.type === "local-delete" ? "确认删除" : "确认释放"}
         danger busy={operationBusy} onConfirm={() => void confirmOperation()} onClose={() => { if (!operationInFlight.current) setConfirmation(null); }} />
-      <ConfirmDialog open={discardOpen} title="放弃未保存的修改？" cancelLabel="继续编辑" description="离开设置后，未保存的配置修改将丢失。" confirmLabel="放弃修改并离开"
-        onConfirm={() => { setDiscardOpen(false); setSettingsDirty(false); const action = leavingSettings.current; leavingSettings.current = null; action?.(); }}
+      <ConfirmDialog open={discardOpen} title="放弃未保存的修改？" cancelLabel="继续编辑" description={`尚未保存：${settingsDirty.join("、")}。离开后这些修改将丢失。`} confirmLabel="放弃修改并离开"
+        onConfirm={() => { setDiscardOpen(false); setSettingsDirty([]); const action = leavingSettings.current; leavingSettings.current = null; action?.(); }}
         onClose={() => { setDiscardOpen(false); leavingSettings.current = null; }} />
       <ErrorDialog open={!!error} message={error} onClose={() => setError("")} />
     </div>

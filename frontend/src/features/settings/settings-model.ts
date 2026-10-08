@@ -58,3 +58,5 @@ export const parseExpandedRoster = (raw: string | null): RosterKind[] => {
     return Array.isArray(values) ? values.filter((value): value is RosterKind => value === 'local' || value === 'codex' || value === 'hermes' || value === 'pi') : [];
   } catch { return []; }
 };
+
+export const dirtySettingsKinds = (draft: AgentSettings | null, baseline: AgentSettings | null): RosterKind[] => !draft || !baseline ? [] : (['local', 'codex', 'hermes', 'pi'] as RosterKind[]).filter(kind => settingsFields(kind).some(key => JSON.stringify(draft[key]) !== JSON.stringify(baseline[key])));

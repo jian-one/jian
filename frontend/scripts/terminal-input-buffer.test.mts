@@ -75,3 +75,34 @@ test('does not answer terminal queries while restoring replayed output', async (
   await new Promise<void>(resolve => term.write('\x1b[6n\x1b[c\x1b[?2026$p', resolve));
   assert.deepEqual(sent, []);
 });
+
+test('recovers rejected Unicode once and never queues a failed control', () => {
+  let value = '未发送';
+  const recovered: string[] = [];
+  const buffer = new TerminalInputBuffer({ read: () => value, clear: () => { value = ''; },
+    preview: () => {}, send: () => false, onUnsentText: text => recovered.push(text) });
+  buffer.input({ data: value, inputType: 'insertText', isComposing: false });
+  buffer.beforeInput('insertLineBreak', false);
+  buffer.dispose();
+  assert.deepEqual(recovered, ['未发送']);
+});
+test('recovers unfinished composition on disposal', () => {
+  let value = '正在输入';
+  const recovered: string[] = [];
+  const buffer = new TerminalInputBuffer({ read: () => value, clear: () => { value = ''; },
+    preview: () => {}, send: () => false, onUnsentText: text => recovered.push(text) });
+  buffer.compositionStart();
+  buffer.dispose();
+  assert.deepEqual(recovered, ['正在输入']);
+  assert.equal(value, '');
+});
+
+test('recovers composition fallback when disposed before deferred commit', () => {
+  const recovered: string[] = [];
+  const buffer = new TerminalInputBuffer({ read: () => '', clear: () => {},
+    preview: () => {}, send: () => false, onUnsentText: text => recovered.push(text),
+    defer: () => () => {} });
+  buffer.compositionEnd('未完成');
+  buffer.dispose();
+  assert.deepEqual(recovered, ['未完成']);
+});

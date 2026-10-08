@@ -13,7 +13,7 @@ export function SessionContext({ session, kind, profile }: { session: OpenSessio
       {session && <span className="session-identity">会话 ID：{session.id}</span>}
     </div></>;
   return <div className="context-copy"><div className="desktop-session-context">{details}</div>
-    <Popover.Root><Popover.Trigger asChild><button className="session-context-trigger" aria-label="查看会话详情"><AgentIcon kind={kind} /><span>{title}</span><ChevronDown /></button></Popover.Trigger>
+    <Popover.Root><Popover.Trigger asChild><button className="session-context-trigger" aria-label="查看会话详情"><AgentIcon kind={kind} /><span><small>{agent}{role && (" · " + role)}</small>{title}</span><ChevronDown /></button></Popover.Trigger>
       <Popover.Portal><Popover.Content className="session-context-popover" align="start" sideOffset={8} aria-label="会话详情">{details}</Popover.Content></Popover.Portal>
     </Popover.Root></div>;
 }

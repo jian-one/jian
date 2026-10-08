@@ -13,11 +13,11 @@ import { ProfileFilePicker } from '../../shared/ui/ProfileFilePicker';
 import { ThemeControls } from '../../shared/ui/ThemeControls';
 import { TerminalFontSizeControl } from '../../shared/ui/TerminalFontSizeControl';
 import type { TerminalTheme } from '../terminal/themes';
-import { agentEnabled, normalizeAgentSettings, parseExpandedRoster, withAgentEnabled, mergeSettingsFields, saveAgentSettings, settingsFields, type AgentKind, type RosterKind } from './settings-model';
+import { agentEnabled, normalizeAgentSettings, parseExpandedRoster, withAgentEnabled, mergeSettingsFields, saveAgentSettings, settingsFields, dirtySettingsKinds, type AgentKind, type RosterKind } from './settings-model';
 import packageInfo from '../../../package.json';
 
 type Section = 'general' | 'terminal' | 'about';
-type Props = { onBack: () => void; targetAgent: RosterKind | null; onDirtyChange: (dirty: boolean) => void; theme: Theme; onThemeChange: (theme: Theme) => void; terminalTheme: TerminalTheme; onTerminalThemeChange: (theme: TerminalTheme) => void; terminalFontSize?: number; onTerminalFontSizeChange?: (size: number) => void; onAgentEnabledChange?: (kind: AgentKind, enabled: boolean) => Promise<void>; busy: boolean; onBusyChange: (busy: boolean) => void; isCurrentUser: () => boolean };
+type Props = { onBack: () => void; targetAgent: RosterKind | null; onDirtyChange: (names: string[]) => void; theme: Theme; onThemeChange: (theme: Theme) => void; terminalTheme: TerminalTheme; onTerminalThemeChange: (theme: TerminalTheme) => void; terminalFontSize?: number; onTerminalFontSizeChange?: (size: number) => void; onAgentEnabledChange?: (kind: AgentKind, enabled: boolean) => Promise<void>; busy: boolean; onBusyChange: (busy: boolean) => void; isCurrentUser: () => boolean };
 const sections: { id: Section; label: string; icon: typeof SlidersHorizontal }[] = [
   { id: 'general', label: '通用', icon: SlidersHorizontal },
   { id: 'terminal', label: '终端', icon: MonitorCog },
@@ -33,7 +33,7 @@ function LaunchArguments({ kind, settings, setSettings }: { kind: AgentKind; set
   return <fieldset className="profile-settings launch-arguments"><legend>启动参数</legend><small>每项为一个独立参数，保存后应用于新建和重启的会话。</small><div className="launch-argument-list">{args.map((argument, index) => <div key={index}><input ref={element => { refs.current[index] = element; }} value={argument} onChange={event => update(index, event.target.value)} placeholder="例如 --model 或 gpt-5" aria-label={`启动参数 ${index + 1}`} /><button type="button" className="icon" aria-label={`移除启动参数 ${index + 1}`} title="移除参数" onClick={() => setSettings(value => ({ ...value, [key]: value[key].filter((_, itemIndex) => itemIndex !== index) }))}><Trash2 /></button></div>)}</div><button type="button" className="icon launch-argument-add" onClick={add} aria-label="添加启动参数" title="添加启动参数"><Plus /></button></fieldset>;
 }
 
-function AgentRosterItem({ kind, settings, savingKind, save, setSettings }: { kind: RosterKind; settings: AgentSettings; savingKind: RosterKind | null; save: (kind: RosterKind, enabled?: boolean) => Promise<void>; setSettings: (update: (value: AgentSettings) => AgentSettings) => void }) {
+function AgentRosterItem({ kind, settings, savingKind, save, setSettings, dirty, feedback, reset }: { dirty: boolean; feedback?: { message?: string; error?: string }; reset: () => void; kind: RosterKind; settings: AgentSettings; savingKind: RosterKind | null; save: (kind: RosterKind, enabled?: boolean) => Promise<void>; setSettings: (update: (value: AgentSettings) => AgentSettings) => void }) {
   const enabled = kind === 'local' || agentEnabled(settings, kind);
   const label = kind === 'local' ? 'Local' : kind === 'codex' ? 'Codex' : kind === 'hermes' ? 'Hermes' : 'Pi';
   const [profilePicking, setProfilePicking] = useState(false);
@@ -43,29 +43,29 @@ function AgentRosterItem({ kind, settings, savingKind, save, setSettings }: { ki
   const localProfiles = <><fieldset className="profile-settings local-profile-settings"><legend>自动加载的 profile 文件</legend><small>第一个文件固定为 ~/.bashrc，不能删除。</small><div className="local-profile-list">{settings.local_profiles.map((path, index) => <div key={path}><span title={path}>{path}</span>{index === 0 ? <small>固定</small> : <button type="button" className="icon" aria-label={`移除 ${path}`} title="移除文件" onClick={() => setSettings(value => ({ ...value, local_profiles: value.local_profiles.filter(item => item !== path) }))}><Trash2 /></button>}</div>)}</div><div className="local-profile-add"><button type="button" className="icon" aria-label="添加 profile 文件" title="添加 profile 文件" onClick={() => setProfilePicking(true)}><Plus /></button></div></fieldset>{profilePicking && <ProfileFilePicker open onOpenChange={setProfilePicking} select={path => { setSettings(value => value.local_profiles.includes(path) ? value : { ...value, local_profiles: [...value.local_profiles, path] }); setProfilePicking(false); }} />}</>;
   const roleFields = <fieldset className="profile-settings"><legend>角色</legend><small>名称、入口路径和角色主目录均为必填。</small>{settings.pi_roles.map((role, index) => <div className="launch-argument-list" key={index}><input required aria-label={`角色 ${index + 1} 名称`} placeholder="角色名称" value={role.name} onChange={event => setSettings(value => ({ ...value, pi_roles: value.pi_roles.map((item, itemIndex) => itemIndex === index ? { ...item, name: event.target.value } : item) }))} /><input required aria-label={`角色 ${index + 1} 入口路径`} placeholder="入口路径" value={role.entry} onChange={event => setSettings(value => ({ ...value, pi_roles: value.pi_roles.map((item, itemIndex) => itemIndex === index ? { ...item, entry: event.target.value } : item) }))} /><input required aria-label={`角色 ${index + 1} 主目录`} placeholder="角色主目录" value={role.home} onChange={event => setSettings(value => ({ ...value, pi_roles: value.pi_roles.map((item, itemIndex) => itemIndex === index ? { ...item, home: event.target.value } : item) }))} /><button type="button" className="icon" aria-label={`移除角色 ${role.name || index + 1}`} onClick={() => setSettings(value => ({ ...value, pi_roles: value.pi_roles.filter((_, itemIndex) => itemIndex !== index) }))}><Trash2 /></button></div>)}<button type="button" className="icon launch-argument-add" aria-label="添加角色" onClick={() => setSettings(value => ({ ...value, pi_roles: [...value.pi_roles, { name: '', entry: '', home: '' }] }))}><Plus /></button></fieldset>;
   return <Accordion.Item className="agent-roster-item" data-agent-settings={kind} value={kind}>
-    <div className="agent-toggle-row"><Accordion.Header><Accordion.Trigger className="agent-roster-trigger" disabled={!!savingKind} aria-label={`${label}设置，展开或收起详细配置`}><span className="agent-toggle-copy"><AgentIcon kind={kind === 'local' ? 'local' : kind} /><strong>{label}</strong></span><ChevronDown className="agent-roster-chevron" aria-hidden="true" /></Accordion.Trigger></Accordion.Header><Switch.Root className="agent-switch" checked={enabled} disabled={kind === 'local' || !!savingKind} onCheckedChange={kind === 'local' ? undefined : toggle} aria-label={kind === 'local' ? 'Local 已激活' : `启用 ${label}`}><Switch.Thumb className="agent-switch-thumb" /></Switch.Root></div>
+    <div className="agent-toggle-row"><Accordion.Header><Accordion.Trigger className="agent-roster-trigger" disabled={!!savingKind} aria-label={`${label}设置，展开或收起详细配置`}><span className="agent-toggle-copy"><AgentIcon kind={kind === 'local' ? 'local' : kind} /><strong>{label}</strong>{dirty && <small className="settings-dirty-badge">未保存</small>}{feedback?.error && <small className="settings-error-badge">保存失败</small>}</span><ChevronDown className="agent-roster-chevron" aria-hidden="true" /></Accordion.Trigger></Accordion.Header><Switch.Root className="agent-switch" checked={enabled} disabled={kind === 'local' || !!savingKind} onCheckedChange={kind === 'local' ? undefined : toggle} aria-label={kind === 'local' ? 'Local 已激活' : `启用 ${label}`}><Switch.Thumb className="agent-switch-thumb" /></Switch.Root></div>
     <Accordion.Content className="agent-roster-content"><form onSubmit={event => { if (event.target !== event.currentTarget) return; event.preventDefault(); void save(kind); }}>
       <fieldset className="agent-roster-fields settings-form-lock" disabled={!!savingKind}>{kind === 'local' ? <>{localProfiles}</> : kind === 'codex' ? <>{field('codex_bin', 'CODEX_BIN', 'Codex 可执行文件路径')}{environmentVariables}<LaunchArguments kind="codex" settings={settings} setSettings={setSettings} /></> : kind === 'hermes' ? <>{field('hermes_home', 'HERMES_HOME', 'Hermes 配置与 profile 根目录')}{field('hermes_bin', 'HERMES_BIN', 'Hermes 可执行文件路径')}<label className="setting-field"><span>Hermes profiles<small>多个名称以逗号分隔</small></span><input value={settings.hermes_profiles.join(',')} onChange={event => setSettings(value => ({ ...value, hermes_profiles: event.target.value.split(',') }))} onBlur={() => setSettings(value => ({ ...value, hermes_profiles: value.hermes_profiles.map(profile => profile.trim()).filter(Boolean) }))} /></label>{environmentVariables}<LaunchArguments kind="hermes" settings={settings} setSettings={setSettings} /></> : <>{field('pi_default', 'default', '默认 Pi 命令完整路径')}{environmentVariables}<LaunchArguments kind="pi" settings={settings} setSettings={setSettings} />{roleFields}</>}</fieldset>
-      <footer><button type="submit" disabled={!!savingKind}>{savingKind === kind ? '正在保存…' : `保存 ${label} 设置`}</button></footer>
+      <div className="settings-card-feedback">{feedback?.error && <p className="error" role="alert">{feedback.error}</p>}{feedback?.message && <p className="settings-save-status" role="status">{feedback.message}</p>}</div><footer><button type="button" className="settings-reset" disabled={!!savingKind || !dirty} onClick={reset}>撤销本项修改</button><button type="submit" disabled={!!savingKind || !dirty}>{savingKind === kind ? '正在保存…' : `保存 ${label} 设置`}</button></footer>
     </form></Accordion.Content>
   </Accordion.Item>;
 }
 
-function GeneralSettings({ onAgentEnabledChange, onBusyChange, isCurrentUser, targetAgent, onDirtyChange }: { targetAgent: RosterKind | null; onDirtyChange: (dirty: boolean) => void; onAgentEnabledChange: (kind: AgentKind, enabled: boolean) => Promise<void>; onBusyChange: (busy: boolean) => void; isCurrentUser: () => boolean }) {
+function GeneralSettings({ onAgentEnabledChange, onBusyChange, isCurrentUser, targetAgent, onDirtyChange }: { targetAgent: RosterKind | null; onDirtyChange: (names: string[]) => void; onAgentEnabledChange: (kind: AgentKind, enabled: boolean) => Promise<void>; onBusyChange: (busy: boolean) => void; isCurrentUser: () => boolean }) {
   const [settings, setSettings] = useState<AgentSettings | null>(null);
   const baseline = useRef<AgentSettings | null>(null);
   const [expanded, setExpanded] = useState<RosterKind[]>(() => parseExpandedRoster(localStorage.getItem('jian.settings-agent-roster-expanded')));
   const [error, setError] = useState('');
-  const [message, setMessage] = useState('');
+  const [feedback, setFeedback] = useState<Partial<Record<RosterKind, { message?: string; error?: string }>>>({});
   const [savingKind, setSavingKind] = useState<RosterKind | null>(null);
   const mounted = useRef(true);
   const alive = () => mounted.current && isCurrentUser();
   const saveInFlight = useRef(false);
   const readingSettings = useRef(false);
   const save = async (kind: RosterKind, enabled?: boolean) => {
-    if (!settings || saveInFlight.current) return;
+    if (!settings || saveInFlight.current || (enabled === undefined && !dirtySettingsKinds(settings, baseline.current).includes(kind))) return;
     saveInFlight.current = true;
-    setSavingKind(kind); onBusyChange(true); setError(''); setMessage('');
+    setSavingKind(kind); onBusyChange(true); setFeedback(value => ({ ...value, [kind]: {} }));
     const fields = settingsFields(kind, enabled === undefined ? 'roster' : 'toggle');
     const next = enabled === undefined ? settings : withAgentEnabled(settings, kind, enabled);
     try {
@@ -74,8 +74,8 @@ function GeneralSettings({ onAgentEnabledChange, onBusyChange, isCurrentUser, ta
       if (baseline.current) baseline.current = mergeSettingsFields(baseline.current, saved, fields);
       setSettings(value => value ? mergeSettingsFields(value, saved, fields) : value);
       if (enabled !== undefined && kind !== 'local') await onAgentEnabledChange(kind, agentEnabled(saved, kind));
-      setMessage(`${kind === 'local' ? 'Local' : kind === 'pi' ? 'Pi' : kind === 'codex' ? 'Codex' : 'Hermes'}${enabled === undefined ? ' 设置已保存' : enabled ? ' 已启用' : ' 已禁用'}`);
-    } catch (e) { if (alive()) setError(errorMessage(e)); }
+      setFeedback(value => ({ ...value, [kind]: { message: `${kind === 'local' ? 'Local' : kind === 'pi' ? 'Pi' : kind === 'codex' ? 'Codex' : 'Hermes'}${enabled === undefined ? ' 设置已保存' : enabled ? ' 已启用' : ' 已禁用'}` } }));
+    } catch (e) { if (alive()) setFeedback(value => ({ ...value, [kind]: { error: errorMessage(e) } })); }
     finally { saveInFlight.current = false; if (alive()) { setSavingKind(null); onBusyChange(false); } }
   };
   const load = async () => {
@@ -86,7 +86,8 @@ function GeneralSettings({ onAgentEnabledChange, onBusyChange, isCurrentUser, ta
     catch (e) { if (alive()) setError(errorMessage(e)); }
     finally { readingSettings.current = false; }
   };
-  useEffect(() => { onDirtyChange(!!settings && JSON.stringify(settings) !== JSON.stringify(baseline.current)); }, [settings, onDirtyChange]);
+  const dirtyKinds = dirtySettingsKinds(settings, baseline.current);
+  useEffect(() => { onDirtyChange(dirtyKinds.map(kind => kind === 'local' ? 'Local' : kind === 'pi' ? 'Pi' : kind === 'codex' ? 'Codex' : 'Hermes')); }, [dirtyKinds.join('|'), onDirtyChange]);
   useEffect(() => {
     if (!targetAgent) return;
     setExpanded(values => values.includes(targetAgent) ? values : [...values, targetAgent]);
@@ -94,13 +95,13 @@ function GeneralSettings({ onAgentEnabledChange, onBusyChange, isCurrentUser, ta
     return () => cancelAnimationFrame(frame);
   }, [targetAgent, settings !== null]);
   useEffect(() => {
-    const warn = (event: BeforeUnloadEvent) => { if (settings && JSON.stringify(settings) !== JSON.stringify(baseline.current)) event.preventDefault(); };
+    const warn = (event: BeforeUnloadEvent) => { if (dirtySettingsKinds(settings, baseline.current).length) event.preventDefault(); };
     window.addEventListener('beforeunload', warn);
     return () => window.removeEventListener('beforeunload', warn);
   }, [settings]);
   useEffect(() => { mounted.current = true; void load(); return () => { mounted.current = false; }; }, []);
   useEffect(() => { localStorage.setItem('jian.settings-agent-roster-expanded', JSON.stringify(expanded)); }, [expanded]);
-  return <div className="general-settings-content" aria-busy={!!savingKind}><div className="settings-section-intro"><h2>Agent 配置</h2><p>保存后应用于新建或重启的会话。</p></div>{error && <p className="error" role="alert">{error}{!settings && <button onClick={() => void load()}>重试</button>}</p>}{message && <p className="settings-save-status" role="status">{message}</p>}{settings ? <Accordion.Root className="agent-toggle-list" type="multiple" value={expanded} onValueChange={values => setExpanded(values as RosterKind[])}>{(['local', 'codex', 'hermes', 'pi'] as RosterKind[]).map(kind => <Fragment key={kind}>{kind === 'codex' && <div className="settings-section-intro agent-roster-heading"><h2>可用 Agent</h2></div>}<AgentRosterItem kind={kind} settings={settings} savingKind={savingKind} save={save} setSettings={update => { if (!saveInFlight.current) { setMessage(''); setSettings(value => value ? update(value) : value); } }} /></Fragment>)}</Accordion.Root> : !error && <p className="muted">正在读取 Agent 设置…</p>}</div>;
+  return <div className="general-settings-content" aria-busy={!!savingKind}><div className="settings-section-intro"><h2>Agent 配置</h2><p>保存后应用于新建或重启的会话。</p></div>{error && <p className="error" role="alert">{error}{!settings && <button onClick={() => void load()}>重试</button>}</p>}{settings ? <Accordion.Root className="agent-toggle-list" type="multiple" value={expanded} onValueChange={values => setExpanded(values as RosterKind[])}>{(['local', 'codex', 'hermes', 'pi'] as RosterKind[]).map(kind => <Fragment key={kind}>{kind === 'codex' && <div className="settings-section-intro agent-roster-heading"><h2>可用 Agent</h2></div>}<AgentRosterItem kind={kind} dirty={dirtyKinds.includes(kind)} feedback={feedback[kind]} reset={() => { if (saveInFlight.current || !baseline.current) return; setSettings(value => value ? mergeSettingsFields(value, baseline.current!, settingsFields(kind)) : value); setFeedback(value => ({ ...value, [kind]: {} })); }} settings={settings} savingKind={savingKind} save={save} setSettings={update => { if (!saveInFlight.current) { setFeedback(value => ({ ...value, [kind]: {} })); setSettings(value => value ? update(value) : value); } }} /></Fragment>)}</Accordion.Root> : !error && <p className="muted">正在读取 Agent 设置…</p>}</div>;
 }
 
 function TerminalStatusMenu({ terminal, onEnter, onRelease }: { terminal: TerminalStatus; onEnter: () => void; onRelease: () => void }) {

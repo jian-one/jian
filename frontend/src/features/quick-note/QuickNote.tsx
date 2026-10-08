@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ChangeEvent } from 'react';
+import { useEffect, useRef, useState, useImperativeHandle, type ChangeEvent } from 'react';
 import { NotebookPen } from 'lucide-react';
 import { Popover, Tooltip } from 'radix-ui';
 import * as Y from 'yjs';
@@ -22,10 +22,11 @@ function replaceText(node: HTMLTextAreaElement, next: string) {
   node.setRangeText(next.slice(start, nextEnd), start, previousEnd, 'preserve');
 }
 
-export function QuickNote({ username }: { username: string }) {
+export function QuickNote({ username, openRef }: { username: string; openRef?: { current: (() => void) | null } }) {
   const textarea = useRef<HTMLTextAreaElement>(null), doc = useRef(new Y.Doc()), composing = useRef(false), pending = useRef<string[]>([]), loaded = useRef(false), cached = useRef(true), mounted = useRef(true), syncing = useRef(false);
   const [syncStatus, setSyncStatus] = useState('已保存');
   const [open, setOpen] = useState(false);
+  useImperativeHandle(openRef, () => () => setOpen(true));
   const text = doc.current.getText('body');
   const persist = () => { try { localStorage.setItem(cacheKey(username), JSON.stringify({ state: toBase64(Y.encodeStateAsUpdate(doc.current)), pending: pending.current })); } catch { cached.current = false; } };
   const flush = async () => {
@@ -72,5 +73,5 @@ export function QuickNote({ username }: { username: string }) {
     doc.current.transact(() => { if (previousEnd > start) text.delete(start, previousEnd - start); if (nextEnd > start) text.insert(start, next.slice(start, nextEnd)); });
   };
 
-  return <Tooltip.Provider delayDuration={250}><Popover.Root open={open} onOpenChange={setOpen}><Tooltip.Root><Tooltip.Trigger asChild><Popover.Trigger asChild><button className="quick-note-toggle" aria-label="快速记事本"><NotebookPen /></button></Popover.Trigger></Tooltip.Trigger><Tooltip.Portal><Tooltip.Content className="tooltip" side="left">快速记事本<Tooltip.Arrow /></Tooltip.Content></Tooltip.Portal></Tooltip.Root><Popover.Portal><Popover.Content className="quick-note" side="bottom" align="end" sideOffset={12} onOpenAutoFocus={event => { event.preventDefault(); textarea.current?.focus(); }}><label htmlFor="quick-note-body">快速记事本</label><div className="note-sync-status" role="status"><span>{syncStatus}</span>{syncStatus !== '已保存' && <button type="button" onClick={() => void flush()}>重试同步</button>}</div><textarea id="quick-note-body" ref={textarea} defaultValue={text.toString()} onChange={change} onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; sync(); }} placeholder="随手记下想法…" maxLength={100000} /></Popover.Content></Popover.Portal></Popover.Root></Tooltip.Provider>;
+  return <Tooltip.Provider delayDuration={250}><Popover.Root open={open} onOpenChange={setOpen}><Tooltip.Root><Tooltip.Trigger asChild><Popover.Trigger asChild><button className="quick-note-toggle" aria-label="快速记事本"><NotebookPen /></button></Popover.Trigger></Tooltip.Trigger><Tooltip.Portal><Tooltip.Content className="tooltip" side="left">快速记事本<Tooltip.Arrow /></Tooltip.Content></Tooltip.Portal></Tooltip.Root><Popover.Portal><Popover.Content className="quick-note" side="bottom" align="end" sideOffset={12} onCloseAutoFocus={event => { const dock = document.querySelector<HTMLButtonElement>('button[aria-label="更多工作台操作"]'); if (dock) { event.preventDefault(); dock.focus({ preventScroll: true }); } }} onOpenAutoFocus={event => { event.preventDefault(); textarea.current?.focus(); }}><label htmlFor="quick-note-body">快速记事本</label><div className="note-sync-status" role="status"><span>{syncStatus}</span>{syncStatus !== '已保存' && <button type="button" onClick={() => void flush()}>重试同步</button>}</div><textarea id="quick-note-body" ref={textarea} defaultValue={text.toString()} onChange={change} onCompositionStart={() => { composing.current = true; }} onCompositionEnd={() => { composing.current = false; sync(); }} placeholder="随手记下想法…" maxLength={100000} /></Popover.Content></Popover.Portal></Popover.Root></Tooltip.Provider>;
 }

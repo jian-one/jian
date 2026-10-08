@@ -5,7 +5,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { attachTerminalInputBuffer, isPasteShortcut } from '../../terminal-input-buffer';
 import { terminalThemes, type TerminalTheme } from './themes';
-import type { Kind } from '../../shared/model';
+import type { Kind, ConnectionFeedback } from '../../shared/model';
 
 type MountOptions = {
   host: HTMLDivElement;
@@ -19,14 +19,19 @@ type MountOptions = {
   theme: TerminalTheme;
   fontSize: number;
   focus: () => void;
-  send: (data: string) => void;
-  onStatus: (value: string) => void;
+  send: (data: string) => boolean;
+  sendText: (data: string) => boolean;
+  onUnsentText?: (text: string) => void;
+  onBufferChange: (behind: boolean) => void;
+  onStatus: (value: 'running' | 'ended') => void;
+  onConnectionChange: (value: ConnectionFeedback) => void;
+  reconnectRequestRef: { current: (() => void) | null };
   onProgress: (value: string) => void;
   onSearchAddon: (addon: SearchAddon | null) => void;
 };
 
 export function mountTerminal(options: MountOptions) {
-  const { host, inputBuffer, preview, terminalRef, socketRef, fitRequestRef, sessionID, terminalPath, theme, fontSize, focus, send, onStatus, onProgress, onSearchAddon } = options;
+  const { host, inputBuffer, preview, terminalRef, socketRef, fitRequestRef, sessionID, terminalPath, theme, fontSize, focus, send, sendText, onUnsentText, onBufferChange, onStatus, onConnectionChange, reconnectRequestRef, onProgress, onSearchAddon } = options;
   onProgress('正在建立终端连接…');
   const touchInput = window.matchMedia('(pointer: coarse), (hover: none)').matches;
   const term = new Terminal({ cursorBlink: true, disableStdin: true, fontSize, theme: terminalThemes[theme], scrollback: 10000 });
@@ -87,7 +92,7 @@ export function mountTerminal(options: MountOptions) {
     xtermTextarea.setAttribute('autocomplete', 'off');
     xtermTextarea.setAttribute('aria-label', '终端输入');
   }
-  let frame = 0, inputFrame = 0, lastSize = '', lastLayout = '', replayed = false, started = false, disposed = false, ended = false, reconnectDelay = 1000, reconnectTimer = 0, connectionTimer = 0, heartbeatTimer = 0, pongTimer = 0, hasConnected = false;
+  let frame = 0, inputFrame = 0, lastSize = '', lastLayout = '', started = false, disposed = false, ended = false, reconnectDelay = 1000, reconnectTimer = 0, connectionTimer = 0, heartbeatTimer = 0, pongTimer = 0, hasConnected = false;
   let inputGeometry: { left: number; top: number; cellWidth: number; cellHeight: number } | null = null;
   const measureInputGeometry = () => {
     const screen = term.element?.querySelector<HTMLElement>('.xterm-screen');
@@ -150,104 +155,141 @@ export function mountTerminal(options: MountOptions) {
   fitRequestRef.current = schedule;
   const resizeObserver = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(schedule);
   resizeObserver?.observe(host);
-  const viewport = window.visualViewport;
-  const workspace = host.closest<HTMLElement>('.workspace-view');
-  const syncViewportHeight = () => {
-    if (!touchInput || !viewport || !workspace) return;
-    const height = `${Math.max(1, Math.round(viewport.height))}px`;
-    if (workspace.style.getPropertyValue('--mobile-viewport-height') !== height)
-      workspace.style.setProperty('--mobile-viewport-height', height);
-  };
-  const syncViewportOffset = () => {
-    if (!touchInput || !viewport || !workspace) return;
-    const offset = `${Math.round(viewport.offsetTop)}px`;
-    if (workspace.style.getPropertyValue('--mobile-viewport-offset') !== offset)
-      workspace.style.setProperty('--mobile-viewport-offset', offset);
-  };
-  const syncViewport = () => {
-    syncViewportHeight();
-    syncViewportOffset();
-    schedule();
-  };
   const render = term.onRender(positionInput);
-  const inputCleanup = touchInput && inputBuffer ? attachTerminalInputBuffer(inputBuffer, { send, preview: text => { if (preview) preview.textContent = text; } }) : undefined;
-  syncViewport();
+  const inputCleanup = touchInput && inputBuffer ? attachTerminalInputBuffer(inputBuffer, { send: sendText, onUnsentText, preview: text => { if (preview) preview.textContent = text; } }) : undefined;
+  schedule();
   const endpoint = sessionID.startsWith('local-') ? `/api/local/sessions/${encodeURIComponent(sessionID)}/terminal` : `/api/agents/${terminalPath}/sessions/${encodeURIComponent(sessionID)}/terminal`;
+  let attempt = 0;
+  const clearConnectionTimers = () => {
+    window.clearTimeout(reconnectTimer); window.clearTimeout(connectionTimer);
+    window.clearInterval(heartbeatTimer); window.clearTimeout(pongTimer);
+    reconnectTimer = connectionTimer = heartbeatTimer = pongTimer = 0;
+  };
+  const ping = (ws: WebSocket) => {
+    if (ws.readyState !== WebSocket.OPEN || pongTimer || document.hidden || navigator.onLine === false) return;
+    ws.send(JSON.stringify({ type: 'ping' }));
+    pongTimer = window.setTimeout(() => ws.close(), 10000);
+  };
+  const startHeartbeat = (ws: WebSocket) => {
+    window.clearInterval(heartbeatTimer);
+    heartbeatTimer = window.setInterval(() => ping(ws), 15000);
+  };
   const connect = () => {
     if (disposed || ended) return;
+    if (navigator.onLine === false || document.hidden) {
+      if (navigator.onLine === false) { onConnectionChange({ state: 'offline', attempt, retrying: false }); onProgress('已离线，联网后恢复连接'); }
+      return;
+    }
     const reconnecting = hasConnected;
+    attempt++;
+    onConnectionChange({ state: reconnecting || attempt > 1 ? 'reconnecting' : 'connecting', attempt, retrying: true });
     const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}${endpoint}`);
     socketRef.current = ws;
+    let resetReplay = false, pendingReplay = 0;
+    const allowInput = () => {
+      if (started && !pendingReplay && !ended && socketRef.current === ws) term.options.disableStdin = false;
+    };
+    const resetOutput = () => { if (resetReplay) { term.reset(); resetReplay = false; } };
     connectionTimer = window.setTimeout(() => ws.close(), 10000);
     ws.onopen = () => {
+      if (disposed || socketRef.current !== ws) return;
       window.clearTimeout(connectionTimer);
-      if (hasConnected) { term.reset(); replayed = started = false; }
+      started = false; resetReplay = hasConnected;
       hasConnected = true;
-      reconnectDelay = 1000;
       lastSize = '';
       resizeNow();
       onProgress('正在恢复终端输出…');
-      heartbeatTimer = window.setInterval(() => {
-        if (ws.readyState !== WebSocket.OPEN || pongTimer) return;
-        ws.send(JSON.stringify({ type: 'ping' }));
-        pongTimer = window.setTimeout(() => ws.close(), 10000);
-      }, 15000);
+      startHeartbeat(ws);
     };
     ws.onmessage = event => {
-      const message = JSON.parse(event.data);
+      if (disposed || socketRef.current !== ws) return;
+      let message;
+      try { message = JSON.parse(event.data); } catch { return; }
+      if (!message || typeof message !== 'object') return;
       if (message.type === 'pong') { window.clearTimeout(pongTimer); pongTimer = 0; return; }
-      if (message.type === 'pty.output') {
-        if (!started) { replayed = true; term.write(message.payload, () => { term.options.disableStdin = false; }); }
+      if (message.type === 'pty.output' && typeof message.payload === 'string') {
+        resetOutput();
+        if (!started) { pendingReplay++; term.write(message.payload, () => { pendingReplay--; allowInput(); }); }
         else term.write(message.payload);
       }
-      if (message.type === 'pty.exit') { ended = true; onStatus('ended'); onProgress('终端已结束'); }
-      if (message.type === 'session.started') {
-        started = true;
-        if (!replayed) term.options.disableStdin = false;
-        onStatus('running');
-        onProgress('已连接');
+      if (message.type === 'pty.exit') {
+        ended = true; term.options.disableStdin = true; clearConnectionTimers();
+        onStatus('ended'); onConnectionChange({ state: 'ended', attempt: 0, retrying: false }); onProgress('终端已结束');
+      }
+      if (message.type === 'session.started' && !ended) {
+        resetOutput(); started = true; reconnectDelay = 1000; attempt = 0;
+        allowInput();
+        onStatus('running'); onConnectionChange({ state: 'connected', attempt: 0, retrying: false }); onProgress('已连接');
         const active = document.activeElement;
         if (!reconnecting && !touchInput && !(active instanceof HTMLElement && active.matches('input, textarea, [contenteditable="true"]')) && !document.querySelector('[role="dialog"][aria-modal="true"], [role="dialog"][data-state="open"]')) focus();
       }
     };
     ws.onclose = () => {
-      window.clearTimeout(connectionTimer);
-      window.clearInterval(heartbeatTimer);
-      window.clearTimeout(pongTimer);
-      heartbeatTimer = pongTimer = 0;
-      if (socketRef.current === ws) socketRef.current = null;
-      if (disposed || ended) return;
+      if (disposed || socketRef.current !== ws) return;
+      clearConnectionTimers(); socketRef.current = null;
+      if (ended) return;
       term.options.disableStdin = true;
-      onStatus('reconnecting');
-      onProgress('连接中断，正在重连…');
-      reconnectTimer = window.setTimeout(connect, reconnectDelay);
+      onConnectionChange({ state: navigator.onLine === false ? 'offline' : 'reconnecting', attempt, retrying: false });
+      onProgress(navigator.onLine === false ? '已离线，联网后恢复连接' : '连接中断，正在重连…');
+      if (!document.hidden && navigator.onLine !== false) reconnectTimer = window.setTimeout(connect, reconnectDelay);
       reconnectDelay = Math.min(reconnectDelay * 2, 15000);
     };
     ws.onerror = () => ws.close();
   };
+  const retryNow = () => {
+    if (disposed || ended || socketRef.current?.readyState === WebSocket.CONNECTING) return;
+    clearConnectionTimers();
+    const previous = socketRef.current; socketRef.current = null;
+    if (previous) { previous.onopen = previous.onmessage = previous.onclose = previous.onerror = null; previous.close(); }
+    term.options.disableStdin = true;
+    connect();
+  };
+  const resume = () => {
+    if (disposed || ended || document.hidden || navigator.onLine === false) return;
+    const ws = socketRef.current;
+    if (ws?.readyState === WebSocket.OPEN) { startHeartbeat(ws); ping(ws); }
+    else if (ws?.readyState === WebSocket.CONNECTING) {
+      window.clearTimeout(connectionTimer); connectionTimer = window.setTimeout(() => ws.close(), 10000);
+    } else retryNow();
+  };
+  const visibility = () => { if (document.hidden) clearConnectionTimers(); else resume(); };
+  const offline = () => {
+    if (disposed || ended) return;
+    clearConnectionTimers(); term.options.disableStdin = true;
+    onConnectionChange({ state: 'offline', attempt, retrying: false }); onProgress('已离线，联网后恢复连接');
+    socketRef.current?.close();
+  };
+  let newOutput = false;
+  const reading = (written = false) => {
+    const buffer = term.buffer.active;
+    if (buffer.type !== 'normal' || buffer.viewportY >= buffer.baseY) newOutput = false;
+    else if (written) newOutput = true;
+    onBufferChange(newOutput);
+  };
+  const scrolled = term.onScroll(() => reading()), written = term.onWriteParsed(() => reading(true));
+  reconnectRequestRef.current = retryNow;
   connect();
-  const input = term.onData(data => { if (!touchInput) send(data); });
-  window.addEventListener('resize', syncViewport);
-  viewport?.addEventListener('resize', syncViewport);
-  viewport?.addEventListener('scroll', syncViewportOffset);
+  const input = term.onData(data => { send(data); });
+  window.addEventListener('resize', schedule);
+  window.addEventListener('online', resume); window.addEventListener('offline', offline);
+  window.addEventListener('pageshow', resume); document.addEventListener('visibilitychange', visibility);
   return () => {
     disposed = true;
+    if (reconnectRequestRef.current === retryNow) reconnectRequestRef.current = null;
     window.clearTimeout(reconnectTimer);
     window.clearTimeout(connectionTimer);
     window.clearInterval(heartbeatTimer);
     window.clearTimeout(pongTimer);
     inputCleanup?.();
-    input.dispose();
+    input.dispose(); scrolled.dispose(); written.dispose();
     render.dispose();
     resizeObserver?.disconnect();
     if (fitRequestRef.current === schedule) fitRequestRef.current = null;
     if (frame) cancelAnimationFrame(frame);
     if (inputFrame) cancelAnimationFrame(inputFrame);
-    window.removeEventListener('resize', syncViewport);
-    viewport?.removeEventListener('resize', syncViewport);
-    viewport?.removeEventListener('scroll', syncViewportOffset);
-    workspace?.style.removeProperty('--mobile-viewport-height');
-    workspace?.style.removeProperty('--mobile-viewport-offset');
+    window.removeEventListener('resize', schedule);
+    window.removeEventListener('online', resume); window.removeEventListener('offline', offline);
+    window.removeEventListener('pageshow', resume); document.removeEventListener('visibilitychange', visibility);
     socketRef.current?.close();
     onSearchAddon(null);
     term.dispose();

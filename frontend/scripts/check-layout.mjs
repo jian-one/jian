@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 const read = path => readFileSync(new URL(path, import.meta.url), 'utf8');
 const app = read('../src/main.tsx');
 const main = app + read('../src/features/terminal/AgentTerminal.tsx') + read('../src/features/session-catalog/SessionTabs.tsx') + read('../src/features/session-catalog/WorkspacePicker.tsx');
+const switcher = read('../src/features/session-catalog/SessionSwitcher.tsx');
 const navigation = read('../src/features/navigation/SidebarNavigation.tsx');
 const sessions = read('../src/features/session-catalog/SessionList.tsx');
 const terminal = read('../src/features/terminal/mountTerminal.ts');
@@ -11,6 +12,11 @@ const settings = read('../src/features/settings/SettingsPage.tsx');
 const css = `${read('../src/styles.css')}\n${read('../src/layout.css')}`;
 
 const checks = [
+  ['unified switching uses cached catalogs and Radix navigation', switcher.includes('Dialog.Root') && switcher.includes('Tabs.List') && switcher.includes('/sessions/cache') && !switcher.includes('/sessions/refresh')],
+  ['focus mode changes layout without replacing terminal identity', app.includes('workbench-focused') && app.includes('hidden={!focusMode}') && css.includes('.workbench-focused .session-tabs')],
+  ['pane recovery reuses one guarded connection flow', terminal.includes('reconnectRequestRef.current = retryNow') && terminal.includes('socketRef.current !== ws') && terminal.includes('clearConnectionTimers()')],
+  ['configuration cards show dirty state and individual recovery', settings.includes('settings-dirty-badge') && settings.includes('撤销本项修改') && settings.includes('feedback[kind]')],
+
   ['settings is independent from terminal context', app.includes('settingsOpen ? (') && app.includes('<SettingsPage') && !app.includes('settingsOpen ? "settings"')],
   ['Agent rail has direct Local, Codex, Hermes and Pi entry points', ['Local', 'Codex', 'Hermes', 'Pi'].every(label => navigation.includes(`<span>${label}</span>`))],
   ['roles use keyboard-accessible Radix tabs', navigation.includes('className="role-strip"') && navigation.includes('Tabs.Trigger') && navigation.includes('activationMode="manual"')],

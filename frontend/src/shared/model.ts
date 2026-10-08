@@ -94,13 +94,15 @@ export const openSessionTitle = (session: OpenSession) => session.kind === 'loca
 export const openSessionLabel = (session: Pick<OpenSession, 'kind'>) =>
   ({ local: 'Local', codex: 'Codex', hermes: 'Hermes', pi: 'Pi' })[session.kind];
 
-export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'ended';
+export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'ended' | 'offline';
+export type ConnectionFeedback = { state: ConnectionState; attempt: number; retrying: boolean };
 export const connectionView = (state: ConnectionState) => ({
   connecting: { tone: 'idle', label: '正在连接' },
   connected: { tone: 'running', label: '已连接' },
   reconnecting: { tone: 'waiting', label: '正在重连' },
   disconnected: { tone: 'idle', label: '已断开连接' },
   ended: { tone: 'ended', label: '进程已结束' },
+  offline: { tone: 'waiting', label: '已离线' },
 })[state];
 export const statusView = (value?: string) => {
   const normalized = (value || 'unknown').toLowerCase();
@@ -112,4 +114,5 @@ export const statusView = (value?: string) => {
   return { tone: 'idle', label: value || '状态未知' };
 };
 
-export const isMobile = () => window.matchMedia('(max-width: 800px)').matches;
+export const mobileMedia = '(max-width: 800px), (max-width: 1199px) and (pointer: coarse)';
+export const isMobile = () => window.matchMedia(mobileMedia).matches;

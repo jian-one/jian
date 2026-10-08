@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Bot, Check, ChevronDown, LogOut, Menu, Plus, RefreshCw, Search, Settings2, Trash2, X } from 'lucide-react';
 import { Dialog, Select, Tabs } from 'radix-ui';
 import { SessionList } from '../session-catalog/SessionList';
@@ -39,16 +39,13 @@ export function SidebarNavigation({ active, currentKind, profile, profiles, piAg
   const filteredLocal = localSessions.filter(session => matches(query, session));
   const scrollKey = navScrollKey(currentKind, currentKind === 'local' ? 'default' : profile);
   const hasRows = (currentKind === 'local' ? localSessions : rows).length > 0;
-  useEffect(() => {
+  useLayoutEffect(() => {
     const node = listNode;
     if (!node || !hasRows || (compact && !navigationOpen) || (restored.current?.node === node && restored.current.key === scrollKey)) return;
-    const frame = requestAnimationFrame(() => {
-      let position = 0;
+    let position = 0;
       try { position = Number(localStorage.getItem(scrollKey)) || 0; } catch {}
       node.scrollTop = Math.max(0, position);
       restored.current = { key: scrollKey, node };
-    });
-    return () => cancelAnimationFrame(frame);
   }, [listNode, compact, navigationOpen, scrollKey, hasRows]);
   const resetScroll = () => {
     if (listNode) listNode.scrollTop = 0;
@@ -72,7 +69,7 @@ export function SidebarNavigation({ active, currentKind, profile, profiles, piAg
       {refreshingKind === currentKind && <p className="catalog-feedback" role="status">正在刷新原生会话…</p>}
       {catalogError && <div className="catalog-feedback error" role="alert"><span>{catalogError}</span><button onClick={() => currentKind !== 'local' && onRefresh(currentKind)}>重试</button></div>}
       <div ref={setListNode} className="catalog-list" onScroll={event => {
-        if (restored.current?.key !== scrollKey || restored.current.node !== event.currentTarget) return;
+        if (compact && !navigationOpen) return;
         try { localStorage.setItem(scrollKey, String(event.currentTarget.scrollTop)); } catch {}
       }}>
         {currentKind === 'local' ? <div className="session-list">{filteredLocal.map(session => <div className={'session-row ' + (active?.id === session.id ? 'active' : '')} key={session.id}><button className="session" onClick={() => onSelectLocal(session)}><span className={'session-state ' + statusView(session.status).tone} /><span className="session-copy"><strong title={session.title}>{session.title}</strong><small title={session.workspace}>{displayWorkspacePath(session.workspace)}</small></span></button><button className="icon local-session-remove" aria-label={`删除 ${session.title}`} title="删除会话" onClick={() => onRemoveLocal(session)}><Trash2 /></button></div>)}{!filteredLocal.length && <div className="nav-empty"><span>{query ? '没有匹配的会话' : '暂无本地终端'}</span><small>{query ? '尝试其他关键词，或清除筛选。' : '新建一个 Bash 会话开始工作。'}</small><button onClick={() => query ? setQuery('') : create()}>{query ? '清除筛选' : '新建会话'}</button></div>}</div> : <SessionList searching={!!query || !!workspace} onClearFilter={() => { setQuery(''); setWorkspace(''); resetScroll(); }} rows={filtered} listKind={currentKind} listProfile={profile} activeID={active?.id} connectedID={connectedSessionID} visibleCount={visibleCount(currentKind, `${profile}:${workspace}`)} onSelect={onSelectSession} onDialog={onDialog} onDisconnect={onDisconnect} onRelease={onRelease} onOpenSecondary={onOpenSecondary} onShowMore={() => onShowMore(currentKind, `${profile}:${workspace}`)} />}
@@ -87,7 +84,7 @@ export function SidebarNavigation({ active, currentKind, profile, profiles, piAg
       <Dialog.Overlay className="nav-scrim" />
       <Dialog.Content ref={drawerRef} className="nav-drawer" aria-describedby={undefined}
         onOpenAutoFocus={event => { event.preventDefault(); drawerRef.current?.querySelector<HTMLButtonElement>('.nav-drawer-close')?.focus({ preventScroll: true }); }}
-        onCloseAutoFocus={event => { if (handingOffFocus) { event.preventDefault(); document.querySelector<HTMLButtonElement>('.settings-back')?.focus({ preventScroll: true }); } }}>
+        onCloseAutoFocus={event => { if (handingOffFocus) { event.preventDefault(); document.querySelector<HTMLButtonElement>('.settings-back')?.focus({ preventScroll: true }); } else { const dock = document.querySelector<HTMLButtonElement>('.mobile-workbench-dock button[aria-label="更多工作台操作"]'); if (dock) { event.preventDefault(); dock.focus({ preventScroll: true }); } } }}>
         <Dialog.Title className="nav-dialog-title">会话导航</Dialog.Title>
         <Dialog.Close asChild><button type="button" className="icon mobile-nav-toggle nav-drawer-close" aria-label="关闭导航"><X /></button></Dialog.Close>
         {content}

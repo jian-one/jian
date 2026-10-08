@@ -1,11 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { Tabs, DropdownMenu } from "radix-ui";
-import { X, MoreHorizontal } from "lucide-react";
+import { X, MoreHorizontal, ListFilter } from "lucide-react";
 import { adjacentTab } from "../../session-tabs";
 import { openSessionKey, openSessionTitle, openSessionLabel, type OpenSession } from "../../shared/model";
 
 export function SessionTabs({
-  sessions, order, value, select, close, reorder, locked,
+  sessions, order, value, select, close, reorder, locked, onSwitcher,
 }: {
   sessions: OpenSession[];
   order: string[];
@@ -14,6 +14,7 @@ export function SessionTabs({
   close: (key: string) => void;
   reorder: (from: string, to: string) => void;
   locked: boolean;
+  onSwitcher: () => void;
 }) {
   const [dragKey, setDragKey] = useState<string | null>(null);
   const [dropKey, setDropKey] = useState<string | null>(null);
@@ -76,5 +77,6 @@ export function SessionTabs({
         </div>;
       })}
     </Tabs.List>
+    <button className="session-switcher-trigger icon" aria-label="切换会话" disabled={locked} onClick={onSwitcher}><ListFilter /></button>
   </Tabs.Root>;
 }

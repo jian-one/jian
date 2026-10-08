@@ -11,7 +11,8 @@ type TerminalInputBufferOptions = {
   clear: () => void;
   preview: (text: string) => void;
   read: () => string;
-  send: (data: string) => void;
+  send: (data: string) => boolean | void;
+  onUnsentText?: (text: string) => void;
   defer?: (callback: () => void) => () => void;
 };
 
@@ -42,6 +43,7 @@ export const terminalKeyData = (event: Pick<KeyboardEvent, 'altKey' | 'ctrlKey' 
 export class TerminalInputBuffer {
   private cancelDeferred?: () => void;
   private composing = false;
+  private pendingText = '';
   private readonly options: TerminalInputBufferOptions;
 
   constructor(options: TerminalInputBufferOptions) {
@@ -65,8 +67,10 @@ export class TerminalInputBuffer {
       const id = window.setTimeout(callback, 0);
       return () => window.clearTimeout(id);
     });
+    this.pendingText = fallback;
     this.cancelDeferred = defer(() => {
       this.cancelDeferred = undefined;
+      this.pendingText = '';
       this.commit(fallback);
     });
   }
@@ -95,18 +99,25 @@ export class TerminalInputBuffer {
   }
 
   dispose() {
+    const pending = this.options.read() || this.pendingText;
     this.cancelPendingCommit();
+    if (pending) this.options.onUnsentText?.(pending);
+    this.options.clear();
     this.options.preview('');
   }
 
   private cancelPendingCommit() {
     this.cancelDeferred?.();
     this.cancelDeferred = undefined;
+    this.pendingText = '';
   }
 
   private commit(fallback: string, readValue = true) {
     const value = readValue ? this.options.read() || fallback : fallback;
-    if (value) this.options.send(value);
+    if (value && this.options.send(value) === false && readValue) {
+      if (!this.options.onUnsentText) return;
+      this.options.onUnsentText(value);
+    }
     this.options.clear();
     this.options.preview('');
   }

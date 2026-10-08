@@ -45,3 +45,17 @@ test('new users get light while legacy and independent theme choices remain vali
 test('Pi sessions in different roles retain separate restore keys', () => {
   assert.notEqual(activeSessionKey('pi', 'first'), activeSessionKey('pi', 'second'));
 });
+
+import { switcherRows } from '../src/features/session-catalog/session-switcher-model.ts';
+test('switcher preserves role identity, opened order and token search without mutating data', () => {
+  const base = { id: 'same', title: 'Build API', workspace: '/work/team', status: 'idle', updated_at: '2026-10-05T10:00:00Z' };
+  const first = { ...base, kind: 'pi' as const, profile: 'ops' }, second = { ...base, kind: 'pi' as const, profile: 'research' };
+  const local = { id: 'local-one', kind: 'local' as const, title: 'Shell', workspace: '/work/team', status: 'running' };
+  const order = [openSessionKey(second), openSessionKey(local)];
+  const opened = [local, second], catalog = [first, second, local];
+  assert.deepEqual(switcherRows(opened, order, catalog).map(openSessionKey), [...order, openSessionKey(first)]);
+  assert.deepEqual(switcherRows(opened, order, catalog, 'PI ops TEAM'), [first]);
+  assert.deepEqual(switcherRows(opened, order, catalog, '', true), [second, local]);
+  assert.deepEqual(switcherRows(opened, order, catalog, 'missing'), []);
+  assert.deepEqual(opened, [local, second]); assert.equal(catalog.length, 3);
+});

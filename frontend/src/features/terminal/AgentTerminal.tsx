@@ -1,10 +1,13 @@
-import { useEffect, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useRef, useState, useImperativeHandle, type CSSProperties } from "react";
 import type { Terminal } from "@xterm/xterm";
 import type { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
 import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ChevronDown, Search, X } from "lucide-react";
-import { Collapsible } from "radix-ui";
-import { initialTerminalFontSize, connectionView, type ConnectionState, type Kind, type TerminalSession } from "../../shared/model";
+import { flushSync } from "react-dom";
+import { MobileTerminalInput, type TerminalActions } from "./MobileTerminalInput";
+import { emptyDraft, type MobileInputMode, type TerminalDraft } from "./mobile-state";
+import { Collapsible, Dialog, ToggleGroup } from "radix-ui";
+import { initialTerminalFontSize, connectionView, type ConnectionFeedback, type Kind, type TerminalSession } from "../../shared/model";
 import { TerminalFontSizeControl } from "../../shared/ui/TerminalFontSizeControl";
 import { mountTerminal } from "./mountTerminal";
 import { terminalThemeColors, terminalThemes, type TerminalTheme } from "./themes";
@@ -12,8 +15,13 @@ import { isPasteShortcut } from "../../terminal-input-buffer";
 
 export function AgentTerminal({
   session,
+  mobile = false, inputMode = 'read', onInputMode = () => {}, actionsRef,
+  draft = emptyDraft, onDraft = () => {}, storageError = '', onUnsentText,
   onStatus,
   onProgress,
+  onConnectionChange,
+  reconnectRef,
+  onRestart,
   terminalPath = "codex",
   terminalTheme,
   terminalFontSize = initialTerminalFontSize(),
@@ -23,7 +31,13 @@ export function AgentTerminal({
     ),
 }: {
   session: TerminalSession;
-  onStatus: (v: string) => void;
+  mobile?: boolean; inputMode?: MobileInputMode; onInputMode?: (mode: MobileInputMode) => void;
+  actionsRef?: { current: TerminalActions | null }; draft?: TerminalDraft; onDraft?: (draft: TerminalDraft) => void;
+  storageError?: string; onUnsentText?: (text: string) => void;
+  onStatus: (v: 'running' | 'ended') => void;
+  onConnectionChange?: (value: ConnectionFeedback) => void;
+  reconnectRef?: { current: (() => void) | null };
+  onRestart?: () => void;
   onProgress: (v: string) => void;
   terminalPath?: Kind | "local";
   terminalTheme: TerminalTheme;
@@ -39,6 +53,13 @@ export function AgentTerminal({
     searchToggleRef = useRef<HTMLButtonElement>(null),
     searchInputRef = useRef<HTMLInputElement>(null),
     searchAddonRef = useRef<SearchAddon | null>(null);
+  const editorRef = useRef<HTMLTextAreaElement>(null), copyRef = useRef<HTMLTextAreaElement>(null);
+  const inputModeRef = useRef(inputMode); inputModeRef.current = inputMode;
+  const mobileRef = useRef(mobile); mobileRef.current = mobile;
+  const unsentRef = useRef(onUnsentText); unsentRef.current = onUnsentText;
+  const [behind, setBehind] = useState(false), [copyOpen, setCopyOpen] = useState(false);
+  const [copyText, setCopyText] = useState(''), [copyScope, setCopyScope] = useState('screen');
+  const [operationMessage, setOperationMessage] = useState('');
   const searchOriginRef = useRef<HTMLElement | null>(null);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchText, setSearchText] = useState("");
@@ -48,7 +69,10 @@ export function AgentTerminal({
     setFontSize(size);
     onTerminalFontSizeChange(size);
   };
-  const [connection, setConnection] = useState<ConnectionState>("connecting");
+  const [feedback, setFeedback] = useState<ConnectionFeedback>({ state: "connecting", attempt: 0, retrying: true });
+  const connection = feedback.state;
+  const localReconnect = useRef<(() => void) | null>(null);
+  const reconnectRequestRef = reconnectRef || localReconnect;
   const [connectionProgress, setConnectionProgress] = useState("");
   const [toolsOpen, setToolsOpen] = useState(false);
   const [shiftPressed, setShiftPressed] = useState(false);
@@ -90,13 +114,55 @@ export function AgentTerminal({
     term.clearSelection();
     return true;
   };
-  const send = (data: string) => {
-    if (data === "\u0003" && copySelection()) return;
+  const pasteAccepted = useRef(false);
+  const send = (data: string): boolean => {
+    if (data === '\u0003' && copySelection()) return true;
     const ws = wsRef.current;
-    if (ws?.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "input", data }));
+    if (ws?.readyState !== WebSocket.OPEN || termRef.current?.options.disableStdin) return false;
+    try { ws.send(JSON.stringify({ type: 'input', data })); pasteAccepted.current = true; }
+    catch { return false; }
     if (!usesTouchInput()) requestAnimationFrame(focus);
+    return true;
   };
+  const sendRef = useRef(send); sendRef.current = send;
+  const pasteText = (text: string): boolean => {
+    if (!termRef.current || termRef.current.options.disableStdin || wsRef.current?.readyState !== WebSocket.OPEN) return false;
+    pasteAccepted.current = false;
+    termRef.current.paste(text);
+    return pasteAccepted.current;
+  };
+  const leaveInput = () => {
+    inputBufferRef.current?.blur(); editorRef.current?.blur();
+    setShiftPressed(false); onInputMode('read');
+  };
+  const snapshot = (scope: string) => {
+    const term = termRef.current;
+    if (!term) return '';
+    const buffer = term.buffer.active;
+    const start = scope === 'recent' ? Math.max(0, buffer.length - 200) : buffer.viewportY;
+    const end = scope === 'recent' ? buffer.length : Math.min(buffer.length, start + term.rows);
+    let text = '';
+    for (let line = start; line < end; line++) {
+      const row = buffer.getLine(line);
+      if (row) text += (line > start && !row.isWrapped ? '\n' : '') + row.translateToString(true);
+    }
+    return text.trimEnd();
+  };
+  useImperativeHandle(actionsRef, () => ({
+    enter: mode => {
+      flushSync(() => onInputMode(mode));
+      if (mode === 'compose') editorRef.current?.focus({ preventScroll: true });
+      else if (!termRef.current?.options.disableStdin) focus();
+    },
+    leave: leaveInput,
+    search: () => {
+      captureSearchOrigin();
+      flushSync(() => setSearchOpen(true));
+      searchInputRef.current?.focus({ preventScroll: true });
+    },
+    copy: () => { leaveInput(); setCopyScope('screen'); setCopyText(snapshot('screen')); setCopyOpen(true); setOperationMessage(''); },
+    paste: () => { void pasteClipboard().catch(() => setOperationMessage('无法读取剪贴板，请进入文本编辑后长按粘贴。')); },
+  }));
   const sendArrow = (direction: string) =>
     send(`\u001b[${shiftPressed ? "1;2" : ""}${direction}`);
   const sendAttachment = async (file: Blob, name?: string) => {
@@ -137,7 +203,7 @@ export function AgentTerminal({
     const text = clipboard?.getData("text/plain") || await navigator.clipboard?.readText();
     if (text) {
       event?.preventDefault();
-      send(text);
+      pasteText(text);
       return;
     }
     try { document.execCommand("paste"); } catch {}
@@ -156,8 +222,13 @@ export function AgentTerminal({
       theme: terminalTheme,
       fontSize,
       focus,
-      send,
-      onStatus: value => { setConnection(value === "running" ? "connected" : value === "ended" ? "ended" : "reconnecting"); onStatus(value); },
+      send: data => sendRef.current(data),
+      sendText: data => mobileRef.current && inputModeRef.current !== 'direct' ? false : sendRef.current(data),
+      onUnsentText: data => unsentRef.current?.(data),
+      onBufferChange: value => setBehind(value),
+      onStatus,
+      reconnectRequestRef,
+      onConnectionChange: value => { if (inputBufferRef.current) inputBufferRef.current.readOnly = value.state !== 'connected'; setFeedback(value); onConnectionChange?.(value); },
       onProgress: value => { setConnectionProgress(value); onProgress(value); },
       onSearchAddon: (addon) => {
         searchAddonRef.current = addon;
@@ -240,7 +311,7 @@ export function AgentTerminal({
     };
     const end = (event: TouchEvent) => {
       const selected = termRef.current?.hasSelection() || window.getSelection()?.isCollapsed === false;
-      if (tapEligible && !moved && !held && !selected && event.touches.length === 0) focus();
+      if ((!mobileRef.current || inputModeRef.current === 'direct') && tapEligible && !moved && !held && !selected && event.touches.length === 0) focus();
       reset();
     };
     element.addEventListener("touchstart", start, { passive: true });
@@ -305,9 +376,12 @@ export function AgentTerminal({
         } as CSSProperties
       }
     >
+      {operationMessage && <p className="terminal-operation-message" role="status">{operationMessage}</p>}
       <div className="terminal-connection-feedback" role="status" data-state={connection}>
         <span className={"status " + connectionView(connection).tone}>{connectionView(connection).label}</span>
-        {connection !== "connected" && <span>{connectionProgress}</span>}
+        {connection !== "connected" && <span>{connectionProgress}{connection === "reconnecting" && feedback.attempt > 0 && `（第 ${feedback.attempt} 次尝试）`}</span>}
+        {connection === "reconnecting" && <button type="button" disabled={feedback.retrying} onClick={() => reconnectRequestRef.current?.()}>立即重连</button>}
+        {connection === "ended" && onRestart && <button type="button" onClick={onRestart}>重启会话</button>}
       </div>
       <div
         className="terminal-stage"
@@ -366,6 +440,7 @@ export function AgentTerminal({
             <button type="button" aria-label="关闭搜索" title="关闭搜索" onClick={closeSearch}><X /></button>
           </form>
         )}
+        {behind && <button className="terminal-new-output" onClick={() => termRef.current?.scrollToBottom()}>有新输出 · 回到底部</button>}
         <div className="terminal" ref={host} />
         <textarea
           ref={inputBufferRef}
@@ -385,7 +460,25 @@ export function AgentTerminal({
           aria-hidden="true"
         />
       </div>
-      <Collapsible.Root
+      {mobile && <MobileTerminalInput mode={inputMode} draft={draft} storageError={storageError} editor={editorRef}
+        ready={connection === 'connected'} onDraft={onDraft} send={send} pasteText={pasteText} leave={leaveInput} />}
+      <Dialog.Root open={copyOpen} onOpenChange={setCopyOpen}><Dialog.Portal><Dialog.Overlay className="dialog-overlay" />
+        <Dialog.Content className="terminal-copy-dialog dialog" onOpenAutoFocus={event => { event.preventDefault(); }}
+          onCloseAutoFocus={event => { event.preventDefault(); document.querySelector<HTMLButtonElement>('button[aria-label="更多工作台操作"]')?.focus({ preventScroll: true }); }}>
+          <header><Dialog.Title>选择输出文本</Dialog.Title><Dialog.Close asChild><button aria-label="关闭输出文本">关闭</button></Dialog.Close></header>
+          <Dialog.Description>当前文本为快照，可长按选择并复制。</Dialog.Description>
+          <ToggleGroup.Root type="single" value={copyScope} onValueChange={value => { if (value) { setCopyScope(value); setCopyText(snapshot(value)); } }} aria-label="输出范围">
+            <ToggleGroup.Item value="screen">当前屏幕</ToggleGroup.Item><ToggleGroup.Item value="recent">最近 200 行</ToggleGroup.Item>
+          </ToggleGroup.Root>
+          <textarea ref={copyRef} readOnly aria-label="可选择的终端输出" value={copyText} />
+          <button onClick={() => {
+            const node = copyRef.current; if (!node) return;
+            const text = node.selectionStart !== node.selectionEnd ? node.value.slice(node.selectionStart, node.selectionEnd) : node.value;
+            if (!navigator.clipboard?.writeText) { setOperationMessage('请长按文本选择并使用系统复制。'); return; }
+            void navigator.clipboard.writeText(text).then(() => setOperationMessage('已复制')).catch(() => setOperationMessage('复制失败，请长按文本使用系统复制。'));
+          }}>复制文本</button><p role="status">{operationMessage}</p>
+        </Dialog.Content></Dialog.Portal></Dialog.Root>
+      {!mobile && <Collapsible.Root
         className={"terminal-tools " + (toolsOpen ? "open" : "")}
         open={toolsOpen}
         onOpenChange={setToolsOpen}
@@ -470,7 +563,7 @@ export function AgentTerminal({
             </button>
           </div>
         </Collapsible.Content>
-      </Collapsible.Root>
+      </Collapsible.Root>}
     </section>
   );
 }

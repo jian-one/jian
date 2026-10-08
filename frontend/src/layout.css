@@ -65,7 +65,7 @@
   background: var(--signal);
 }
 
-@media (max-width: 800px) {
+@media (max-width: 800px), (max-width: 1199px) and (pointer: coarse) {
   .workspace-picker, .dialog { --dialog-gap: 12px; width: min(660px, calc(100vw - 24px - env(safe-area-inset-left) - env(safe-area-inset-right))); max-height: calc(var(--dialog-viewport-height, 100dvh) - 24px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); }
   .workspace-picker > footer, .dialog footer { padding-bottom: max(14px, env(safe-area-inset-bottom)); }
   .workspace-picker input, .dialog input, .settings-page input { font-size: 16px; }
@@ -257,7 +257,7 @@
   }
 }
 
-@media (max-width: 800px) {
+@media (max-width: 800px), (max-width: 1199px) and (pointer: coarse) {
   .context-bar { min-height: 64px; padding: max(8px, env(safe-area-inset-top)) 8px 8px 60px; gap: 4px; }
   .desktop-session-context { display: none; }
   .session-context-trigger { display: flex; align-items: center; gap: 6px; width: 100%; padding: 4px; min-height: 44px; border: 0; background: transparent; }
@@ -297,4 +297,46 @@
   .catalog-create { width: auto; min-height: 44px; }
   .catalog-header button, .agent-rail button, .role-strip button, .session-menu button, .local-session-remove, .user-actions button { min-width: 44px; min-height: 44px; }
   .login input { font-size: 16px; }
+}
+
+@media (max-width: 800px), (max-width: 1199px) and (pointer: coarse) {
+  .session-switcher { position: fixed; top: calc(var(--dialog-viewport-top, 0px) + 8px); left: 12px; transform: none; width: calc(100vw - 24px); max-height: calc(var(--dialog-viewport-height, 100dvh) - 16px); padding: 16px; }
+  .session-switcher button { min-width: 44px; min-height: 44px; }
+  .session-switcher input { font-size: 16px; }
+  .session-switcher-trigger { min-width: 44px; min-height: 44px; }
+  .context-actions { gap: 2px; }
+  .context-copy { min-width: 0; }
+  .focus-mode-trigger { padding: 8px; }
+}
+
+@media (max-width: 800px), (max-width: 1199px) and (pointer: coarse) {
+  .workspace-view { position: relative; }
+  .conversation { display: flex; flex-direction: column; overflow: hidden; }
+  .conversation > .context-bar, .conversation > .session-tabs, .conversation > .focus-bar { display: none; }
+  .app:has(.mobile-workbench-dock) > .mobile-nav-toggle { display: none; }
+  .conversation > .mobile-workbench-header { display: flex; flex: none; order: -1; align-items: center; gap: 8px; min-height: calc(48px + env(safe-area-inset-top, 0px)); padding: env(safe-area-inset-top, 0px) max(8px, env(safe-area-inset-right)) 0 max(8px, env(safe-area-inset-left)); border-bottom: 1px solid var(--line); }
+  .mobile-workbench-header .context-copy { flex: 1; display: block; }
+  .mobile-workbench-header .session-context-trigger { min-height: 48px; }
+  .mobile-workbench-header .session-context-trigger > span { display: grid; gap: 1px; text-align: left; }
+  .mobile-workbench-header .session-context-trigger small { display: block; font-size: 10px; color: var(--muted); }
+  .mobile-workbench-header .status { font-size: 11px; padding: 4px; border: 0; background: transparent; }
+  .mobile-workbench-dock { display: flex; order: 10; flex: none; min-height: calc(48px + env(safe-area-inset-bottom, 0px)); padding: 0 env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px); border-top: 1px solid var(--line); background: var(--surface); }
+  .mobile-workbench-dock > button, .mobile-workbench-dock > [data-state] { flex: 1; display: flex; align-items: center; justify-content: center; gap: 6px; min-width: 48px; min-height: 48px; border: 0; border-radius: 0; background: transparent; font-size: 13px; }
+  .mobile-workbench-dock svg { width: 18px; height: 18px; }
+  .mobile-workbench-sheet { position: fixed; top: auto; bottom: calc(100dvh - var(--dialog-viewport-top, 0px) - var(--dialog-viewport-height, 100dvh)); left: 0; transform: none; width: 100%; max-height: calc(var(--dialog-viewport-height, 100dvh) - 12px); display: flex; flex-direction: column; padding: 14px max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); border-radius: 14px 14px 0 0; }
+  .mobile-workbench-sheet header { flex: none; padding: 0; }
+  .mobile-workbench-sheet h2 { font-size: 18px; margin: 0; }
+  .mobile-workbench-sheet > p { flex: none; margin: 8px 0; font-size: 13px; color: var(--muted); }
+  .mobile-sheet-content { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; min-height: 0; overflow: auto; overscroll-behavior: contain; }
+  .mobile-sheet-content > button { min-width: 0; min-height: 48px; text-align: left; background: var(--input); }
+  .mobile-appearance { grid-column: 1 / -1; display: flex; gap: 12px; flex-wrap: wrap; }
+  .session-switcher { top: auto; bottom: calc(100dvh - var(--dialog-viewport-top, 0px) - var(--dialog-viewport-height, 100dvh)); left: 0; width: 100%; max-height: calc(var(--dialog-viewport-height, 100dvh) - 12px); border-radius: 14px 14px 0 0; }
+  .terminal-copy-dialog { position: fixed; top: calc(var(--dialog-viewport-top, 0px) + 12px); left: 12px; width: calc(100vw - 24px); transform: none; }
+  .terminal-copy-dialog button, .mobile-composer-actions button { min-height: 44px; min-width: 44px; }
+  .terminal-pane { min-height: 0; }
+  .terminal-stage { padding: 4px; }
+  .workbench-focused .mobile-workbench-dock { padding-top: env(safe-area-inset-top, 0px); }
+  [data-radix-popper-content-wrapper]:has(.quick-note) { position: fixed !important; top: calc(var(--dialog-viewport-top, 0px) + 12px) !important; left: 12px !important; transform: none !important; width: calc(100vw - 24px); }
+  .quick-note { width: 100%; max-height: calc(var(--dialog-viewport-height, 100dvh) - 24px); display: flex; flex-direction: column; }
+  .quick-note textarea { flex: 1; min-height: 60px; resize: none; font-size: 16px; }
 }

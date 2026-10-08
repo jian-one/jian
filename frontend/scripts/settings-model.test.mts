@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { agentEnabled, normalizeAgentSettings, parseExpandedRoster, withAgentEnabled, mergeSettingsFields, settingsFields } from '../src/features/settings/settings-model.ts';
+import { agentEnabled, normalizeAgentSettings, parseExpandedRoster, withAgentEnabled, mergeSettingsFields, settingsFields, dirtySettingsKinds } from '../src/features/settings/settings-model.ts';
 
 const settings = normalizeAgentSettings({ codex_bin: 'codex', path: '/bin', hermes_home: '', hermes_bin: 'hermes', hermes_profiles: [], local_profiles: [], codex_args: [], hermes_args: [], codex_env: [], hermes_env: [], codex_enabled: false, hermes_enabled: true });
 
@@ -61,4 +61,13 @@ test('about page uses the package version and current Rust stack', () => {
   assert.match(source, /\['版本号', packageInfo\.version\]/);
   assert.match(source, /\['技术栈', 'Rust backend · React frontend'\]/);
   assert.doesNotMatch(source, /Go backend/);
+});
+
+test('card dirty state ignores saved switches and resetting one card preserves other drafts', () => {
+  const draft = { ...settings, codex_enabled: true, codex_args: ['edited'], hermes_args: ['other draft'] };
+  assert.deepEqual(dirtySettingsKinds(draft, settings), ['codex', 'hermes']);
+  const reset = mergeSettingsFields(draft, settings, settingsFields('codex'));
+  assert.deepEqual(dirtySettingsKinds(reset, settings), ['hermes']);
+  assert.equal(reset.codex_enabled, true); assert.deepEqual(reset.hermes_args, ['other draft']);
+  assert.deepEqual(dirtySettingsKinds(null, settings), []);
 });

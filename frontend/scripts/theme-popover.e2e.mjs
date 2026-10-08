@@ -55,7 +55,7 @@ class CDP {
 
   async evaluate(expression) {
     const result = await this.send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true });
-    if (result.exceptionDetails) throw new Error(result.exceptionDetails.text);
+    if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description || result.exceptionDetails.text);
     return result.result.value;
   }
 }
@@ -221,6 +221,20 @@ try {
   await click('关闭搜索');
   await waitFor(() => cdp.evaluate(`!document.querySelector('.terminal-search-bar') && document.activeElement === window.__searchFocusBeforeReconnect`), 'search toggle focus restore after reconnect test', 5000);
   console.log('PASS search focus restores correctly and survives terminal reconnect');
+  const retryOrigin = await cdp.evaluate(`(() => {
+    window.__retryTerminal = document.querySelector('.terminal .xterm');
+    window.__regularRetryTimeout = window.setTimeout;
+    window.setTimeout = (callback, delay, ...args) => window.__regularRetryTimeout(callback, delay === 1000 ? 15000 : delay, ...args);
+    const socket = window.__terminalSockets.findLast(socket => socket.readyState === WebSocket.OPEN);
+    const count = window.__terminalSockets.length; socket.close(); return count;
+  })()`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.terminal-connection-feedback')?.getAttribute('data-state') === 'reconnecting' && !!document.querySelector('.terminal-connection-feedback button')`), 'inline connection recovery');
+  await cdp.evaluate(`(() => { const button = document.querySelector('.terminal-connection-feedback button'); button.click(); button.click(); })()`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.terminal-status-menu .status')?.textContent.trim() === '已连接'`), 'manual reconnect success');
+  if (!await cdp.evaluate(`window.__terminalSockets.length === ${retryOrigin + 1} && document.querySelector('.terminal .xterm') === window.__retryTerminal`)) throw new Error('manual reconnect duplicated a socket or replaced xterm');
+  await cdp.evaluate(`window.setTimeout = window.__regularRetryTimeout`);
+  console.log('PASS inline manual retry reuses xterm and sends one connection');
+
 
   await assertOpen('Terminal 配色');
   await assertOpen('界面主题');
@@ -313,6 +327,8 @@ try {
   if (await cdp.evaluate(`window.__terminalFitReads`) < fitReadsAfterUnchangedResize + 2) throw new Error('font-size change did not refit the terminal');
   console.log('PASS terminal fit skips unchanged resizes and updates for font-size changes');
   const tap = async selector => {
+    await cdp.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+    await cdp.evaluate(`(() => { const node = document.querySelector(${JSON.stringify(selector)}); if (node?.closest('.mobile-control-scroll')) node.scrollIntoView({ block: 'nearest', inline: 'nearest' }); })()`);
     const point = await cdp.evaluate(`(() => { const box = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect(); return { x: box.x + box.width / 2, y: box.y + box.height / 2 }; })()`);
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
@@ -337,16 +353,19 @@ try {
   if (await cdp.evaluate(`document.activeElement.classList.contains('terminal-input-buffer')`)) throw new Error('ending a swipe opened terminal input');
   await cdp.evaluate(`document.activeElement.blur()`);
   await tap('.terminal .xterm-screen');
-  if (!await cdp.evaluate(`document.activeElement.classList.contains('terminal-input-buffer')`)) throw new Error('a plain terminal tap did not focus mobile input');
+  if (await cdp.evaluate(`document.activeElement.classList.contains('terminal-input-buffer')`)) throw new Error('reading output opened mobile input');
+  await tap('.mobile-workbench-dock button[aria-label="输入终端"]');
+  if (!await cdp.evaluate(`document.activeElement.classList.contains('terminal-input-buffer')`)) throw new Error('explicit input entry failed');
+  await tap('.mobile-workbench-dock button[aria-label="收起输入"]');
   await cdp.evaluate(`document.activeElement.blur()`);
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [terminalPoint] });
   await new Promise(resolve => setTimeout(resolve, 750));
   await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
   if (await cdp.evaluate(`document.activeElement.classList.contains('terminal-input-buffer')`)) throw new Error('a long press opened terminal input');
-  await tap('.terminal-tools-toggle');
+
   const selectedText = await cdp.evaluate(`(() => {
     // WebGL renders terminal rows to canvas; use a real DOM selection to exercise the shared focus guard.
-    const target = document.querySelector('.terminal-tools-toggle');
+    const target = document.querySelector('.mobile-workbench-dock button:first-child');
     const range = document.createRange();
     range.selectNodeContents(target);
     const selection = window.getSelection();
@@ -358,15 +377,16 @@ try {
   await tap('.terminal .xterm-screen');
   if (await cdp.evaluate(`document.activeElement.classList.contains('terminal-input-buffer')`)) throw new Error('tapping selected terminal text opened input');
   await cdp.evaluate(`window.getSelection()?.removeAllRanges()`);
-  console.log('PASS mobile terminal keeps scrolling during a long swipe and only focuses on a tap');
+  console.log('PASS mobile terminal keeps scrolling during a long swipe and requires explicit input entry');
   await cdp.evaluate(`(() => {
     document.activeElement.blur();
     window.__shortcutInputs = [];
     const send = WebSocket.prototype.send;
     WebSocket.prototype.send = function(data) { const message = JSON.parse(data); if (message.type === 'input') window.__shortcutInputs.push(message.data); return send.call(this, data); };
   })()`);
-  await tap('.terminal-navigation button:first-child');
-  if (await cdp.evaluate(`document.activeElement.matches('textarea, input, [contenteditable="true"]')`)) throw new Error('mobile shortcut opened text input');
+  await tap('.mobile-workbench-dock button[aria-label="输入终端"]');
+  await tap('.mobile-control-scroll button:first-child');
+  if (!await cdp.evaluate(`document.activeElement.classList.contains('terminal-input-buffer')`)) throw new Error('mobile shortcut lost input focus');
   if (!await cdp.evaluate(`window.__shortcutInputs.at(-1) === String.fromCharCode(27)`)) throw new Error('mobile shortcut did not send Escape');
   // Headless Chrome has no software keyboard: reproduce its visual viewport
   // resize and pan while retaining the actual terminal input focus.
@@ -383,17 +403,17 @@ try {
     for (let i = 0; i < 8; i++) visualViewport.dispatchEvent(new Event('scroll'));
   })()`);
   await new Promise(resolve => setTimeout(resolve, 100));
-  const scrollState = await cdp.evaluate(`({ reads: window.__terminalGeometryReads, height: document.querySelector('.workspace-view').style.getPropertyValue('--mobile-viewport-height'), offset: document.querySelector('.workspace-view').style.getPropertyValue('--mobile-viewport-offset') })`);
+  const scrollState = await cdp.evaluate(`({ reads: window.__terminalGeometryReads, height: document.documentElement.style.getPropertyValue('--mobile-viewport-height'), offset: document.documentElement.style.getPropertyValue('--mobile-viewport-offset') })`);
   if (scrollState.reads !== 0 || scrollState.height !== '430px' || scrollState.offset !== '75px') throw new Error(`visual viewport scroll changed terminal layout or lost its offset: ${JSON.stringify(scrollState)}`);
-  const geometry = await cdp.evaluate(`(() => { const box = document.querySelector('.terminal-tools').getBoundingClientRect(); return { top: box.top, bottom: box.bottom, viewportTop: visualViewport.offsetTop, viewportBottom: visualViewport.offsetTop + visualViewport.height }; })()`);
+  const geometry = await cdp.evaluate(`(() => { const box = document.querySelector('.mobile-control-bar').getBoundingClientRect(); return { top: box.top, bottom: box.bottom, viewportTop: visualViewport.offsetTop, viewportBottom: visualViewport.offsetTop + visualViewport.height }; })()`);
   if (geometry.top < geometry.viewportTop || geometry.bottom > geometry.viewportBottom + 1) throw new Error('mobile toolbar is behind keyboard: ' + JSON.stringify(geometry));
-  await tap('.terminal-navigation button[aria-label="Shift"]');
-  await tap('.terminal-navigation button[aria-label="方向键左"]');
-  await tap('.terminal-functions button[aria-label="Shift+左方向键"]');
+  await tap('.mobile-control-scroll button[aria-label="Shift"]');
+  await tap('.mobile-control-scroll button[aria-label="方向键左"]');
+  await tap('.mobile-control-scroll button[aria-label="方向键左"]');
   const shortcuts = await cdp.evaluate(`({ inputs: window.__shortcutInputs, focused: document.activeElement.classList.contains('terminal-input-buffer'), shifted: document.querySelector('button[aria-label="Shift"]').getAttribute('aria-pressed') })`);
   if (JSON.stringify(shortcuts.inputs) !== JSON.stringify(['\u001b[1;2D', '\u001b[1;2D']) || !shortcuts.focused || shortcuts.shifted !== 'true') throw new Error('mobile Shift shortcuts or focus failed: ' + JSON.stringify(shortcuts));
-  await tap('.terminal-navigation button[aria-label="Shift"]');
-  await tap('.terminal-navigation button[aria-label="方向键左"]');
+  await tap('.mobile-control-scroll button[aria-label="Shift"]');
+  await tap('.mobile-control-scroll button[aria-label="方向键左"]');
   if (!await cdp.evaluate(`window.__shortcutInputs.at(-1) === String.fromCharCode(27) + '[D'`)) throw new Error('mobile Shift did not toggle off');
   await cdp.evaluate(`(() => {
     document.activeElement.blur();
@@ -403,8 +423,8 @@ try {
     visualViewport.dispatchEvent(new Event('scroll'));
   })()`);
   await new Promise(resolve => setTimeout(resolve, 100));
-  await tap('.terminal-functions button[aria-label="Shift+左方向键"]');
-  if (!await cdp.evaluate(`document.querySelector('.terminal-tools').getBoundingClientRect().bottom <= visualViewport.offsetTop + visualViewport.height + 1 && !document.activeElement.matches('textarea, input') && window.__shortcutInputs.at(-1) === String.fromCharCode(27) + '[1;2D'`)) throw new Error('mobile toolbar did not recover after keyboard dismissal');
+  await tap('.mobile-workbench-dock button[aria-label="收起输入"]');
+  if (await cdp.evaluate(`document.activeElement.matches('textarea, input')`)) throw new Error('input remained focused after dismissal');
   console.log('PASS mobile toolbar preserves focus, stays above keyboard viewport, and sends Shift+Left');
 
   const mouseClick = async selector => {
@@ -470,35 +490,41 @@ try {
   await cdp.evaluate(`document.querySelector('.session-tabs-list').scrollLeft = document.querySelector('.session-tabs-list').scrollWidth`);
   await mouseClick('.session-tab:last-child .session-tab-trigger');
   await waitFor(() => cdp.evaluate(`document.querySelector('.terminal-status-menu .status')?.textContent.trim() === '已连接'`), 'last terminal tab');
-  for (const width of [1440, 800, 390, 360, 844]) {
+  for (const width of [1440, 800, 430, 390, 360, 320, 844]) {
     await cdp.send('Emulation.setDeviceMetricsOverride', { width, height: width === 844 ? 390 : 844, deviceScaleFactor: 1, mobile: width <= 800 });
     await waitFor(() => cdp.evaluate(`!!document.querySelector('.sidebar') === ${width > 800}`), 'responsive navigation');
     if (!await cdp.evaluate(`document.querySelector('.workspace-view').getBoundingClientRect().right <= innerWidth + 1`)) throw new Error('workspace overflow at ' + width);
-    await waitFor(() => cdp.evaluate(`(() => { const list = document.querySelector('.session-tabs-list').getBoundingClientRect(); const tab = document.querySelector('.session-tabs [data-state="active"]').parentElement.getBoundingClientRect(); return tab.left >= list.left - 1 && tab.right <= list.right + 1; })()`), 'active tab visible at ' + width);
+    if (width > 800) await waitFor(() => cdp.evaluate(`(() => { const list = document.querySelector('.session-tabs-list').getBoundingClientRect(); const tab = document.querySelector('.session-tabs [data-state="active"]').parentElement.getBoundingClientRect(); return tab.left >= list.left - 1 && tab.right <= list.right + 1; })()`), 'active tab visible at ' + width);
   }
   await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
   await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true });
   await cdp.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
   await waitFor(() => cdp.evaluate(`!document.querySelector('.sidebar')`), 'closed mobile drawer');
+  const mobileMore = async label => {
+    await tap('.mobile-workbench-dock button[aria-label="更多工作台操作"]');
+    await waitFor(() => cdp.evaluate(`!!document.querySelector('.mobile-workbench-sheet')`), 'mobile menu');
+    await clickSelector('.mobile-workbench-sheet button[aria-label="' + label + '"]', label);
+  };
+  const openMobileNavigation = () => mobileMore('会话目录与管理');
   const beforeDrawer = await cdp.evaluate(`({ count: window.__terminalSockets.length, width: document.querySelector('.terminal-stage').getBoundingClientRect().width })`);
-  await tap('button[aria-label="打开导航"]');
+  await openMobileNavigation();
   await waitFor(() => cdp.evaluate(`!!document.querySelector('.nav-drawer') && document.activeElement.getAttribute('aria-label') === '关闭导航'`), 'drawer close-button focus');
   await keyPress('Tab');
   if (!await cdp.evaluate(`!!document.activeElement.closest('.nav-drawer') && !document.activeElement.matches('input, textarea')`)) throw new Error('drawer did not contain keyboard focus');
-  await cdp.evaluate(`document.querySelector('.catalog-list').scrollTop = 220`);
+  await cdp.evaluate(`document.querySelector('.catalog-list').scrollTop = 220; document.querySelector('.catalog-list').dispatchEvent(new Event('scroll', { bubbles: true }))`);
   await new Promise(resolve => setTimeout(resolve, 100));
   const savedScroll = await cdp.evaluate(`document.querySelector('.catalog-list').scrollTop`);
   if (savedScroll <= 0) throw new Error('catalog did not scroll');
   await keyPress('Escape');
-  await waitFor(() => cdp.evaluate(`!document.querySelector('.nav-drawer') && document.activeElement.getAttribute('aria-label') === '打开导航'`), 'drawer focus restore');
-  await tap('button[aria-label="打开导航"]');
-  await waitFor(() => cdp.evaluate(`Math.abs(document.querySelector('.catalog-list').scrollTop - ${savedScroll}) <= 1`), 'catalog scroll restore');
+  await waitFor(() => cdp.evaluate(`!document.querySelector('.nav-drawer') && document.activeElement.getAttribute('aria-label') === '更多工作台操作'`), 'drawer focus restore');
+  await openMobileNavigation();
+  try {await waitFor(() => cdp.evaluate(`Math.abs(document.querySelector('.catalog-list').scrollTop - ${savedScroll}) <= 1`), 'catalog scroll restore'); } catch (error) { throw new Error(error.message + '; ' + JSON.stringify(await cdp.evaluate(`({ saved: ${savedScroll}, actual: document.querySelector('.catalog-list')?.scrollTop, storage: Object.fromEntries(Object.keys(localStorage).filter(key => key.includes('scroll')).map(key => [key,localStorage.getItem(key)])), drawer: !!document.querySelector('.nav-drawer'), focused: document.activeElement.outerHTML })`))); }
   await tap('button[aria-label="关闭导航"]');
   const afterDrawer = await cdp.evaluate(`({ count: window.__terminalSockets.length, width: document.querySelector('.terminal-stage').getBoundingClientRect().width })`);
   if (JSON.stringify(beforeDrawer) !== JSON.stringify(afterDrawer)) throw new Error('drawer changed terminal connection or width');
-  const hitSize = await cdp.evaluate(`(() => { const box = document.querySelector('.session-tab-close').getBoundingClientRect(); return { width: box.width, height: box.height }; })()`);
+  const hitSize = await cdp.evaluate(`(() => { const box = document.querySelector('.mobile-workbench-dock button').getBoundingClientRect(); return { width: box.width, height: box.height }; })()`);
   if (hitSize.width < 44 || hitSize.height < 44) throw new Error('mobile close hit target is too small');
-  await tap('button[aria-label="打开导航"]');
+  await openMobileNavigation();
   await tap('button[aria-label="local 设置"]');
   await waitFor(() => cdp.evaluate(`!document.querySelector('.nav-drawer') && !!document.querySelector('.settings-page') && document.activeElement.getAttribute('aria-label') === '返回工作台'`), 'drawer handoff to independent settings');
   await screenshot('mobile-settings');
@@ -584,6 +610,104 @@ try {
     await waitFor(() => cdp.evaluate(`window.__rpcResponses.includes(${id})`), label + ' response');
   };
   const roster = kind => `.agent-roster-item:has([aria-label="${kind}设置，展开或收起详细配置"])`;
+  const cachedFixture = (kind, profile) => ({ id: 'same-native-id', kind, profile, title: 'Build service', workspace: '/work/team', status: 'idle' });
+  await rule({ method: 'GET', path: '/agents/codex/sessions/cache', error: '测试缓存读取失败' });
+  await rule({ method: 'GET', path: '/agents/hermes/sessions/cache', body: [cachedFixture('hermes', 'ops')] });
+  await rule({ method: 'GET', path: '/agents/pi/sessions/cache', body: [cachedFixture('pi', 'ops'), cachedFixture('pi', 'research')] });
+  const beforeSwitcherSockets = await cdp.evaluate(`window.__terminalSockets.length`);
+  await mouseClick('.session-tabs .session-switcher-trigger');
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('.switcher-error') && !document.querySelector('.switcher-feedback')?.textContent.includes('正在') && document.activeElement.getAttribute('aria-label') === '搜索全部会话'`), 'switcher partial results and desktop focus');
+  await input('.switcher-search input', 'PI TEAM');
+  await waitFor(() => cdp.evaluate(`document.querySelectorAll('.switcher-result').length === 2`), 'same ID Pi roles remain distinct');
+  await input('.switcher-search input', 'PI ops TEAM');
+  if (!await cdp.evaluate(`document.querySelectorAll('.switcher-result').length === 1 && document.querySelector('.switcher-result').textContent.includes('ops')`)) throw new Error('switcher role search failed');
+  await rule({ method: 'GET', path: '/agents/codex/sessions/cache', body: [] });
+  await mouseClick('.switcher-error button');
+  await waitFor(() => cdp.evaluate(`!document.querySelector('.switcher-error')`), 'partial cache retry');
+  await input('.switcher-search input', 'no-such-session');
+  if (!await cdp.evaluate(`!!document.querySelector('.switcher-empty') && !document.querySelector('.switcher-result')`)) throw new Error('switcher missing empty state');
+  await input('.switcher-search input', '');
+  await mouseClick('.switcher-scope button:last-child');
+  if (!await cdp.evaluate(`[...document.querySelectorAll('.switcher-result')].every(row => row.textContent.includes('当前') || row.textContent.includes('已打开')) && window.__terminalSockets.length === ${beforeSwitcherSockets}`)) throw new Error('opened filter created a terminal connection');
+  await keyPress('Escape');
+  await waitFor(() => cdp.evaluate(`!document.querySelector('.session-switcher') && document.activeElement.matches('.session-tabs .session-switcher-trigger')`), 'switcher focus restore');
+  await mouseClick('.session-tabs .session-switcher-trigger');
+  await input('.switcher-search input', sharedID);
+  await keyPress('Enter');
+  await waitFor(() => cdp.evaluate(`!document.querySelector('.session-switcher') && localStorage.getItem('jian.active_local_session') === ${JSON.stringify(sharedID)}`), 'switcher Enter activates local session');
+  if (await cdp.evaluate(`window.__rpcRequests.some(request => request.method === 'POST' && request.path.endsWith('/sessions/refresh'))`)) throw new Error('switcher triggered native discovery');
+  console.log('PASS unified switcher preserves role identity, partial results, keyboard focus and cached discovery');
+
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+  await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true });
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('.focus-mode-trigger') && document.querySelector('.terminal-status-menu .status')?.textContent.trim() === '已连接'`), 'mobile focus entry');
+  await cdp.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-view').getBoundingClientRect().height <= 845 && document.body.style.pointerEvents !== 'none'`), 'mobile layout settled');
+  const normalHeight = await cdp.evaluate(`(() => { window.__focusTerminal = document.querySelector('.terminal'); window.__focusSocketCount = window.__terminalSockets.length; return document.querySelector('.terminal-stage').getBoundingClientRect().height; })()`);
+  await mobileMore('进入专注模式');
+  try { await waitFor(() => cdp.evaluate(`!!document.querySelector('.workbench-focused') && document.querySelector('.terminal-stage').getBoundingClientRect().height >= ${normalHeight + 44}`), 'focus mode adds terminal space'); }
+  catch (error) { throw new Error(error.message + '; ' + JSON.stringify(await cdp.evaluate(`({normalHeight:${normalHeight}, focused:!!document.querySelector('.workbench-focused'), height:document.querySelector('.terminal-stage').getBoundingClientRect().height, focusBar:document.querySelector('.focus-bar').getBoundingClientRect().height, context:document.querySelector('.context-bar').getBoundingClientRect().height, tabs:getComputedStyle(document.querySelector('.session-tabs')).display})`))); }
+  if (!await cdp.evaluate(`document.querySelector('.terminal') === window.__focusTerminal && window.__terminalSockets.length === window.__focusSocketCount && getComputedStyle(document.querySelector('.session-tabs')).display === 'none'`)) throw new Error('focus mode changed terminal mount or socket');
+  await screenshot('focus-mode');
+  await tap('.mobile-workbench-dock button[aria-label="切换会话"]');
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('.session-switcher') && document.activeElement.getAttribute('aria-label') === '关闭会话切换器'`), 'mobile switcher avoids keyboard autofocus');
+  await cdp.evaluate(`(() => { Object.defineProperties(visualViewport, { height: { configurable: true, value: 380 }, offsetTop: { configurable: true, value: 50 } }); visualViewport.dispatchEvent(new Event('resize')); })()`);
+  await waitFor(() => cdp.evaluate(`(() => { const box = document.querySelector('.session-switcher').getBoundingClientRect(); return box.top >= 50 && box.bottom <= 430; })()`), 'switcher fits keyboard viewport');
+  await screenshot('switcher-mobile');
+  await keyPress('Escape');
+  await cdp.evaluate(`(() => { delete visualViewport.height; delete visualViewport.offsetTop; visualViewport.dispatchEvent(new Event('resize')); })()`);
+  await waitFor(() => cdp.evaluate(`!document.querySelector('.session-switcher') && document.body.style.pointerEvents !== 'none'`), 'mobile switcher cleanup');
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 844, height: 390, deviceScaleFactor: 1, mobile: true });
+  if (!await cdp.evaluate(`!!document.querySelector('.workbench-focused')`)) throw new Error('phone rotation left focus mode');
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+  await cdp.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+  await mobileMore('设置');
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('.settings-page')`), 'focus settings entry');
+  await tap('button[aria-label="返回工作台"]');
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('.workbench-focused') && !!document.querySelector('.terminal')`), 'settings returns to focus mode');
+  await mobileMore('退出专注模式');
+  await waitFor(() => cdp.evaluate(`!document.querySelector('.workbench-focused')`), 'explicit focus exit');
+
+  await mobileMore('文本编辑');
+  await waitFor(() => cdp.evaluate(`document.activeElement.getAttribute('aria-label') === '编辑终端文本'`), 'native composer focus');
+  const editDraft = text => cdp.evaluate(`(() => {
+    const node = document.querySelector('#mobile-terminal-editor');
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(node, ${JSON.stringify(text)});
+    node.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await editDraft('移动草稿\n第二行');
+  await keyPress('Enter');
+  if (!await cdp.evaluate(`document.querySelector('#mobile-terminal-editor').value.includes('\\n')`)) throw new Error('composer Enter did not retain a multiline draft');
+  await tap('.mobile-workbench-dock button[aria-label="收起输入"]');
+  await mobileMore('文本编辑');
+  if (!await cdp.evaluate(`document.querySelector('#mobile-terminal-editor').value.includes('移动草稿') && Object.keys(sessionStorage).some(key => key.startsWith('jian.terminal-draft.'))`)) throw new Error('composer draft did not persist');
+  await editDraft('printf mobile-compose');
+  await cdp.evaluate(`window.__shortcutInputs = []`);
+  await cdp.evaluate(`(() => { const b = [...document.querySelectorAll('.mobile-composer button')].find(b => b.textContent === '发送文本'); b.click(); b.click(); })()`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('#mobile-terminal-editor').value === ''`), 'submitted draft cleared');
+  if (!await cdp.evaluate(`window.__shortcutInputs.length === 1 && window.__shortcutInputs[0].replaceAll(String.fromCharCode(27) + '[200~', '').replaceAll(String.fromCharCode(27) + '[201~', '') === 'printf mobile-compose'`)) throw new Error('paste-only submit duplicated or added Enter: ' + JSON.stringify(await cdp.evaluate(`window.__shortcutInputs`)));
+  await clickSelector('.mobile-composer-actions button:first-child', 'restore last submission');
+  await cdp.evaluate(`window.__shortcutInputs = []`);
+  await cdp.evaluate(`[...document.querySelectorAll('.mobile-composer button')].find(b => b.textContent === '发送并回车').click()`);
+  if (!await cdp.evaluate(`window.__shortcutInputs.length === 2 && window.__shortcutInputs[0].replaceAll(String.fromCharCode(27) + '[200~', '').replaceAll(String.fromCharCode(27) + '[201~', '') === 'printf mobile-compose' && window.__shortcutInputs[1] === '\\r'`)) throw new Error('composer did not send exactly one Enter');
+  await editDraft('离线保留');
+  await cdp.evaluate(`Object.defineProperty(navigator, 'onLine', { configurable: true, value: false }); window.dispatchEvent(new Event('offline'))`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.mobile-workbench-header .status').textContent.includes('离线')`), 'offline state');
+  if (!await cdp.evaluate(`document.querySelector('#mobile-terminal-editor').value === '离线保留' && [...document.querySelectorAll('.mobile-composer button')].find(b => b.textContent === '发送文本').disabled`)) throw new Error('offline composer lost draft or allowed submission');
+  await cdp.evaluate(`delete navigator.onLine; window.dispatchEvent(new Event('online'))`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.mobile-workbench-header .status').textContent.includes('已连接')`), 'online reconnect');
+  if (!await cdp.evaluate(`document.querySelector('#mobile-terminal-editor').value === '离线保留'`)) throw new Error('reconnect replayed draft automatically');
+  await tap('.mobile-workbench-dock button[aria-label="收起输入"]');
+  await mobileMore('选择输出文本');
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('.terminal-copy-dialog textarea')`), 'selectable output snapshot');
+  const frozen = await cdp.evaluate(`document.querySelector('.terminal-copy-dialog textarea').value`);
+  if (!frozen) throw new Error('output snapshot empty');
+  await keyPress('Escape');
+  console.log('PASS mobile composer multiline drafts, one-shot paste, explicit Enter, offline recovery and output snapshot');
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+  await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: false });
+  console.log('PASS mobile focus preserves terminal identity, keyboard viewport and settings return');
+
   await mouseClick('button[aria-label="设置"]');
   await waitFor(() => cdp.evaluate(`!!document.querySelector('.agent-toggle-list')`), 'settings form');
   for (const kind of ['Codex', 'Hermes', 'Pi']) await mouseClick(`${roster(kind)} .agent-roster-trigger`);
@@ -618,7 +742,7 @@ try {
   await waitFor(() => cdp.evaluate(`document.querySelector('.general-settings-content [role="alert"]')?.textContent.includes('测试保存失败') && !document.querySelector('[aria-label="返回工作台"]').disabled`), 'save failure and unlock');
   if (!await cdp.evaluate(`document.querySelector(${JSON.stringify(roster('Hermes'))} + ' input[aria-label="启动参数 1"]').value === 'hermes-draft'`)) throw new Error('save failure erased input');
   await mouseClick(`${roster('Hermes')} button[type="submit"]`);
-  await waitFor(() => cdp.evaluate(`document.querySelector('.settings-save-status')?.textContent.includes('Hermes 设置已保存')`), 'save retry');
+  await waitFor(() => cdp.evaluate(`document.querySelector(${JSON.stringify(roster('Hermes'))} + ' .settings-save-status')?.textContent.includes('Hermes 设置已保存')`), 'save retry');
   const persistedSettings = await cdp.evaluate(`window.__rpcCall('/settings')`);
   if (JSON.stringify(persistedSettings.settings.codex_args) !== JSON.stringify(['--model']) || JSON.stringify(persistedSettings.settings.hermes_args) !== JSON.stringify(['hermes-draft']) || persistedSettings.settings.pi_roles.length) throw new Error('real server did not persist only submitted fields');
   await cdp.evaluate(`(() => { const trigger = document.querySelector(${JSON.stringify(roster('Local'))} + ' .agent-roster-trigger'); if (trigger.getAttribute('data-state') !== 'open') trigger.click(); })()`);
@@ -631,6 +755,12 @@ try {
   if (!await cdp.evaluate(`window.__rpcRequests.filter(item => item.method === 'PUT' && item.path === '/settings').length === ${profileSaveCount} && Number(getComputedStyle(document.querySelector('.profile-file-picker')).zIndex) > Number(getComputedStyle(document.querySelector('.profile-file-overlay')).zIndex)`)) throw new Error('profile browse saved settings or appeared below its overlay');
   await keyPress('Escape');
   await waitFor(() => cdp.evaluate(`!document.querySelector('.profile-file-picker') && document.activeElement.getAttribute('aria-label') === '添加 profile 文件'`), 'profile picker return focus');
+  if (!await cdp.evaluate(`document.querySelector(${JSON.stringify(roster('Codex'))} + ' button[type="submit"]').disabled && !document.querySelector(${JSON.stringify(roster('Codex'))} + ' .settings-dirty-badge')`)) throw new Error('unchanged card remains saveable');
+  await input(`${roster('Codex')} input[aria-label="启动参数 1"]`, '--review-draft');
+  await mouseClick(`${roster('Codex')} .settings-reset`);
+  if (!await cdp.evaluate(`document.querySelector(${JSON.stringify(roster('Codex'))} + ' input[aria-label="启动参数 1"]').value === '--model' && !!document.querySelector(${JSON.stringify(roster('Pi'))} + ' .settings-dirty-badge')`)) throw new Error('single-card reset changed other drafts');
+  console.log('PASS card dirty markers and individual reset preserve other drafts');
+  await input(`${roster('Codex')} input[aria-label="启动参数 1"]`, '--model-timeout');
   await rule({ method: 'GET', path: '/settings', hold: true, label: 'save-timeout' });
   await cdp.evaluate(`(() => { window.__regularTimeout = window.setTimeout; window.setTimeout = (callback, duration, ...args) => window.__regularTimeout(callback, duration === 120000 ? 100 : duration, ...args); })()`);
   await mouseClick(`${roster('Codex')} button[type="submit"]`);
@@ -686,6 +816,7 @@ try {
   await dismissUnavailableNotice();
   await mouseClick('button[aria-label="codex 设置"]');
   await waitFor(() => cdp.evaluate(`!!document.querySelector(${JSON.stringify(roster('Codex'))} + ' .agent-roster-content')`), 'shortcut opens Codex configuration');
+  await input(`${roster('Codex')} input[aria-label="启动参数 1"]`, '--shortcut-retry');
   await rule({ method: 'PUT', path: '/settings', hold: true, error: '测试快捷保存失败', label: 'shortcut-save' });
   await mouseClick(`${roster('Codex')} button[type="submit"]`);
   await waitFor(() => cdp.evaluate(`window.__heldRPC.some(item => item.label === 'shortcut-save')`), 'shortcut delayed save');
@@ -709,7 +840,7 @@ try {
     await rule({ method: 'POST', path: `/agents/${kind}/sessions`, hold: true, error: `测试 ${kind} 创建失败`, label: 'typed-create' });
     await cdp.evaluate(`(() => { const button = document.querySelector('.workspace-picker > footer button'); button.click(); button.click(); })()`);
     await waitFor(() => cdp.evaluate(`window.__heldRPC.some(item => item.label === 'typed-create')`), kind + ' create snapshot');
-    if (!await cdp.evaluate(`window.__rpcRequests.filter(item => item.method === 'POST' && item.path === '/agents/${kind}/sessions').length === ${before + 1} && window.__heldRPC.find(item => item.label === 'typed-create').body.launch_args[0] === ${JSON.stringify(kind === 'codex' ? '--model' : 'hermes-draft')}`)) throw new Error(kind + ' creation routing or snapshot failed');
+    if (!await cdp.evaluate(`window.__rpcRequests.filter(item => item.method === 'POST' && item.path === '/agents/${kind}/sessions').length === ${before + 1} && window.__heldRPC.find(item => item.label === 'typed-create').body.launch_args[0] === ${JSON.stringify(kind === 'codex' ? '--shortcut-retry' : 'hermes-draft')}`)) throw new Error(kind + ' creation routing or snapshot failed');
     await releaseRPC('typed-create');
     await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-picker [role="alert"]')?.textContent.includes('测试 ${kind} 创建失败') && !document.querySelector('.workspace-picker > footer button').disabled`), kind + ' create failure unlock');
     await keyPress('Escape');
@@ -735,7 +866,7 @@ try {
 
   await cdp.send('Emulation.setDeviceMetricsOverride', { width: 360, height: 844, deviceScaleFactor: 1, mobile: true });
   await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true });
-  await tap('button[aria-label="打开导航"]');
+  await openMobileNavigation();
   await tap('button[aria-label="新建会话"]');
   await waitFor(() => cdp.evaluate(`!!document.querySelector('.workspace-picker') && document.activeElement.getAttribute('aria-label') === '关闭目录选择器'`), 'mobile picker non-input focus');
   await cdp.evaluate(`(() => {
@@ -743,12 +874,13 @@ try {
     visualViewport.dispatchEvent(new Event('resize'));
   })()`);
   await waitFor(() => cdp.evaluate(`document.documentElement.style.getPropertyValue('--dialog-viewport-height') === '380px'`), 'dialog keyboard viewport');
+  await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-picker').getBoundingClientRect().bottom <= 430`), 'picker layout uses keyboard viewport');
   const dialogGeometry = await cdp.evaluate(`(() => { const dialog = document.querySelector('.workspace-picker').getBoundingClientRect(), footer = document.querySelector('.workspace-picker > footer').getBoundingClientRect(), close = document.querySelector('[aria-label="关闭目录选择器"]').getBoundingClientRect(); return { top: dialog.top, bottom: dialog.bottom, footerBottom: footer.bottom, pageWidth: document.documentElement.scrollWidth, closeWidth: close.width, closeHeight: close.height }; })()`);
   if (dialogGeometry.top < 50 || dialogGeometry.bottom > 430 || dialogGeometry.footerBottom > 430 || dialogGeometry.pageWidth > 360 || dialogGeometry.closeWidth < 44 || dialogGeometry.closeHeight < 44) throw new Error('mobile keyboard dialog overflow: ' + JSON.stringify(dialogGeometry));
   await keyPress('Tab');
   if (!await cdp.evaluate(`!!document.activeElement.closest('.workspace-picker')`)) throw new Error('picker focus escaped');
   await keyPress('Escape');
-  await waitFor(() => cdp.evaluate(`!document.querySelector('.workspace-picker') && document.activeElement.getAttribute('aria-label') === '打开导航'`), 'mobile picker fallback focus');
+  await waitFor(() => cdp.evaluate(`!document.querySelector('.workspace-picker') && document.activeElement.getAttribute('aria-label') === '更多工作台操作'`), 'mobile picker fallback focus');
   await cdp.evaluate(`(() => { delete visualViewport.height; delete visualViewport.offsetTop; visualViewport.dispatchEvent(new Event('resize')); })()`);
   console.log('PASS shortcut save locks/focus and mobile dialog keyboard viewport/touch targets');
 
@@ -763,6 +895,32 @@ try {
   await releaseRPC('local-create');
   await waitFor(() => cdp.evaluate(`document.querySelector('.terminal-status-menu .status')?.textContent.trim() === '已连接' && !document.querySelector('.session-tab-close').disabled`), 'real Local created and attached');
   console.log('PASS repeated Local clicks create one real server-owned session');
+  await rule({ method: 'GET', path: '/agents/codex/sessions/cache', body: [{ id: 'unavailable-e2e-pane', kind: 'codex', title: 'Unavailable pane', workspace: root, status: 'idle' }] });
+  await mouseClick('.agent-rail button:has(.agent-icon-codex)');
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('.session-row .session-menu')`), 'secondary fixture catalog');
+  await mouseClick('.session-row .session-menu button');
+  await cdp.evaluate(`[...document.querySelectorAll('.session-actions button')].find(button => button.textContent.includes('在右侧打开')).click()`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.secondary-pane .terminal-connection-feedback')?.getAttribute('data-state') === 'reconnecting'`), 'secondary failed connection');
+  const primarySocket = await cdp.evaluate(`(() => { window.__primaryPaneSocket = window.__terminalSockets.findLast(socket => socket.readyState === WebSocket.OPEN); window.__paneRetryTimeout = window.setTimeout; window.setTimeout = (callback, delay, ...args) => window.__paneRetryTimeout(callback, delay === 1000 ? 15000 : delay, ...args); return window.__terminalSockets.length; })()`);
+  await mouseClick('.secondary-pane .terminal-connection-feedback button');
+  await waitFor(() => cdp.evaluate(`window.__terminalSockets.length > ${primarySocket}`), 'secondary manual retry');
+  if (!await cdp.evaluate(`window.__primaryPaneSocket.readyState === WebSocket.OPEN && document.querySelector('.terminal-status-menu .status')?.textContent.trim() === '已连接'`)) throw new Error('secondary retry affected primary display');
+  await mouseClick('button[aria-label="关闭右侧终端"]');
+  await cdp.evaluate(`window.setTimeout = window.__paneRetryTimeout`);
+  await waitFor(() => cdp.evaluate(`!document.querySelector('.secondary-pane')`), 'secondary detached');
+  console.log('PASS secondary connection recovery leaves the primary terminal connected');
+
+  await cdp.evaluate(`window.__primaryPaneSocket.send(JSON.stringify({ type: 'input', data: ${JSON.stringify('exit\n')} }))`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.primary-pane .terminal-connection-feedback')?.getAttribute('data-state') === 'ended'`), 'real PTY ended');
+  const endedSockets = await cdp.evaluate(`window.__terminalSockets.length`);
+  await new Promise(resolve => setTimeout(resolve, 1200));
+  if (await cdp.evaluate(`window.__terminalSockets.length`) !== endedSockets) throw new Error('ended PTY automatically reconnected');
+  await mouseClick('.primary-pane .terminal-connection-feedback button');
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('[aria-describedby="confirm-dialog-description"]')`), 'ended PTY restart confirmation');
+  await mouseClick('[aria-describedby="confirm-dialog-description"] footer button:last-child');
+  await waitFor(() => cdp.evaluate(`document.querySelector('.terminal-status-menu .status')?.textContent.trim() === '已连接'`), 'ended PTY confirmed restart');
+  console.log('PASS ended PTY stops reconnecting and restarts only after confirmation');
+
 
   while (await cdp.evaluate(`document.querySelectorAll('.session-tab-close').length > 0`)) {
     if (await cdp.evaluate(`document.querySelectorAll('.session-tab-close').length === 1`)) {
@@ -799,6 +957,7 @@ try {
   await mouseClick('.settings-navigation-item:first-child');
   await waitFor(() => cdp.evaluate(`!!document.querySelector('.agent-toggle-list')`), 'settings before logout race');
   await cdp.evaluate(`(() => { const trigger = document.querySelector(${JSON.stringify(roster('Codex'))} + ' .agent-roster-trigger'); if (trigger.getAttribute('data-state') !== 'open') trigger.click(); })()`);
+  await input(`${roster('Codex')} input[aria-label="启动参数 1"]`, '--logout-race');
   const beforeLogoutPuts = await cdp.evaluate(`window.__rpcRequests.filter(item => item.method === 'PUT' && item.path === '/settings').length`);
   const logoutSettings = await cdp.evaluate(`window.__rpcCall('/settings')`);
   await rule({ method: 'GET', path: '/settings', hold: true, body: logoutSettings, label: 'stale-save' });
