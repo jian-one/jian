@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, errorMessage, onSocketEvent } from '../../shared/api';
 import { sessionCacheKey, openSessionKey, type Kind, type OpenSession } from '../../shared/model';
-import { catalogAreas, emptyCatalogSlice, mergeCatalog, type Catalog, type CatalogArea } from './catalog-state';
+import { catalogAreas, emptyCatalogSlice, mergeCatalog, updateCatalogStatus, type Catalog, type CatalogArea } from './catalog-state';
 
 export function useSessionCatalog(user: string | null, enabled: Partial<Record<Kind, boolean>>) {
   const [areas, setAreas] = useState<Catalog>({});
@@ -84,6 +84,12 @@ export function useSessionCatalog(user: string | null, enabled: Partial<Record<K
     const slice = state.current[row.kind] || emptyCatalogSlice();
     write({ ...state.current, [row.kind]: { ...slice, rows: [row, ...slice.rows.filter(value => openSessionKey(value) !== openSessionKey(row))] } });
   };
+  const updateStatus = (row: OpenSession, status: 'running' | 'ended') => {
+    const next = updateCatalogStatus(state.current, row, status);
+    if (next === state.current) return;
+    mutations.current.set(row.kind, (mutations.current.get(row.kind) || 0) + 1);
+    write(next);
+  };
   const remove = (row: OpenSession) => {
     mutations.current.set(row.kind, (mutations.current.get(row.kind) || 0) + 1);
     const slice = state.current[row.kind];
@@ -117,5 +123,5 @@ export function useSessionCatalog(user: string | null, enabled: Partial<Record<K
   }, [user]);
   useEffect(() => { if (user) void latest.current.sync(); }, [enabled.codex, enabled.hermes, enabled.pi]);
   const read = async (area: CatalogArea, native = false) => { if (native) await refresh(area); else await sync([area]); return state.current[area] || emptyCatalogSlice(); };
-  return { areas, sync, refresh, read, clear, upsert, remove };
+  return { areas, sync, refresh, read, clear, upsert, remove, updateStatus };
 }

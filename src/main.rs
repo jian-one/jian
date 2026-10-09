@@ -940,17 +940,20 @@ async fn release_terminal(
     AxumPath(id): AxumPath<String>,
 ) -> Api {
     require(&state, &headers)?;
-    let kind = state
-        .runtime
-        .terminals
-        .session(&id)
-        .map(|row| row.kind)
-        .unwrap_or(AgentKind::Local);
+    let session = state.runtime.terminals.session(&id);
     state.locals.write().unwrap().remove(&id);
     if let Err(e) = state.runtime.terminals.stop(&id) {
         return fail(StatusCode::NOT_FOUND, e);
     }
-    state.runtime.remove_catalog_session(kind, &id);
+    if let Some(mut session) = session {
+        if session.kind == AgentKind::Local {
+            state.runtime.remove_catalog_session(session.kind, &id);
+        } else {
+            session.status = "ended".into();
+            session.updated_at = chrono::Utc::now();
+            state.runtime.update_catalog_session(session);
+        }
+    }
     ok(json!({"released":true,"id":id}))
 }
 async fn restart_terminal(
@@ -2061,6 +2064,63 @@ mod cli_tests {
         assert!(find_terminal_session(&state, AgentKind::Codex, "missing").is_none());
         assert!(find_terminal_session(&state, AgentKind::Hermes, "missing").is_none());
         drop(state);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn releasing_native_terminal_keeps_ended_catalog_row() {
+        let root = std::env::temp_dir().join(format!("jian-release-{}", uuid::Uuid::new_v4()));
+        let store = Arc::new(Store::open(root.join("jian.db")).unwrap());
+        store
+            .put(
+                "auth_sessions",
+                &token_hash("test-token"),
+                &AuthSession {
+                    username: "admin".into(),
+                    expires: chrono::Utc::now() + chrono::Duration::days(1),
+                },
+            )
+            .unwrap();
+        let runtime = Runtime::new(AgentSettings::default());
+        let session = Session::new(AgentKind::Hermes, "/tmp".into(), "Native".into());
+        runtime.update_catalog_session(session.clone());
+        runtime
+            .terminals
+            .start(terminal::TerminalSpec {
+                session: session.clone(),
+                label: AgentKind::Hermes,
+                cwd: "/tmp".into(),
+                argv: vec!["/bin/bash".into(), "-c".into(), "sleep 20".into()],
+                env: std::env::vars().map(|(k, v)| format!("{k}={v}")).collect(),
+            })
+            .unwrap();
+        let state = Arc::new(AppState {
+            store: store.clone(),
+            runtime: runtime.clone(),
+            locals: RwLock::new(HashMap::new()),
+            attempts: Mutex::new(HashMap::new()),
+            quick_notes: QuickNoteWorker::start(store).unwrap(),
+            quick_note_updates: broadcast::channel(1).0,
+            resize_owners: Mutex::new(HashMap::new()),
+            secure_cookie: false,
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("jian_session=test-token"),
+        );
+        assert!(
+            release_terminal(State(state.clone()), headers, AxumPath(session.id.clone()))
+                .await
+                .is_ok()
+        );
+        assert!(!runtime.terminals.running(&session.id));
+        let rows = runtime.catalog_state(AgentKind::Hermes).rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, session.id);
+        assert_eq!(rows[0].status, "ended");
+        drop(state);
+        drop(runtime);
         std::fs::remove_dir_all(root).unwrap();
     }
 

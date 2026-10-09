@@ -5,7 +5,6 @@ import { type AgentSettings, type Theme, type TerminalStatus, type TerminalStatu
 import { initialTerminalFontSize } from '../../shared/model';
 import { api, errorMessage } from '../../shared/api';
 import { MenuPopup } from '../../shared/ui/Popup';
-import { ConfirmDialog } from '../../shared/ui/ConfirmDialog';
 import { ErrorDialog } from '../../shared/ui/ErrorDialog';
 import { AgentIcon } from '../../shared/ui/AgentIcon';
 import { EnvironmentVariables } from '../../shared/ui/EnvironmentVariables';
@@ -118,13 +117,12 @@ function TerminalPool({ terminals, onEnter, onRelease, onReleaseAll }: { termina
 function TerminalSettings({ terminalFontSize = initialTerminalFontSize(), onTerminalFontSizeChange = size => window.dispatchEvent(new CustomEvent('jian-terminal-font-size', { detail: size })) }: { terminalFontSize?: number; onTerminalFontSizeChange?: (size: number) => void } = {}) {
   const [status, setStatus] = useState<TerminalStatusResponse | null>(null);
   const [error, setError] = useState('');
-  const [confirm, setConfirm] = useState<{ type: 'all' | 'release'; terminal?: TerminalStatus } | null>(null);
-  const [busy, setBusy] = useState(false);
+  const releaseInFlight = useRef(false);
   const load = async () => { try { const value = await api<TerminalStatusResponse>('/settings/terminal-status'); setStatus(value); setError(''); } catch (e) { setError(errorMessage(e)); } };
   useEffect(() => { let active = true; const refresh = async () => { if (active) await load(); }; void refresh(); const timer = window.setInterval(() => void refresh(), 5000); return () => { active = false; window.clearInterval(timer); }; }, []);
   const enter = (terminal: TerminalStatus) => window.dispatchEvent(new CustomEvent('jian-enter-terminal', { detail: { id: terminal.id, label: terminal.label } }));
-  const release = async () => { if (!confirm) return; setBusy(true); try { const path = confirm.type === 'all' ? '/settings/terminals/release-all' : `/settings/terminals/${encodeURIComponent(confirm.terminal!.id)}/release`; await api(path, { method: 'POST' }); if (confirm.type === 'all') window.dispatchEvent(new Event('jian-release-all-terminals')); setConfirm(null); await load(); } catch (e) { setConfirm(null); setError(errorMessage(e)); } finally { setBusy(false); } };
-  return <div className="terminal-settings-content"><header className="terminal-settings-heading"><div className="settings-section-intro"><span className="eyebrow">TERMINAL MANAGER</span><p>查看服务器上运行的终端，释放会中止任务。</p></div><div className="terminal-font-size-settings"><span>终端字号</span><TerminalFontSizeControl size={terminalFontSize} onChange={onTerminalFontSizeChange} /></div></header><div className="terminal-font-preview" style={{ fontSize: terminalFontSize }}>user@jian:~$ echo "终端字号预览"</div>{status && <TerminalPool terminals={status.active_pool} onEnter={enter} onRelease={terminal => setConfirm({ type: 'release', terminal })} onReleaseAll={() => setConfirm({ type: 'all' })} />}{!status && !error && <p className="muted">正在读取终端状态…</p>}<ConfirmDialog open={!!confirm} title={confirm?.type === 'all' ? '释放所有会话？' : '释放这个会话？'} description={confirm?.type === 'all' ? '所有 terminal 子进程都会被强制停止，当前浏览器连接也会断开。' : `“${confirm?.terminal?.title || confirm?.terminal?.id}”将被强制停止，正在执行的任务会中断。`} confirmLabel="确认释放" danger busy={busy} onConfirm={() => void release()} onClose={() => setConfirm(null)} /><ErrorDialog open={!!error} message={error} onClose={() => setError('')} /></div>;
+  const release = async (terminal?: TerminalStatus) => { if (releaseInFlight.current) return; releaseInFlight.current = true; try { const path = terminal ? `/settings/terminals/${encodeURIComponent(terminal.id)}/release` : '/settings/terminals/release-all'; await api(path, { method: 'POST' }); if (!terminal) window.dispatchEvent(new Event('jian-release-all-terminals')); await load(); } catch (e) { setError(errorMessage(e)); } finally { releaseInFlight.current = false; } };
+  return <div className="terminal-settings-content"><header className="terminal-settings-heading"><div className="settings-section-intro"><span className="eyebrow">TERMINAL MANAGER</span><p>查看服务器上运行的终端，释放会中止任务。</p></div><div className="terminal-font-size-settings"><span>终端字号</span><TerminalFontSizeControl size={terminalFontSize} onChange={onTerminalFontSizeChange} /></div></header><div className="terminal-font-preview" style={{ fontSize: terminalFontSize }}>user@jian:~$ echo "终端字号预览"</div>{status && <TerminalPool terminals={status.active_pool} onEnter={enter} onRelease={terminal => void release(terminal)} onReleaseAll={() => void release()} />}{!status && !error && <p className="muted">正在读取终端状态…</p>}<ErrorDialog open={!!error} message={error} onClose={() => setError('')} /></div>;
 }
 
 function AboutSettings() {

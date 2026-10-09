@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mergeCatalog, emptyCatalogSlice, catalogFeedback } from '../src/features/session-catalog/catalog-state.ts';
+import { mergeCatalog, emptyCatalogSlice, catalogFeedback, updateCatalogStatus } from '../src/features/session-catalog/catalog-state.ts';
 
 test('catalog snapshots cannot overwrite newer events and preserve other areas', () => {
   const local = { ...emptyCatalogSlice(), revision: 7 };
@@ -22,4 +22,18 @@ test('a failed cold discovery retains the browser catalog but a successful empty
   assert.equal(failed.local?.error, 'unavailable');
   const empty = mergeCatalog(failed, { local: { ...emptyCatalogSlice(), revision: 1, last_success_at: '2026-10-08T00:00:00Z' } });
   assert.deepEqual(empty.local?.rows, []);
+});
+
+test('terminal status updates preserve order, role identity, and deleted rows', () => {
+  const row = { id: 'same', kind: 'pi' as const, profile: 'a', title: 'A', workspace: '/work', status: 'ended' };
+  const other = { ...row, profile: 'b' };
+  const current = { pi: { ...emptyCatalogSlice(), rows: [other, row] } };
+  const running = updateCatalogStatus(current, row, 'running');
+  assert.equal(running.pi?.rows[0], other);
+  assert.equal(running.pi?.rows[1].status, 'running');
+  assert.equal(current.pi.rows[1].status, 'ended');
+  assert.equal(updateCatalogStatus(running, row, 'running'), running);
+  const ended = updateCatalogStatus(running, row, 'ended');
+  assert.equal(ended.pi?.rows[1].status, 'ended');
+  assert.equal(updateCatalogStatus({}, row, 'running').pi, undefined);
 });

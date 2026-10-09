@@ -5,13 +5,14 @@ import { adjacentTab } from "../../session-tabs";
 import { openSessionKey, openSessionTitle, openSessionLabel, type OpenSession } from "../../shared/model";
 
 export function SessionTabs({
-  sessions, order, value, select, close, reorder, locked, onSwitcher,
+  sessions, order, value, select, close, release, reorder, locked, onSwitcher,
 }: {
   sessions: OpenSession[];
   order: string[];
   value: string | null;
   select: (key: string) => void;
   close: (key: string) => void;
+  release: (session: OpenSession) => void;
   reorder: (from: string, to: string) => void;
   locked: boolean;
   onSwitcher: () => void;
@@ -59,7 +60,8 @@ export function SessionTabs({
             <DropdownMenu.Label>{title}</DropdownMenu.Label><DropdownMenu.Label>{session.workspace}</DropdownMenu.Label>
             <DropdownMenu.Item disabled={order.indexOf(key) === 0} onSelect={() => reorder(key, order[order.indexOf(key) - 1])}>向左移动</DropdownMenu.Item>
             <DropdownMenu.Item disabled={order.indexOf(key) === order.length - 1} onSelect={() => reorder(key, order[order.indexOf(key) + 1])}>向右移动</DropdownMenu.Item>
-            <DropdownMenu.Item onSelect={() => close(key)}>关闭标签，进程继续运行</DropdownMenu.Item>
+            <DropdownMenu.Item onSelect={() => close(key)}>关闭</DropdownMenu.Item>
+            <DropdownMenu.Item onSelect={() => release(session)}>释放</DropdownMenu.Item>
           </DropdownMenu.Content></DropdownMenu.Portal></DropdownMenu.Root>
           <button type="button" className="session-tab-close" aria-label={`关闭 ${title}`} title="关闭标签页，进程继续运行"
             disabled={locked}

@@ -179,7 +179,7 @@ function App() {
     [switcherOpen, setSwitcherOpen] = useState(false),
     [focusMode, setFocusMode] = useState(false),
     [discardOpen, setDiscardOpen] = useState(false),
-    [confirmation, setConfirmation] = useState<{ type: "release" | "restart" | "local-delete"; session: OpenSession } | null>(null),
+    [confirmation, setConfirmation] = useState<{ type: "restart" | "local-delete"; session: OpenSession } | null>(null),
     [operationBusy, setOperationBusy] = useState(false),
     [connection, setConnection] = useState<ConnectionState>("disconnected"),
     [wideScreen, setWideScreen] = useState(() => window.matchMedia("(min-width: 1200px)").matches),
@@ -610,14 +610,20 @@ function App() {
     await load(kind);
   };
   const releaseSession = async (target: OpenSession) => {
-    await api(`/settings/terminals/${encodeURIComponent(target.id)}/release`, {
-      method: "POST",
-    });
-    catalog.remove(target);
-    closeTab(openSessionKey(target));
-    if (secondary?.id === target.id && secondary.kind === target.kind)
-      setSecondary(null);
-    if (target.kind !== "local") await load(target.kind);
+    if (operationInFlight.current) return;
+    operationInFlight.current = true; setOperationBusy(true);
+    try {
+      await api(`/settings/terminals/${encodeURIComponent(target.id)}/release`, {
+        method: "POST",
+      });
+      if (target.kind === "local") catalog.remove(target);
+      else catalog.updateStatus(target, "ended");
+      closeTab(openSessionKey(target));
+      if (secondary?.id === target.id && secondary.kind === target.kind)
+        setSecondary(null);
+      if (target.kind !== "local") await load(target.kind);
+    } catch (e) { setError(errorMessage(e)); }
+    finally { operationInFlight.current = false; setOperationBusy(false); }
   };
   // Keep the existing Hermes restore-key contract covered while Pi uses the same profile flow.
   // const selectProfile = (nextProfile: string) => { localStorage.removeItem(activeSessionKey('hermes', nextProfile)); };
@@ -708,8 +714,7 @@ function App() {
     const { type, session } = confirmation;
     operationInFlight.current = true; setOperationBusy(true);
     try {
-      if (type === "release") await releaseSession(session);
-      else if (type === "local-delete" && session.kind === "local") await removeLocal(session);
+      if (type === "local-delete" && session.kind === "local") await removeLocal(session);
       else if (type === "restart") {
         const restartingActive = active && openSessionKey(active) === openSessionKey(session);
         const ended = restartingActive ? connection === "ended" : session.status === "ended";
@@ -760,7 +765,7 @@ function App() {
         onSync={() => void catalog.sync()}
         onSettings={target => openSettings(target)}
         onDialog={(mode, session) => { if (navigationLocked()) return; setMobileNavigationOpen(false); setDialog({ mode, session }); }}
-        onRelease={session => setConfirmation({ type: "release", session })}
+        onRelease={session => void releaseSession(session)}
         connectedSessionID={connectedSessionID}
         onDisconnect={disconnect}
         onOpenSecondary={openSecondary}
@@ -799,7 +804,7 @@ function App() {
             onSwitch={() => setSwitcherOpen(true)} onNavigation={() => setMobileNavigationOpen(true)}
             onCreate={() => activeKind === 'local' ? void createLocal() : openWorkspace(activeKind, profile)}
             onSettings={() => openSettings()} onNote={() => noteOpen.current?.()} onFocus={() => setFocusMode(value => !value)}
-            onRelease={() => { if (active) setConfirmation({ type: 'release', session: active }); }}
+            onRelease={() => { if (active) void releaseSession(active); }}
             onRestart={() => { if (active) setConfirmation({ type: 'restart', session: active }); }}
             onDisconnect={() => disconnect()} onReconnect={reconnect}
             theme={theme} terminalTheme={terminalTheme} fontSize={terminalFontSize}
@@ -821,7 +826,7 @@ function App() {
                 status={currentStatus}
                 connected={connected}
                 onReconnect={reconnect}
-                onRelease={async () => { if (active) setConfirmation({ type: "release", session: active }); }}
+                onRelease={async () => { if (active) await releaseSession(active); }}
               />}
             </div>
           </header>
@@ -831,8 +836,9 @@ function App() {
             value={activeKey}
             select={selectTab}
             close={closeTab}
+            release={session => void releaseSession(session)}
             reorder={reorderTabs}
-            locked={settingsBusy || creating}
+            locked={settingsBusy || creating || operationBusy}
             onSwitcher={() => setSwitcherOpen(true)}
           />
           {secondary && !wideScreen && active && <div className="narrow-pane-switch"><span>另一终端：{displayTitle(secondary)}</span><button onClick={() => { const previous = active; activate(secondary); setSecondary(previous.kind === 'local' ? null : previous); }}>切换终端</button><button className="icon" aria-label="关闭另一终端" onClick={() => setSecondary(null)}><X /></button></div>}
@@ -855,13 +861,14 @@ function App() {
                     onRestart={() => setConfirmation({ type: "restart", session: active })}
                     onConnectionChange={feedback => { setConnection(feedback.state); setConnectedSessionID(feedback.state === "connected" ? active.id : null); }}
                     onStatus={(value) => {
+                      catalog.updateStatus(active, value);
                       setActive(current => current && openSessionKey(current) === openSessionKey(active) ? { ...current, status: value } : current);
                     }}
                   /></Suspense>
                 </div>
                 {secondary && wideScreen && <div className="terminal-pane secondary-pane">
                   <div className="terminal-pane-label"><span>右侧终端</span><small title={secondary.workspace}>{displayTitle(secondary)}</small><button className="icon" aria-label="关闭右侧终端" title="关闭右侧终端" onClick={() => setSecondary(null)}><X /></button></div>
-                  <Suspense fallback={<p role="status">正在打开终端…</p>}><AgentTerminal key={`secondary:${openSessionKey(secondary)}:${secondaryRevision}`} session={secondary} terminalTheme={terminalTheme} terminalPath={secondary.kind} onProgress={() => {}} onStatus={value => setSecondary(current => current && openSessionKey(current) === openSessionKey(secondary) ? { ...current, status: value } : current)} onRestart={() => setConfirmation({ type: "restart", session: secondary })} /></Suspense>
+                  <Suspense fallback={<p role="status">正在打开终端…</p>}><AgentTerminal key={`secondary:${openSessionKey(secondary)}:${secondaryRevision}`} session={secondary} terminalTheme={terminalTheme} terminalPath={secondary.kind} onProgress={() => {}} onStatus={value => { catalog.updateStatus(secondary, value); setSecondary(current => current && openSessionKey(current) === openSessionKey(secondary) ? { ...current, status: value } : current); }} onRestart={() => setConfirmation({ type: "restart", session: secondary })} /></Suspense>
                 </div>}
               </div>
             ) : (
@@ -933,9 +940,9 @@ function App() {
           confirm={(title) => manage(dialog.mode, dialog.session, title)}
         />
       )}
-      <ConfirmDialog open={!!confirmation} title={confirmation?.type === "restart" ? "重启会话？" : confirmation?.type === "local-delete" ? "删除本地终端？" : "释放会话？"}
+      <ConfirmDialog open={!!confirmation} title={confirmation?.type === "restart" ? "重启会话？" : "删除本地终端？"}
         description={confirmation?.type === "restart" && confirmation.session.status === "ended" ? "会话已结束，将在原工作目录启动新的终端进程。" : `“${confirmation ? openSessionTitle(confirmation.session) : ""}”的进程将停止，正在执行的任务会中断。`}
-        confirmLabel={confirmation?.type === "restart" ? "确认重启" : confirmation?.type === "local-delete" ? "确认删除" : "确认释放"}
+        confirmLabel={confirmation?.type === "restart" ? "确认重启" : "确认删除"}
         danger busy={operationBusy} onConfirm={() => void confirmOperation()} onClose={() => { if (!operationInFlight.current) setConfirmation(null); }} />
       <ConfirmDialog open={discardOpen} title="放弃未保存的修改？" cancelLabel="继续编辑" description={`尚未保存：${settingsDirty.join("、")}。离开后这些修改将丢失。`} confirmLabel="放弃修改并离开"
         onConfirm={() => { setDiscardOpen(false); setSettingsDirty([]); const action = leavingSettings.current; leavingSettings.current = null; action?.(); }}

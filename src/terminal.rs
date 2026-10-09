@@ -72,7 +72,7 @@ impl Default for TerminalManager {
 }
 
 impl TerminalManager {
-    pub fn start(self: &Arc<Self>, spec: TerminalSpec) -> Result<()> {
+    pub fn start(self: &Arc<Self>, mut spec: TerminalSpec) -> Result<()> {
         if spec.session.id.is_empty() || spec.argv.first().is_none_or(String::is_empty) {
             return Err(anyhow!("terminal command is required"));
         }
@@ -100,6 +100,7 @@ impl TerminalManager {
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
         let (events, _) = broadcast::channel(128);
+        spec.session.status = "running".into();
         let id = spec.session.id.clone();
         let terminal = Arc::new(Terminal {
             session: RwLock::new(spec.session.clone()),
@@ -400,7 +401,9 @@ mod tests {
     #[test]
     fn starts_replays_and_stops() {
         let manager = Arc::new(TerminalManager::default());
-        let session = Session::new(AgentKind::Local, "/tmp".into(), "Bash".into());
+        let mut session = Session::new(AgentKind::Local, "/tmp".into(), "Bash".into());
+        session.status = "ended".into();
+        let mut changes = manager.changes.subscribe();
         manager
             .start(TerminalSpec {
                 session: session.clone(),
@@ -414,11 +417,14 @@ mod tests {
                 env: std::env::vars().map(|(k, v)| format!("{k}={v}")).collect(),
             })
             .unwrap();
+        assert_eq!(manager.session(&session.id).unwrap().status, "running");
+        assert_eq!(changes.try_recv().unwrap().status, "running");
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(
             String::from_utf8_lossy(&manager.subscribe(&session.id).unwrap().0).contains("ready")
         );
         manager.stop(&session.id).unwrap();
+        assert_eq!(changes.try_recv().unwrap().status, "ended");
     }
 
     #[test]
