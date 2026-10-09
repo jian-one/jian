@@ -171,6 +171,22 @@ try {
     if (close) { await click(label); await waitUntilClosed(label); }
   };
 
+  await waitFor(() => cdp.evaluate(`document.querySelector('.desktop-session-context .codex-quota')?.textContent === '额度暂不可用'`), 'unavailable quota state');
+  await cdp.evaluate(`window.__rpcRules.push({ method: 'GET', path: '/agents/codex/rate-limits', body: {
+    rateLimits: { primary: { usedPercent: 75, windowDurationMins: 300 }, secondary: { usedPercent: 85, windowDurationMins: 10080 } },
+    rateLimitResetCredits: { availableCount: 3 }
+  } }); document.dispatchEvent(new Event('visibilitychange'));`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.desktop-session-context .codex-quota')?.textContent === '5h: 25% | weekly: 15% | Reset: 3'`), 'desktop quota');
+  const quotaRequests = await cdp.evaluate(`window.__rpcRequests.filter(item => item.path === '/agents/codex/rate-limits').length`);
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 420, height: 900, deviceScaleFactor: 1, mobile: true });
+  await waitFor(() => cdp.evaluate(`document.querySelector('.mobile-workbench-header .mobile-codex-quota')?.textContent === '5h: 25% | weekly: 15% | Reset: 3'`), 'mobile quota');
+  if (!await cdp.evaluate(`window.__rpcRequests.filter(item => item.path === '/agents/codex/rate-limits').length === ${quotaRequests}`)) throw new Error('mobile header duplicated quota requests');
+  await cdp.evaluate(`window.__rpcRules.push({ method: 'GET', path: '/agents/codex/rate-limits', error: 'quota test outage' }); document.dispatchEvent(new Event('visibilitychange'));`);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.mobile-workbench-header .codex-quota')?.textContent === '额度暂不可用'`), 'quota refresh error');
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+  console.log('PASS Codex quota remaining percentages, reset count, shared desktop/mobile snapshot and refresh errors (fixture data)');
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('nav.agent-rail button:first-child')`), 'desktop navigation after quota test');
+
   await clickSelector('nav.agent-rail button:first-child', 'Local agent');
   await waitFor(() => cdp.evaluate(`document.querySelector('.catalog-header strong')?.textContent === 'Local Bash'`), 'Local catalog');
   await click('新建会话');

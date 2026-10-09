@@ -246,6 +246,7 @@ fn api_routes(state: Arc<AppState>) -> Router {
             post(restart_terminal),
         )
         .route("/api/settings/terminals/release-all", post(release_all))
+        .route("/api/agents/codex/rate-limits", get(codex_rate_limits))
         .route(
             "/api/agents/codex/sessions",
             get(list_codex).post(create_codex),
@@ -1003,6 +1004,16 @@ struct CreateAgent {
     #[serde(default)]
     title: String,
 }
+async fn codex_rate_limits(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
+    require(&state, &headers)?;
+    let runtime = state.runtime.clone();
+    match tokio::task::spawn_blocking(move || runtime.codex_rate_limits()).await {
+        Ok(Ok(value)) => ok(value),
+        Ok(Err(error)) => fail(StatusCode::SERVICE_UNAVAILABLE, error),
+        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error),
+    }
+}
+
 async fn agent_list(state: &Arc<AppState>, headers: &HeaderMap, kind: AgentKind) -> Api {
     require(state, headers)?;
     match state.runtime.cached(kind) {
@@ -2040,8 +2051,8 @@ mod cli_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    #[test]
-    fn terminal_routes_share_session_lookup() {
+    #[tokio::test]
+    async fn terminal_routes_share_session_lookup() {
         let root = std::env::temp_dir().join(format!("jian-routes-{}", uuid::Uuid::new_v4()));
         let store = Arc::new(Store::open(root.join("jian.db")).unwrap());
         let local = Session::new(AgentKind::Local, "/tmp".into(), "Bash".into());
@@ -2063,7 +2074,16 @@ mod cli_tests {
         );
         assert!(find_terminal_session(&state, AgentKind::Codex, "missing").is_none());
         assert!(find_terminal_session(&state, AgentKind::Hermes, "missing").is_none());
-        drop(state);
+        let unauthorized = api_routes(Arc::new(state))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents/codex/rate-limits")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
         std::fs::remove_dir_all(root).unwrap();
     }
 

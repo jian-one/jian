@@ -53,6 +53,23 @@ Set `JIAN_CODEX_BIN` to an absolute executable path when Codex is not on
 the service user's `PATH`; place it in the service environment file so the
 systemd service can use it.
 
+## Codex quota API
+
+`GET /api/agents/codex/rate-limits` requires a Jian login cookie and returns
+the complete JSON result from Codex `account/rateLimits/read`, including
+`rateLimits`, `rateLimitsByLimitId`, credit details and
+`rateLimitResetCredits` when available. Unknown/new fields are preserved.
+It uses the same configured Codex executable and environment as the sessions.
+Unauthenticated requests return HTTP 401; unavailable Codex, account or upstream
+quota data returns HTTP 503 with `{"error":"..."}`.
+
+Codex session headers on desktop, mobile and split terminals share a quota
+snapshot, refreshed every 30 seconds while the page is visible and immediately
+when it becomes visible again. For example: `5h: 25% | weekly: 15% | Reset: 3`.
+The percentages are remaining quota for the 300-minute and 10080-minute windows;
+`Reset` is `rateLimitResetCredits.availableCount`, not a reset timestamp.
+Missing fields display `—`; failed reads display `额度暂不可用`.
+
 ## Hermes chat integration
 
 When Hermes is available, Jian exposes an interactive xterm.js workspace

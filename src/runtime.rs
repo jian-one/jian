@@ -572,6 +572,24 @@ impl Runtime {
             .collect())
     }
 
+    pub fn codex_rate_limits(&self) -> Result<Value> {
+        let mut guard = self.codex_app.lock().unwrap();
+        if guard.is_none() {
+            *guard = Some(self.new_app_server()?);
+        }
+        let result = guard
+            .as_mut()
+            .unwrap()
+            .call("account/rateLimits/read", json!({}));
+        if result.is_err() {
+            if let Some(mut app) = guard.take() {
+                let _ = app.child.kill();
+                let _ = app.child.wait();
+            }
+        }
+        result
+    }
+
     fn codex_threads(&self) -> Result<Vec<Session>> {
         let mut app_guard = self.codex_app.lock().unwrap();
         if app_guard.is_none() {
@@ -1266,6 +1284,42 @@ mod tests {
         assert!(result.error.is_some());
         assert!(updates.try_recv().is_ok());
         assert_eq!(updates.try_recv().unwrap().1, result.revision);
+    }
+
+    #[test]
+    fn codex_rate_limits_preserves_all_fields_and_recovers_after_error() {
+        let runtime = Runtime::new(AgentSettings::default());
+        let expected = json!({
+            "rateLimits": {"primary": {"usedPercent": 75, "windowDurationMins": 300}},
+            "rateLimitsByLimitId": {"codex": {"planType": "pro"}},
+            "rateLimitResetCredits": {"availableCount": 3, "credits": []},
+            "futureField": {"untouched": true}
+        });
+        let reply = json!({"id": 1, "result": expected}).to_string();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", r#"read request; case "$request" in *account/rateLimits/read*) printf '%s\n' "$1";; *) exit 1;; esac; read request; printf '%s\n' '{"id":2,"error":{"message":"quota unavailable"}}'"#, "quota-fixture", &reply])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        *runtime.codex_app.lock().unwrap() = Some(AppServer {
+            child,
+            stdin,
+            stdout,
+            next: 0,
+            timeout: Duration::from_secs(2),
+        });
+        assert_eq!(runtime.codex_rate_limits().unwrap(), expected);
+        assert!(
+            runtime
+                .codex_rate_limits()
+                .unwrap_err()
+                .to_string()
+                .contains("quota unavailable")
+        );
+        assert!(runtime.codex_app.lock().unwrap().is_none());
     }
 
     #[test]

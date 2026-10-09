@@ -260,6 +260,8 @@
 @media (max-width: 800px), (max-width: 1199px) and (pointer: coarse) {
   .context-bar { min-height: 64px; padding: max(8px, env(safe-area-inset-top)) 8px 8px 60px; gap: 4px; }
   .desktop-session-context { display: none; }
+  .mobile-codex-quota { display: block; padding: 0 4px; }
+  .mobile-codex-quota .codex-quota { font-size: 10px; white-space: normal; }
   .session-context-trigger { display: flex; align-items: center; gap: 6px; width: 100%; padding: 4px; min-height: 44px; border: 0; background: transparent; }
   .session-context-trigger > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
   .session-context-trigger > svg, .session-context-trigger .agent-icon { flex: none; width: 16px; height: 16px; }

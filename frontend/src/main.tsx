@@ -7,6 +7,7 @@ import { useSessionCatalog } from "./features/session-catalog/useSessionCatalog"
 import { ConfirmDialog } from "./shared/ui/ConfirmDialog";
 import { openSessionKey, openSessionTitle, openSessionLabel, connectionView, type OpenSession, type ConnectionState } from "./shared/model";
 import { MobileWorkbench } from "./shared/ui/MobileWorkbench";
+import { CodexQuotaProvider, CodexQuotaStatus } from "./shared/ui/CodexQuota";
 import { useTerminalDrafts, type MobileInputMode } from "./features/terminal/mobile-state";
 import type { TerminalActions } from "./features/terminal/MobileTerminalInput";
 import { QuickNote } from "./features/quick-note/QuickNote";
@@ -738,6 +739,7 @@ function App() {
     else setTerminalRevision((v) => v + 1);
   };
   return (
+    <CodexQuotaProvider enabled={!settingsOpen && (activeKind === 'codex' || secondary?.kind === 'codex')}>
     <div className={"app " + (settingsOpen ? "settings-shell " : "") + (mobileNavigationOpen ? "nav-mobile-open " : "") + (focusMode && !settingsOpen ? "workbench-focused" : "")}>
       <SidebarNavigation
         active={active}
@@ -867,7 +869,7 @@ function App() {
                   /></Suspense>
                 </div>
                 {secondary && wideScreen && <div className="terminal-pane secondary-pane">
-                  <div className="terminal-pane-label"><span>右侧终端</span><small title={secondary.workspace}>{displayTitle(secondary)}</small><button className="icon" aria-label="关闭右侧终端" title="关闭右侧终端" onClick={() => setSecondary(null)}><X /></button></div>
+                  <div className="terminal-pane-label"><span>右侧终端</span><small title={secondary.workspace}>{displayTitle(secondary)}</small>{secondary.kind === 'codex' && <CodexQuotaStatus />}<button className="icon" aria-label="关闭右侧终端" title="关闭右侧终端" onClick={() => setSecondary(null)}><X /></button></div>
                   <Suspense fallback={<p role="status">正在打开终端…</p>}><AgentTerminal key={`secondary:${openSessionKey(secondary)}:${secondaryRevision}`} session={secondary} terminalTheme={terminalTheme} terminalPath={secondary.kind} onProgress={() => {}} onStatus={value => { catalog.updateStatus(secondary, value); setSecondary(current => current && openSessionKey(current) === openSessionKey(secondary) ? { ...current, status: value } : current); }} onRestart={() => setConfirmation({ type: "restart", session: secondary })} /></Suspense>
                 </div>}
               </div>
@@ -949,6 +951,7 @@ function App() {
         onClose={() => { setDiscardOpen(false); leavingSettings.current = null; }} />
       <ErrorDialog open={!!error} message={error} onClose={() => setError("")} />
     </div>
+    </CodexQuotaProvider>
   );
 }
 createRoot(document.getElementById("root")!).render(<App />);
