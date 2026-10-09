@@ -5,14 +5,17 @@ use std::{
     os::fd::AsRawFd,
     path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
@@ -21,10 +24,24 @@ use crate::{
     terminal::{TerminalManager, TerminalSpec},
 };
 
+#[derive(Clone, Default, Serialize)]
+pub struct CatalogState {
+    pub rows: Vec<Session>,
+    pub revision: u64,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub refreshing: bool,
+    pub error: Option<String>,
+    #[serde(skip)]
+    completed: u64,
+}
+
 pub struct Runtime {
     pub terminals: Arc<TerminalManager>,
     settings: RwLock<AgentSettings>,
-    cache: RwLock<HashMap<AgentKind, std::result::Result<Vec<Session>, String>>>,
+    cache: RwLock<HashMap<AgentKind, CatalogState>>,
+    refresh_locks: HashMap<AgentKind, Mutex<()>>,
+    settings_epoch: AtomicU64,
+    pub catalog_updates: tokio::sync::broadcast::Sender<(AgentKind, u64)>,
     codex_app: Mutex<Option<AppServer>>,
 }
 
@@ -34,16 +51,64 @@ impl Runtime {
             terminals: Arc::new(TerminalManager::default()),
             settings: RwLock::new(settings),
             cache: RwLock::new(HashMap::new()),
+            refresh_locks: [
+                AgentKind::Codex,
+                AgentKind::Hermes,
+                AgentKind::Pi,
+                AgentKind::Local,
+            ]
+            .into_iter()
+            .map(|kind| (kind, Mutex::new(())))
+            .collect(),
+            settings_epoch: AtomicU64::new(0),
+            catalog_updates: tokio::sync::broadcast::channel(64).0,
             codex_app: Mutex::new(None),
         })
     }
 
     pub fn start_cache(self: &Arc<Self>) {
+        let runtime = self.clone();
+        let mut changes = self.terminals.changes.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match changes.recv().await {
+                    Ok(session) => {
+                        let revision =
+                            {
+                                let mut cache = runtime.cache.write().unwrap();
+                                let entry = cache.entry(session.kind).or_default();
+                                if let Some(row) = entry.rows.iter_mut().find(|row| {
+                                    row.id == session.id && row.profile == session.profile
+                                }) {
+                                    row.status = session.status.clone();
+                                    row.updated_at = session.updated_at;
+                                }
+                                entry.revision += 1;
+                                entry.revision
+                            };
+                        let _ = runtime.catalog_updates.send((session.kind, revision));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        for kind in [
+                            AgentKind::Local,
+                            AgentKind::Codex,
+                            AgentKind::Hermes,
+                            AgentKind::Pi,
+                        ] {
+                            runtime.catalog_changed(kind);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
         for kind in [AgentKind::Codex, AgentKind::Hermes, AgentKind::Pi] {
             let runtime = self.clone();
             tokio::spawn(async move {
                 loop {
-                    if let Err(error) = runtime.refresh_async(kind).await {
+                    if runtime.enabled(kind)
+                        && let Err(error) = runtime.refresh_async(kind).await
+                    {
                         tracing::warn!(agent = kind.as_str(), %error, "session cache refresh failed");
                     }
                     tokio::time::sleep(Duration::from_secs(30)).await;
@@ -58,7 +123,14 @@ impl Runtime {
     }
 
     pub fn set_settings(&self, settings: AgentSettings) {
-        *self.settings.write().unwrap() = settings;
+        {
+            let mut current = self.settings.write().unwrap();
+            if serde_json::to_value(&*current).ok() == serde_json::to_value(&settings).ok() {
+                return;
+            }
+            *current = settings;
+            self.settings_epoch.fetch_add(1, Ordering::SeqCst);
+        }
         if let Some(mut app) = self.codex_app.lock().unwrap().take() {
             let _ = app.child.kill();
         }
@@ -71,28 +143,122 @@ impl Runtime {
         self.binary(kind).is_ok()
     }
     pub fn refresh(&self, kind: AgentKind) -> Result<Vec<Session>> {
-        let result = self.discover(kind);
+        if !self.enabled(kind) {
+            return Err(anyhow!("Agent 已停用"));
+        }
+        self.refresh_with(kind, || self.discover(kind))
+    }
+    fn refresh_with(
+        &self,
+        kind: AgentKind,
+        discover: impl FnOnce() -> Result<Vec<Session>>,
+    ) -> Result<Vec<Session>> {
+        let completed = self.catalog_state(kind).completed;
+        let _scan = self.refresh_locks[&kind].lock().unwrap();
+        let previous = self.catalog_state(kind);
+        if previous.completed != completed {
+            return previous
+                .error
+                .map_or_else(|| Ok(previous.rows), |error| Err(anyhow!(error)));
+        }
+        let epoch = self.settings_epoch.load(Ordering::SeqCst);
+        self.cache
+            .write()
+            .unwrap()
+            .entry(kind)
+            .or_default()
+            .refreshing = true;
+        let mut result = discover();
         if kind == AgentKind::Codex
             && result.is_err()
             && let Some(mut app) = self.codex_app.lock().unwrap().take()
         {
             let _ = app.child.kill();
         }
-        self.cache.write().unwrap().insert(
-            kind,
-            result
-                .as_ref()
-                .map(|v| v.clone())
-                .map_err(ToString::to_string),
-        );
+        let _settings = self.settings.read().unwrap();
+        let mut cache = self.cache.write().unwrap();
+        let entry = cache.entry(kind).or_default();
+        entry.refreshing = false;
+        entry.completed += 1;
+        if epoch != self.settings_epoch.load(Ordering::SeqCst)
+            || entry.revision != previous.revision
+        {
+            result = Err(anyhow!("配置或会话已变化，请重新同步"));
+        }
+        match &result {
+            Ok(rows) => {
+                entry.rows = rows.clone();
+                entry.last_success_at = Some(Utc::now());
+                entry.error = None;
+            }
+            Err(error) => entry.error = Some(error.to_string()),
+        }
+        entry.revision += 1;
+        let revision = entry.revision;
+        drop(cache);
+        let _ = self.catalog_updates.send((kind, revision));
         result
     }
+    pub fn enabled(&self, kind: AgentKind) -> bool {
+        let settings = self.settings.read().unwrap();
+        !settings.agent_toggles_set
+            || match kind {
+                AgentKind::Codex => settings.codex_enabled,
+                AgentKind::Hermes => settings.hermes_enabled,
+                AgentKind::Pi => settings.pi_enabled,
+                AgentKind::Local => true,
+            }
+    }
+    pub fn catalog_state(&self, kind: AgentKind) -> CatalogState {
+        self.cache
+            .read()
+            .unwrap()
+            .get(&kind)
+            .cloned()
+            .unwrap_or_default()
+    }
+    pub fn catalog_changed(&self, kind: AgentKind) {
+        let revision = {
+            let mut cache = self.cache.write().unwrap();
+            let entry = cache.entry(kind).or_default();
+            entry.revision += 1;
+            entry.revision
+        };
+        let _ = self.catalog_updates.send((kind, revision));
+    }
+    pub fn update_catalog_session(&self, session: Session) {
+        let kind = session.kind;
+        let revision = {
+            let mut cache = self.cache.write().unwrap();
+            let entry = cache.entry(kind).or_default();
+            entry
+                .rows
+                .retain(|row| row.id != session.id || row.profile != session.profile);
+            entry.rows.insert(0, session);
+            entry.revision += 1;
+            entry.revision
+        };
+        let _ = self.catalog_updates.send((kind, revision));
+    }
+    pub fn remove_catalog_session(&self, kind: AgentKind, id: &str) {
+        let revision = {
+            let mut cache = self.cache.write().unwrap();
+            let entry = cache.entry(kind).or_default();
+            entry.rows.retain(|row| row.id != id);
+            entry.revision += 1;
+            entry.revision
+        };
+        let _ = self.catalog_updates.send((kind, revision));
+    }
     pub fn cached(&self, kind: AgentKind) -> Result<Vec<Session>> {
-        match self.cache.read().unwrap().get(&kind) {
-            Some(Ok(v)) => Ok(v.clone()),
-            Some(Err(e)) => Err(anyhow!(e.clone())),
-            None => Err(anyhow!("session cache is not ready: {}", kind.as_str())),
+        let state = self.catalog_state(kind);
+        if state.last_success_at.is_some() || !state.rows.is_empty() {
+            return Ok(state.rows);
         }
+        Err(anyhow!(state.error.unwrap_or_else(|| format!(
+            "session cache is not ready: {}",
+            kind.as_str()
+        ))))
     }
     pub fn session(&self, kind: AgentKind, id: &str) -> Result<Session> {
         if let Some(session) = self.terminals.session(id).filter(|s| s.kind == kind) {
@@ -1023,6 +1189,84 @@ mod tests {
     use std::{fs, os::unix::fs::PermissionsExt, thread, time::Instant};
 
     use super::*;
+
+    #[test]
+    fn catalog_keeps_last_success_when_discovery_fails() {
+        let runtime = Runtime::new(AgentSettings::default());
+        let row = Session::new(AgentKind::Hermes, "/work".into(), "Saved".into());
+        runtime
+            .refresh_with(AgentKind::Hermes, || Ok(vec![row.clone()]))
+            .unwrap();
+        let successful = runtime.catalog_state(AgentKind::Hermes);
+        assert!(
+            runtime
+                .refresh_with(AgentKind::Hermes, || Err(anyhow!("offline")))
+                .is_err()
+        );
+        let failed = runtime.catalog_state(AgentKind::Hermes);
+        assert_eq!(failed.rows[0].id, row.id);
+        assert_eq!(failed.last_success_at, successful.last_success_at);
+        assert!(failed.revision > successful.revision);
+        assert!(!failed.refreshing);
+        assert_eq!(failed.error.as_deref(), Some("offline"));
+    }
+
+    #[test]
+    fn catalog_coalesces_waiting_refreshes_and_invalidates_changed_settings() {
+        let runtime = Runtime::new(AgentSettings::default());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_runtime = runtime.clone();
+        let first = thread::spawn(move || {
+            first_runtime.refresh_with(AgentKind::Hermes, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(vec![])
+            })
+        });
+        entered_rx.recv().unwrap();
+        let second_runtime = runtime.clone();
+        let second = thread::spawn(move || {
+            second_runtime.refresh_with(AgentKind::Hermes, || panic!("duplicate native discovery"))
+        });
+        thread::sleep(Duration::from_millis(30));
+        release_tx.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert_eq!(runtime.catalog_state(AgentKind::Hermes).completed, 1);
+        assert!(
+            runtime
+                .refresh_with(AgentKind::Hermes, || {
+                    let mut settings = runtime.settings();
+                    settings.hermes_home = "/new-home".into();
+                    runtime.set_settings(settings);
+                    Ok(vec![])
+                })
+                .is_err()
+        );
+        assert!(!runtime.catalog_state(AgentKind::Hermes).refreshing);
+    }
+
+    #[test]
+    fn catalog_does_not_replace_a_mutation_with_an_old_scan() {
+        let runtime = Runtime::new(AgentSettings::default());
+        let row = Session::new(AgentKind::Hermes, "/work".into(), "New".into());
+        let mut updates = runtime.catalog_updates.subscribe();
+        assert!(
+            runtime
+                .refresh_with(AgentKind::Hermes, || {
+                    runtime.update_catalog_session(row.clone());
+                    Ok(vec![])
+                })
+                .is_err()
+        );
+        let result = runtime.catalog_state(AgentKind::Hermes);
+        assert_eq!(result.rows[0].id, row.id);
+        assert!(!result.refreshing);
+        assert!(result.error.is_some());
+        assert!(updates.try_recv().is_ok());
+        assert_eq!(updates.try_recv().unwrap().1, result.revision);
+    }
 
     #[test]
     fn app_server_call_times_out_when_codex_stops_replying() {

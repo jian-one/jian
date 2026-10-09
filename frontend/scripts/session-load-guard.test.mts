@@ -36,7 +36,10 @@ test('the app keeps profile-aware restoration while list navigation reads the ca
 
   assert.match(source, /shouldRestoreNativeSession\(/);
   assert.match(source, /explicitHome:\s*target === "hermes" && hermesHomeSelected\.current/);
-  assert.match(source, /refresh \? `\/agents\/\$\{target\}\/sessions\/refresh` : `\/agents\/\$\{target\}\/sessions\/cache`/);
+  assert.match(source, /catalog.read\(target, refresh\)/);
+  const catalog = readFileSync(new URL('../src/features/session-catalog/useSessionCatalog.ts', import.meta.url), 'utf8');
+  assert.match(catalog, /sessions\/catalog\?areas=/);
+  assert.match(catalog, /if \(area !== 'local'\) await api/);
   assert.match(source, /const selectProfile = \(nextProfile: string\) => \{[\s\S]*localStorage\.removeItem\(activeSessionKey\(kind, nextProfile\)\)/);
 });
 

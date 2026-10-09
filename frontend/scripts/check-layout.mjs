@@ -4,6 +4,7 @@ const read = path => readFileSync(new URL(path, import.meta.url), 'utf8');
 const app = read('../src/main.tsx');
 const main = app + read('../src/features/terminal/AgentTerminal.tsx') + read('../src/features/session-catalog/SessionTabs.tsx') + read('../src/features/session-catalog/WorkspacePicker.tsx');
 const switcher = read('../src/features/session-catalog/SessionSwitcher.tsx');
+const catalog = read('../src/features/session-catalog/useSessionCatalog.ts');
 const navigation = read('../src/features/navigation/SidebarNavigation.tsx');
 const sessions = read('../src/features/session-catalog/SessionList.tsx');
 const terminal = read('../src/features/terminal/mountTerminal.ts');
@@ -12,7 +13,7 @@ const settings = read('../src/features/settings/SettingsPage.tsx');
 const css = `${read('../src/styles.css')}\n${read('../src/layout.css')}`;
 
 const checks = [
-  ['unified switching uses cached catalogs and Radix navigation', switcher.includes('Dialog.Root') && switcher.includes('Tabs.List') && switcher.includes('/sessions/cache') && !switcher.includes('/sessions/refresh')],
+  ['unified switching uses cached catalogs and Radix navigation', switcher.includes('Dialog.Root') && switcher.includes('Tabs.List') && switcher.includes('catalog: Catalog') && !switcher.includes('api(')],
   ['focus mode changes layout without replacing terminal identity', app.includes('workbench-focused') && app.includes('hidden={!focusMode}') && css.includes('.workbench-focused .session-tabs')],
   ['pane recovery reuses one guarded connection flow', terminal.includes('reconnectRequestRef.current = retryNow') && terminal.includes('socketRef.current !== ws') && terminal.includes('clearConnectionTimers()')],
   ['configuration cards show dirty state and individual recovery', settings.includes('settings-dirty-badge') && settings.includes('撤销本项修改') && settings.includes('feedback[kind]')],
@@ -22,8 +23,8 @@ const checks = [
   ['roles use keyboard-accessible Radix tabs', navigation.includes('className="role-strip"') && navigation.includes('Tabs.Trigger') && navigation.includes('activationMode="manual"')],
   ['catalog searches title, workspace and session ID', navigation.includes('value.title} ${value.workspace} ${value.id}') && navigation.includes('catalog-search')],
   ['workspace is a filter instead of a disclosure level', navigation.includes('catalog-filter') && !navigation.includes('NavigationMenu')],
-  ['normal list loads use the runtime cache', main.includes('`/agents/${target}/sessions/cache`')],
-  ['native discovery is explicit refresh only', main.includes('refresh ? `/agents/${target}/sessions/refresh`') && main.includes('await load(k, true)')],
+  ['normal list loads use the runtime cache', catalog.includes('/sessions/catalog?areas=')],
+  ['native discovery is explicit refresh only', catalog.includes('`/agents/${area}/sessions/refresh`') && main.includes('await load(k, true)')],
   ['session rows expose a right-pane action through Radix menu', sessions.includes('Columns2') && sessions.includes('在右侧打开')],
   ['desktop supports two terminal panes', main.includes('terminal-split') && main.includes('secondary-pane') && main.includes('setSecondary')],
   ['narrow screens detach secondary display but preserve its session tab', app.includes('secondary && wideScreen') && app.includes('setOpenSessions(current => current.some')],

@@ -460,7 +460,7 @@ export function AgentTerminal({
           aria-hidden="true"
         />
       </div>
-      {mobile && <MobileTerminalInput mode={inputMode} draft={draft} storageError={storageError} editor={editorRef}
+      {mobile && <MobileTerminalInput mode={inputMode} enter={mode => { flushSync(() => onInputMode(mode)); if (mode === 'compose') editorRef.current?.focus({ preventScroll: true }); else focus(); }} draft={draft} storageError={storageError} editor={editorRef}
         ready={connection === 'connected'} onDraft={onDraft} send={send} pasteText={pasteText} leave={leaveInput} />}
       <Dialog.Root open={copyOpen} onOpenChange={setCopyOpen}><Dialog.Portal><Dialog.Overlay className="dialog-overlay" />
         <Dialog.Content className="terminal-copy-dialog dialog" onOpenAutoFocus={event => { event.preventDefault(); }}

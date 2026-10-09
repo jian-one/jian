@@ -266,8 +266,8 @@ try {
   await waitFor(() => cdp.evaluate(`!window.__jianThemeTestDocument && !!document.querySelector('.context-actions') && document.documentElement.dataset.theme === 'light'`), 'persisted themes after reload');
   await assertOpen('界面主题');
   await assertOpen('Terminal 配色');
-  await cdp.evaluate(`localStorage.setItem('jian.terminal_theme', 'black'); location.reload()`);
-  await waitFor(() => cdp.evaluate(`document.documentElement.dataset.theme === 'light' && localStorage.getItem('jian.terminal_theme') === 'console'`), 'legacy Terminal theme migration');
+  await cdp.evaluate(`window.__migrationReload = true; localStorage.setItem('jian.terminal_theme', 'black'); location.reload()`);
+  await waitFor(() => cdp.evaluate(`!window.__migrationReload && !!document.querySelector('.context-actions') && document.documentElement.dataset.theme === 'light' && localStorage.getItem('jian.terminal_theme') === 'console'`), 'legacy Terminal theme migration');
   await assertOpen('Terminal 配色', false);
   if (!await cdp.evaluate(`!!document.querySelector('.theme-menu[aria-label="Terminal 配色"] button[data-theme-preview="console"].selected')`)) throw new Error('legacy black Terminal theme was not migrated to console');
   console.log('PASS homepage theme popovers stay open and persist independently');
@@ -329,7 +329,9 @@ try {
   const tap = async selector => {
     await cdp.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
     await cdp.evaluate(`(() => { const node = document.querySelector(${JSON.stringify(selector)}); if (node?.closest('.mobile-control-scroll')) node.scrollIntoView({ block: 'nearest', inline: 'nearest' }); })()`);
-    const point = await cdp.evaluate(`(() => { const box = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect(); return { x: box.x + box.width / 2, y: box.y + box.height / 2 }; })()`);
+    const point = await cdp.evaluate(`(() => { const target = document.querySelector(${JSON.stringify(selector)}); const box = target.getBoundingClientRect(); const x = box.x + box.width / 2, y = box.y + box.height / 2; const hit = document.elementFromPoint(x, y); return { x, y, hit: target === hit || target.contains(hit), actual: hit?.outerHTML.slice(0, 300), disabled: target.disabled }; })()`);
+    if (!point.hit || point.disabled) throw new Error('button not actionable: ' + selector + '; ' + JSON.stringify(point));
+    delete point.hit; delete point.actual; delete point.disabled;
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [point] });
     await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -355,6 +357,7 @@ try {
   await tap('.terminal .xterm-screen');
   if (await cdp.evaluate(`document.activeElement.classList.contains('terminal-input-buffer')`)) throw new Error('reading output opened mobile input');
   await tap('.mobile-workbench-dock button[aria-label="输入终端"]');
+  await cdp.evaluate(`[...document.querySelectorAll('.mobile-input-modes button')].find(button => button.textContent === '实时终端').click()`);
   if (!await cdp.evaluate(`document.activeElement.classList.contains('terminal-input-buffer')`)) throw new Error('explicit input entry failed');
   await tap('.mobile-workbench-dock button[aria-label="收起输入"]');
   await cdp.evaluate(`document.activeElement.blur()`);
@@ -385,6 +388,7 @@ try {
     WebSocket.prototype.send = function(data) { const message = JSON.parse(data); if (message.type === 'input') window.__shortcutInputs.push(message.data); return send.call(this, data); };
   })()`);
   await tap('.mobile-workbench-dock button[aria-label="输入终端"]');
+  await cdp.evaluate(`[...document.querySelectorAll('.mobile-input-modes button')].find(button => button.textContent === '实时终端').click()`);
   await tap('.mobile-control-scroll button:first-child');
   if (!await cdp.evaluate(`document.activeElement.classList.contains('terminal-input-buffer')`)) throw new Error('mobile shortcut lost input focus');
   if (!await cdp.evaluate(`window.__shortcutInputs.at(-1) === String.fromCharCode(27)`)) throw new Error('mobile shortcut did not send Escape');
@@ -429,9 +433,11 @@ try {
 
   const mouseClick = async selector => {
     await cdp.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
-    await cdp.evaluate(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' })`);
+    await cdp.evaluate(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'instant' })`);
     await cdp.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
-    const point = await cdp.evaluate(`(() => { const box = document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect(); return { x: box.x + box.width / 2, y: box.y + box.height / 2 }; })()`);
+    const point = await cdp.evaluate(`(() => { const target = document.querySelector(${JSON.stringify(selector)}); const box = target.getBoundingClientRect(); const x = box.x + box.width / 2, y = box.y + box.height / 2; const hit = document.elementFromPoint(x, y); return { x, y, hit: target === hit || target.contains(hit), actual: hit?.outerHTML.slice(0, 300), disabled: target.disabled }; })()`);
+    if (!point.hit || point.disabled) throw new Error('button not actionable: ' + selector + '; ' + JSON.stringify(point));
+    delete point.hit; delete point.actual; delete point.disabled;
     await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', clickCount: 1, ...point });
     await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', clickCount: 1, ...point });
   };
@@ -501,9 +507,12 @@ try {
   await cdp.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
   await waitFor(() => cdp.evaluate(`!document.querySelector('.sidebar')`), 'closed mobile drawer');
   const mobileMore = async label => {
+    if (label === '文本编辑') { await tap('.mobile-workbench-dock button[aria-label="输入终端"]'); return; }
     await tap('.mobile-workbench-dock button[aria-label="更多工作台操作"]');
     await waitFor(() => cdp.evaluate(`!!document.querySelector('.mobile-workbench-sheet')`), 'mobile menu');
-    await clickSelector('.mobile-workbench-sheet button[aria-label="' + label + '"]', label);
+    const group = ['会话目录与管理', '新建会话', '重新连接', '关闭当前会话显示', '重启当前会话', '释放当前会话'].includes(label) ? '会话管理' : ['选择输出文本', '搜索终端输出', '粘贴到终端'].includes(label) ? '输出' : '工作台';
+    await mouseClick('.mobile-tool-groups [role="tab"]:nth-child(' + (group === '输出' ? 1 : group === '会话管理' ? 2 : 3) + ')');
+    await cdp.evaluate(`[...document.querySelectorAll('.mobile-workbench-sheet button')].find(button => button.textContent === ${JSON.stringify(label)}).click()`);
   };
   const openMobileNavigation = () => mobileMore('会话目录与管理');
   const beforeDrawer = await cdp.evaluate(`({ count: window.__terminalSockets.length, width: document.querySelector('.terminal-stage').getBoundingClientRect().width })`);
@@ -610,10 +619,24 @@ try {
     await waitFor(() => cdp.evaluate(`window.__rpcResponses.includes(${id})`), label + ' response');
   };
   const roster = kind => `.agent-roster-item:has([aria-label="${kind}设置，展开或收起详细配置"])`;
+  const pushed = await cdp.evaluate(`window.__rpcCall('/local/sessions', 'POST', {})`);
+  await waitFor(() => cdp.evaluate(`(JSON.parse(localStorage.getItem('jian.session_cache.theme-test.local') || '[]')).some(row => row.id === ${JSON.stringify(pushed.id)})`), 'server catalog push updates shared cache');
+  await cdp.evaluate(`window.__rpcCall('/local/sessions/' + ${JSON.stringify(pushed.id)}, 'DELETE')`);
+  await waitFor(() => cdp.evaluate(`!(JSON.parse(localStorage.getItem('jian.session_cache.theme-test.local') || '[]')).some(row => row.id === ${JSON.stringify(pushed.id)})`), 'server deletion push removes cached row');
+  const catalogAccess = await cdp.evaluate(`Promise.all([fetch('/api/sessions/catalog', { credentials: 'omit' }).then(r => r.status), fetch('/api/sessions/catalog?areas=invalid').then(r => r.status)])`);
+  if (catalogAccess[0] !== 401 || catalogAccess[1] !== 400) throw new Error('catalog authentication or area validation failed: ' + JSON.stringify(catalogAccess));
+  console.log('PASS real catalog push synchronizes creation/deletion and snapshot access stays authenticated');
   const cachedFixture = (kind, profile) => ({ id: 'same-native-id', kind, profile, title: 'Build service', workspace: '/work/team', status: 'idle' });
-  await rule({ method: 'GET', path: '/agents/codex/sessions/cache', error: '测试缓存读取失败' });
-  await rule({ method: 'GET', path: '/agents/hermes/sessions/cache', body: [cachedFixture('hermes', 'ops')] });
-  await rule({ method: 'GET', path: '/agents/pi/sessions/cache', body: [cachedFixture('pi', 'ops'), cachedFixture('pi', 'research')] });
+  const fixtureCatalog = await cdp.evaluate(`window.__rpcCall('/sessions/catalog')`);
+  fixtureCatalog.areas.codex.error = '测试缓存读取失败';
+  fixtureCatalog.areas.hermes.rows = [cachedFixture('hermes', 'ops')];
+  fixtureCatalog.areas.hermes.error = null;
+  fixtureCatalog.areas.pi.rows = [cachedFixture('pi', 'ops'), cachedFixture('pi', 'research')];
+  fixtureCatalog.areas.pi.error = null;
+  for (const slice of Object.values(fixtureCatalog.areas)) slice.revision += 100;
+  await rule({ method: 'GET', prefix: '/sessions/catalog', body: fixtureCatalog });
+  await cdp.evaluate(`window.__apiSocket.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'sessions.catalog.resync' }) }))`);
+  await waitFor(() => cdp.evaluate(`!window.__rpcRules.length`), 'shared catalog fixture loaded');
   const beforeSwitcherSockets = await cdp.evaluate(`window.__terminalSockets.length`);
   await mouseClick('.session-tabs .session-switcher-trigger');
   await waitFor(() => cdp.evaluate(`!!document.querySelector('.switcher-error') && !document.querySelector('.switcher-feedback')?.textContent.includes('正在') && document.activeElement.getAttribute('aria-label') === '搜索全部会话'`), 'switcher partial results and desktop focus');
@@ -621,7 +644,9 @@ try {
   await waitFor(() => cdp.evaluate(`document.querySelectorAll('.switcher-result').length === 2`), 'same ID Pi roles remain distinct');
   await input('.switcher-search input', 'PI ops TEAM');
   if (!await cdp.evaluate(`document.querySelectorAll('.switcher-result').length === 1 && document.querySelector('.switcher-result').textContent.includes('ops')`)) throw new Error('switcher role search failed');
-  await rule({ method: 'GET', path: '/agents/codex/sessions/cache', body: [] });
+  fixtureCatalog.areas.codex.error = null; fixtureCatalog.areas.codex.revision++;
+  await rule({ method: 'POST', path: '/agents/codex/sessions/refresh', body: [] });
+  await rule({ method: 'GET', prefix: '/sessions/catalog', body: fixtureCatalog });
   await mouseClick('.switcher-error button');
   await waitFor(() => cdp.evaluate(`!document.querySelector('.switcher-error')`), 'partial cache retry');
   await input('.switcher-search input', 'no-such-session');
@@ -635,7 +660,7 @@ try {
   await input('.switcher-search input', sharedID);
   await keyPress('Enter');
   await waitFor(() => cdp.evaluate(`!document.querySelector('.session-switcher') && localStorage.getItem('jian.active_local_session') === ${JSON.stringify(sharedID)}`), 'switcher Enter activates local session');
-  if (await cdp.evaluate(`window.__rpcRequests.some(request => request.method === 'POST' && request.path.endsWith('/sessions/refresh'))`)) throw new Error('switcher triggered native discovery');
+  if (await cdp.evaluate(`window.__rpcRequests.filter(request => request.method === 'POST' && request.path.endsWith('/sessions/refresh')).length !== 1`)) throw new Error('switcher triggered native discovery');
   console.log('PASS unified switcher preserves role identity, partial results, keyboard focus and cached discovery');
 
   await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
@@ -653,6 +678,7 @@ try {
   await waitFor(() => cdp.evaluate(`!!document.querySelector('.session-switcher') && document.activeElement.getAttribute('aria-label') === '关闭会话切换器'`), 'mobile switcher avoids keyboard autofocus');
   await cdp.evaluate(`(() => { Object.defineProperties(visualViewport, { height: { configurable: true, value: 380 }, offsetTop: { configurable: true, value: 50 } }); visualViewport.dispatchEvent(new Event('resize')); })()`);
   await waitFor(() => cdp.evaluate(`(() => { const box = document.querySelector('.session-switcher').getBoundingClientRect(); return box.top >= 50 && box.bottom <= 430; })()`), 'switcher fits keyboard viewport');
+  if (!await cdp.evaluate(`document.querySelector('.switcher-results').getBoundingClientRect().height >= 60`)) throw new Error('mobile keyboard viewport hides session results: ' + JSON.stringify(await cdp.evaluate(`[...document.querySelector('.session-switcher').children].map(node => ({ className: node.className, height: node.getBoundingClientRect().height, text: node.textContent.slice(0, 60) }))`)));
   await screenshot('switcher-mobile');
   await keyPress('Escape');
   await cdp.evaluate(`(() => { delete visualViewport.height; delete visualViewport.offsetTop; visualViewport.dispatchEvent(new Event('resize')); })()`);
@@ -739,7 +765,7 @@ try {
   await waitFor(() => cdp.evaluate(`document.querySelector('[aria-label="启用 Hermes"]').getAttribute('aria-checked') === 'true' && !document.querySelector('[aria-label="返回工作台"]').disabled`), 'Hermes restored');
   await rule({ method: 'PUT', path: '/settings', error: '测试保存失败' });
   await mouseClick(`${roster('Hermes')} button[type="submit"]`);
-  await waitFor(() => cdp.evaluate(`document.querySelector('.general-settings-content [role="alert"]')?.textContent.includes('测试保存失败') && !document.querySelector('[aria-label="返回工作台"]').disabled`), 'save failure and unlock');
+  try { await waitFor(() => cdp.evaluate(`[...document.querySelectorAll('.general-settings-content [role="alert"]')].some(node => node.textContent.includes('测试保存失败')) && !document.querySelector('[aria-label="返回工作台"]').disabled`), 'save failure and unlock'); } catch (error) { throw new Error(error.message + '; ' + JSON.stringify(await cdp.evaluate(`({ text: document.querySelector('.general-settings-content')?.textContent, rules: window.__rpcRules, requests: window.__rpcRequests.slice(-6) })`))); }
   if (!await cdp.evaluate(`document.querySelector(${JSON.stringify(roster('Hermes'))} + ' input[aria-label="启动参数 1"]').value === 'hermes-draft'`)) throw new Error('save failure erased input');
   await mouseClick(`${roster('Hermes')} button[type="submit"]`);
   await waitFor(() => cdp.evaluate(`document.querySelector(${JSON.stringify(roster('Hermes'))} + ' .settings-save-status')?.textContent.includes('Hermes 设置已保存')`), 'save retry');
@@ -777,7 +803,7 @@ try {
   await mouseClick('[aria-describedby="confirm-dialog-description"] footer button:last-child');
   await cdp.evaluate(`window.__rpcCall('/settings', 'PUT', ${JSON.stringify({ ...persistedSettings.settings, pi_default: join(temporary, 'missing-pi'), pi_args: ['--model'] })})`);
   await mouseClick('.agent-rail button:has(.agent-icon-pi)');
-  await waitFor(() => cdp.evaluate(`document.querySelector('.catalog-header strong')?.textContent === 'Pi' && window.__rpcRequests.filter(item => item.path === '/agents/pi/sessions/cache').every(item => window.__rpcResponses.includes(item.id))`), 'Pi catalog response');
+  await waitFor(() => cdp.evaluate(`document.querySelector('.catalog-header strong')?.textContent === 'Pi' && window.__rpcRequests.filter(item => item.path.startsWith('/sessions/catalog')).every(item => window.__rpcResponses.includes(item.id))`), 'Pi catalog response');
   if (await cdp.evaluate(`!!document.querySelector('[aria-describedby="error-dialog-description"]')`)) await clickSelector('[aria-describedby="error-dialog-description"] button', 'fixture cache notice');
   await rule({ method: 'GET', path: '/settings', error: '测试参数读取失败' });
   await mouseClick('button[aria-label="新建会话"]');
@@ -812,7 +838,7 @@ try {
   console.log('PASS workspace parameter retry, out-of-order browse, duplicate creation guard, and real server failure recovery');
 
   await mouseClick('.agent-rail button:has(.agent-icon-codex)');
-  await waitFor(() => cdp.evaluate(`document.querySelector('.catalog-header strong')?.textContent === 'Codex' && window.__rpcRequests.filter(item => item.path === '/agents/codex/sessions/cache').every(item => window.__rpcResponses.includes(item.id))`), 'Codex catalog response');
+  await waitFor(() => cdp.evaluate(`document.querySelector('.catalog-header strong')?.textContent === 'Codex' && window.__rpcRequests.filter(item => item.path.startsWith('/sessions/catalog')).every(item => window.__rpcResponses.includes(item.id))`), 'Codex catalog response');
   await dismissUnavailableNotice();
   await mouseClick('button[aria-label="codex 设置"]');
   await waitFor(() => cdp.evaluate(`!!document.querySelector(${JSON.stringify(roster('Codex'))} + ' .agent-roster-content')`), 'shortcut opens Codex configuration');
@@ -829,7 +855,7 @@ try {
 
   const selectFixtureAgent = async kind => {
     await mouseClick(`.agent-rail button:has(.agent-icon-${kind})`);
-    await waitFor(() => cdp.evaluate(`document.querySelector('.catalog-header strong')?.textContent.toLowerCase() === ${JSON.stringify(kind)} && window.__rpcRequests.filter(item => item.path === '/agents/${kind}/sessions/cache').every(item => window.__rpcResponses.includes(item.id))`), kind + ' catalog settled');
+    await waitFor(() => cdp.evaluate(`document.querySelector('.catalog-header strong')?.textContent.toLowerCase() === ${JSON.stringify(kind)} && window.__rpcRequests.filter(item => item.path.startsWith('/sessions/catalog')).every(item => window.__rpcResponses.includes(item.id))`), kind + ' catalog settled');
     if (await cdp.evaluate(`!!document.querySelector('[aria-describedby="error-dialog-description"]')`)) await clickSelector('[aria-describedby="error-dialog-description"] button', kind + ' fixture cache notice');
   };
   for (const kind of ['codex', 'hermes']) {
@@ -849,7 +875,7 @@ try {
   await selectFixtureAgent('pi');
   await waitFor(() => cdp.evaluate(`Array.from(document.querySelectorAll('.role-strip [role="tab"]')).some(tab => tab.textContent === 'e2e-role')`), 'Pi fixture role');
   await mouseClick('.role-strip [role="tab"]:last-child');
-  await waitFor(() => cdp.evaluate(`document.querySelector('.role-strip [data-state="active"]')?.textContent === 'e2e-role' && window.__rpcRequests.filter(item => item.path === '/agents/pi/sessions/cache').every(item => window.__rpcResponses.includes(item.id))`), 'Pi role selected');
+  await waitFor(() => cdp.evaluate(`document.querySelector('.role-strip [data-state="active"]')?.textContent === 'e2e-role' && window.__rpcRequests.filter(item => item.path.startsWith('/sessions/catalog')).every(item => window.__rpcResponses.includes(item.id))`), 'Pi role selected');
   if (await cdp.evaluate(`!!document.querySelector('[aria-describedby="error-dialog-description"]')`)) await clickSelector('[aria-describedby="error-dialog-description"] button', 'Pi role cache notice');
   await rule({ method: 'GET', path: '/settings', hold: true, label: 'role-preflight' });
   await rule({ method: 'POST', path: '/agents/pi/sessions', error: '测试 Pi 角色创建失败' });
@@ -895,7 +921,10 @@ try {
   await releaseRPC('local-create');
   await waitFor(() => cdp.evaluate(`document.querySelector('.terminal-status-menu .status')?.textContent.trim() === '已连接' && !document.querySelector('.session-tab-close').disabled`), 'real Local created and attached');
   console.log('PASS repeated Local clicks create one real server-owned session');
-  await rule({ method: 'GET', path: '/agents/codex/sessions/cache', body: [{ id: 'unavailable-e2e-pane', kind: 'codex', title: 'Unavailable pane', workspace: root, status: 'idle' }] });
+  const paneCatalog = await cdp.evaluate(`window.__rpcCall('/sessions/catalog')`);
+  paneCatalog.areas.codex.rows = [{ id: 'unavailable-e2e-pane', kind: 'codex', title: 'Unavailable pane', workspace: root, status: 'idle' }];
+  paneCatalog.areas.codex.revision += 1000;
+  await rule({ method: 'GET', prefix: '/sessions/catalog', body: paneCatalog });
   await mouseClick('.agent-rail button:has(.agent-icon-codex)');
   await waitFor(() => cdp.evaluate(`!!document.querySelector('.session-row .session-menu')`), 'secondary fixture catalog');
   await mouseClick('.session-row .session-menu button');
@@ -950,7 +979,7 @@ try {
   await keyPress('Escape');
   console.log('PASS note sync failure retains local edits and retry persists them');
 
-  await waitFor(() => cdp.evaluate(`window.__rpcRequests.filter(item => item.path.endsWith('/sessions/cache')).every(item => window.__rpcResponses.includes(item.id))`), 'reload catalogs settled');
+  await waitFor(() => cdp.evaluate(`window.__rpcRequests.filter(item => item.path.startsWith('/sessions/catalog')).every(item => window.__rpcResponses.includes(item.id))`), 'reload catalogs settled');
   await dismissUnavailableNotice();
   await mouseClick('button[aria-label="设置"]');
   await waitFor(() => cdp.evaluate(`!!document.querySelector('.settings-navigation')`), 'settings reopened before logout');
@@ -964,7 +993,7 @@ try {
   await rule({ method: 'POST', path: '/auth/logout', hold: true, label: 'logout' });
   await mouseClick(`${roster('Codex')} button[type="submit"]`);
   await waitFor(() => cdp.evaluate(`window.__heldRPC.some(item => item.label === 'stale-save')`), 'save before logout');
-  await mouseClick('button[aria-label="退出登录"]');
+  await mouseClick('.settings-account button[aria-label="退出登录"]');
   await waitFor(() => cdp.evaluate(`window.__heldRPC.some(item => item.label === 'logout') && !document.querySelector('.settings-page')`), 'logout while saving');
   await releaseRPC('stale-save');
   await cdp.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);

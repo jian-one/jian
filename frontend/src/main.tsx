@@ -1,10 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ChevronDown, Plus, RefreshCw, Trash2, X, Minimize2, Maximize2, ListFilter, SlidersHorizontal } from "lucide-react";
 import { SessionSwitcher } from "./features/session-catalog/SessionSwitcher";
 import { SessionTabs } from "./features/session-catalog/SessionTabs";
-import { WorkspacePicker } from "./features/session-catalog/WorkspacePicker";
-import { AgentTerminal } from "./features/terminal/AgentTerminal";
+import { useSessionCatalog } from "./features/session-catalog/useSessionCatalog";
 import { ConfirmDialog } from "./shared/ui/ConfirmDialog";
 import { openSessionKey, openSessionTitle, openSessionLabel, connectionView, type OpenSession, type ConnectionState } from "./shared/model";
 import { MobileWorkbench } from "./shared/ui/MobileWorkbench";
@@ -57,13 +56,16 @@ import { ErrorDialog } from "./shared/ui/ErrorDialog";
 import { SessionDialog } from "./features/session-catalog/SessionDialog";
 import { Login } from "./features/auth/Login";
 import { SidebarNavigation } from "./features/navigation/SidebarNavigation";
-import { SettingsPage } from "./features/settings/SettingsPage";
 import { AgentIcon } from "./shared/ui/AgentIcon";
 import { SessionContext } from "./shared/ui/SessionContext";
 import { WorkbenchTools } from "./shared/ui/WorkbenchTools";
 
 import "./styles.css";
 import "./layout.css";
+
+const WorkspacePicker = lazy(() => import('./features/session-catalog/WorkspacePicker').then(module => ({ default: module.WorkspacePicker })));
+const AgentTerminal = lazy(() => import('./features/terminal/AgentTerminal').then(module => ({ default: module.AgentTerminal })));
+const SettingsPage = lazy(() => import('./features/settings/SettingsPage').then(module => ({ default: module.SettingsPage })));
 
 function StatusMenu({
   status,
@@ -128,30 +130,6 @@ function StatusMenu({
   );
 }
 
-const readSessionCache = (username: string, kind: Kind): Session[] => {
-  try {
-    const value = JSON.parse(
-      localStorage.getItem(sessionCacheKey(username, kind)) || "[]",
-    );
-    return Array.isArray(value) ? value : [];
-  } catch {
-    return [];
-  }
-};
-
-const writeSessionCache = (
-  username: string,
-  kind: Kind,
-  sessions: Session[],
-) => {
-  try {
-    localStorage.setItem(
-      sessionCacheKey(username, kind),
-      JSON.stringify(sessions),
-    );
-  } catch {}
-};
-
 function App() {
   const startKind = initialKind();
   const initialArea =
@@ -208,7 +186,6 @@ function App() {
     [catalogError, setCatalogError] = useState<{ kind: Kind; profile: string; message: string } | null>(null),
     [visibleCounts, setVisibleCounts] = useState<Record<string, number>>({});
   const token = useRef<SessionLoadVersion>({ current: 0 }),
-    sessionCache = useRef<Partial<Record<Kind, Session[]>>>({}),
     hermesHomeSelected = useRef(false);
   const settingsBusyRef = useRef(false), creatingRef = useRef(false), authEpoch = useRef(0);
   const leavingSettings = useRef<(() => void) | null>(null);
@@ -217,6 +194,7 @@ function App() {
   const mobileActions = useRef<TerminalActions | null>(null), noteOpen = useRef<(() => void) | null>(null);
   const [inputMode, setInputMode] = useState<MobileInputMode>('read');
   const drafts = useTerminalDrafts(user);
+  const catalog = useSessionCatalog(user, agentEnabled);
   useEffect(() => { setInputMode('read'); }, [activeKey, settingsOpen, compactNavigation]);
   const requestNavigation = (action: () => void) => {
     if (settingsBusyRef.current || creatingRef.current) return;
@@ -248,22 +226,11 @@ function App() {
     const t = currentTarget
       ? beginSessionLoad(token.current)
       : token.current.current;
-    const cached = user
-      ? readSessionCache(user, target)
-      : sessionCache.current[target] || [];
-    sessionCache.current[target] = cached;
-    if (cached.length && currentTarget) setAll(cached);
     try {
-      const rows = normalizeSessions(
-        await api<Session[]>(
-          refresh ? `/agents/${target}/sessions/refresh` : `/agents/${target}/sessions/cache`,
-          refresh ? { method: "POST" } : undefined,
-        ),
-      );
+      const slice = await catalog.read(target, refresh);
+      const rows = normalizeSessions(slice.rows.filter(row => row.kind === target) as Session[]);
       if (loadAuthEpoch !== authEpoch.current) return false;
       if (currentTarget && !isCurrentSessionLoad(token.current, t)) return true;
-      sessionCache.current[target] = rows;
-      if (user) writeSessionCache(user, target, rows);
       if (currentTarget) {
         setAll(rows);
         setOpenSessions((sessions) =>
@@ -281,7 +248,7 @@ function App() {
               ) || session
             : session,
         );
-        setCatalogError(value => value?.kind === target && value.profile === profile ? null : value);
+        setCatalogError(slice.error ? { kind: target, profile, message: slice.error } : null);
       }
       if (
         currentTarget &&
@@ -380,7 +347,6 @@ function App() {
   useEffect(() => {
     if (user) {
       void load(kind);
-      void load(kind === "codex" ? "hermes" : "codex");
     }
   }, [user, area, kind, profile]);
   useEffect(() => {
@@ -500,12 +466,13 @@ function App() {
     }
   }, [agentEnabled.codex, agentEnabled.hermes, agentEnabled.pi, area]);
   useEffect(() => {
-    if (!user) return;
-    const loadAuthEpoch = authEpoch.current;
-    void api<LocalSession[]>("/local/sessions")
-      .then(rows => { if (loadAuthEpoch === authEpoch.current) setLocalSessions(rows); })
-      .catch(e => { if (loadAuthEpoch === authEpoch.current) setError(errorMessage(e)); });
-  }, [user]);
+    setLocalSessions((catalog.areas.local?.rows || []) as LocalSession[]);
+    setCatalogError(null);
+    const rows = normalizeSessions((catalog.areas[kind]?.rows || []) as Session[]);
+    setAll(rows);
+    setOpenSessions(current => current.map(row => catalog.areas[row.kind]?.rows.find(next => openSessionKey(next) === openSessionKey(row)) || row));
+    setActive(current => { if (!current) return current; const row = catalog.areas[current.kind]?.rows.find(next => openSessionKey(next) === openSessionKey(current)); return row ? { ...row, status: current.status } : current; });
+  }, [catalog.areas, kind]);
   useEffect(() => {
     const restart = () => {
       if (active) setConfirmation({ type: "restart", session: active });
@@ -579,11 +546,10 @@ function App() {
   };
   const removeLocal = async (session: LocalSession) => {
     await api(`/local/sessions/${encodeURIComponent(session.id)}`, { method: "DELETE" });
-    setLocalSessions(rows => rows.filter(item => item.id !== session.id));
+    catalog.remove(session);
     closeTab(openSessionKey(session));
   };
   const refresh = async (k: Kind) => {
-    if (refreshingKind) return;
     setRefreshingKind(k);
     await load(k, true);
     setRefreshingKind(null);
@@ -613,7 +579,7 @@ function App() {
       if (epoch !== authEpoch.current) return;
       invalidateSessionLoads(token.current);
       setPicking(false);
-      if (x.kind === "local") setLocalSessions(rows => [x, ...rows]);
+      catalog.upsert(x);
       activate(x.kind === "local" ? x : activeView(x), true);
       if (targetKind !== "local") void load(targetKind);
     } catch (e) { if (epoch === authEpoch.current) throw e; }
@@ -636,9 +602,7 @@ function App() {
       await api(`/agents/${kind}/sessions/${encodeURIComponent(s.id)}`, {
         method: "DELETE",
       });
-      sessionCache.current[kind] = (sessionCache.current[kind] || []).filter(
-        (item) => item.id !== s.id,
-      );
+      catalog.remove(s);
       closeTab(openSessionKey(s));
       localStorage.removeItem(selectedSessionKey(s, profile));
     }
@@ -649,8 +613,7 @@ function App() {
     await api(`/settings/terminals/${encodeURIComponent(target.id)}/release`, {
       method: "POST",
     });
-    if (target.kind === "local")
-      setLocalSessions((rows) => rows.filter((item) => item.id !== target.id));
+    catalog.remove(target);
     closeTab(openSessionKey(target));
     if (secondary?.id === target.id && secondary.kind === target.kind)
       setSecondary(null);
@@ -700,7 +663,7 @@ function App() {
     setVisibleCounts((value) => ({ ...value, [key]: (value[key] || 8) + 8 }));
   };
   const logout = () => {
-    drafts.clear(); setInputMode('read');
+    drafts.clear(); catalog.clear(); setInputMode('read');
     authEpoch.current++; settingsBusyRef.current = false; creatingRef.current = false;
     setSettingsBusyState(false); setCreating(false);
     setSettingsOpen(false); setSettingsTarget(null); setPicking(false); setSwitcherOpen(false); setFocusMode(false);
@@ -708,7 +671,7 @@ function App() {
       Object.keys(localStorage)
         .filter((key) => key.startsWith("jian.") && key !== themeKey)
         .forEach((key) => localStorage.removeItem(key));
-      invalidateSessionLoads(token.current); sessionCache.current = {};
+      invalidateSessionLoads(token.current);
       setAll([]); setLocalSessions([]); setOpenSessions([]); setTabOrder([]); setSecondary(null); clearActive(); setCatalogError(null);
       setUser(null);
       setPicking(false); setSettingsTarget(null); setError("");
@@ -770,7 +733,7 @@ function App() {
     else setTerminalRevision((v) => v + 1);
   };
   return (
-    <div className={"app " + (mobileNavigationOpen ? "nav-mobile-open " : "") + (focusMode && !settingsOpen ? "workbench-focused" : "")}>
+    <div className={"app " + (settingsOpen ? "settings-shell " : "") + (mobileNavigationOpen ? "nav-mobile-open " : "") + (focusMode && !settingsOpen ? "workbench-focused" : "")}>
       <SidebarNavigation
         active={active}
         currentKind={area}
@@ -793,6 +756,8 @@ function App() {
         onOpenWorkspace={(target, nextProfile) => requestNavigation(() => openWorkspace(target, nextProfile))}
         onRefresh={(target) => void refresh(target)}
         refreshingKind={refreshingKind}
+        catalog={catalog.areas} opened={openSessions}
+        onSync={() => void catalog.sync()}
         onSettings={target => openSettings(target)}
         onDialog={(mode, session) => { if (navigationLocked()) return; setMobileNavigationOpen(false); setDialog({ mode, session }); }}
         onRelease={session => setConfirmation({ type: "release", session })}
@@ -811,7 +776,8 @@ function App() {
       />
       <div className="workspace-view">
         {settingsOpen ? (
-          <SettingsPage
+          <Suspense fallback={<p role="status">正在打开设置…</p>}><SettingsPage
+               username={user} onLogout={() => settingsBusyRef.current ? logout() : requestNavigation(logout)}
               theme={theme}
               onThemeChange={setTheme}
               terminalTheme={terminalTheme}
@@ -825,7 +791,7 @@ function App() {
               busy={settingsBusy}
               onBusyChange={setSettingsBusy}
               isCurrentUser={isCurrentUser}
-            />
+            /></Suspense>
         ) : <main className="conversation">
           {compactNavigation && <MobileWorkbench session={active} kind={activeKind} profile={profile} connection={active ? connection : 'disconnected'}
             focused={focusMode} mode={inputMode} busy={settingsBusy || creating} attached={terminalAttached} actions={mobileActions}
@@ -869,12 +835,13 @@ function App() {
             locked={settingsBusy || creating}
             onSwitcher={() => setSwitcherOpen(true)}
           />
+          {secondary && !wideScreen && active && <div className="narrow-pane-switch"><span>另一终端：{displayTitle(secondary)}</span><button onClick={() => { const previous = active; activate(secondary); setSecondary(previous.kind === 'local' ? null : previous); }}>切换终端</button><button className="icon" aria-label="关闭另一终端" onClick={() => setSecondary(null)}><X /></button></div>}
           {active ? (
             terminalAttached ? (
               <div className={secondary && wideScreen ? "terminal-split" : "terminal-single"}>
                 <div className="terminal-pane primary-pane">
                   {secondary && wideScreen && <div className="terminal-pane-label"><span>主终端</span><small>{displayTitle(active)}</small></div>}
-                  <AgentTerminal
+                  <Suspense fallback={<p role="status">正在打开终端…</p>}><AgentTerminal
                     key={`${openSessionKey(active)}:${terminalRevision}`}
                     session={active}
                     mobile={compactNavigation} inputMode={inputMode} onInputMode={setInputMode} actionsRef={mobileActions}
@@ -890,11 +857,11 @@ function App() {
                     onStatus={(value) => {
                       setActive(current => current && openSessionKey(current) === openSessionKey(active) ? { ...current, status: value } : current);
                     }}
-                  />
+                  /></Suspense>
                 </div>
                 {secondary && wideScreen && <div className="terminal-pane secondary-pane">
                   <div className="terminal-pane-label"><span>右侧终端</span><small title={secondary.workspace}>{displayTitle(secondary)}</small><button className="icon" aria-label="关闭右侧终端" title="关闭右侧终端" onClick={() => setSecondary(null)}><X /></button></div>
-                  <AgentTerminal key={`secondary:${openSessionKey(secondary)}:${secondaryRevision}`} session={secondary} terminalTheme={terminalTheme} terminalPath={secondary.kind} onProgress={() => {}} onStatus={value => setSecondary(current => current && openSessionKey(current) === openSessionKey(secondary) ? { ...current, status: value } : current)} onRestart={() => setConfirmation({ type: "restart", session: secondary })} />
+                  <Suspense fallback={<p role="status">正在打开终端…</p>}><AgentTerminal key={`secondary:${openSessionKey(secondary)}:${secondaryRevision}`} session={secondary} terminalTheme={terminalTheme} terminalPath={secondary.kind} onProgress={() => {}} onStatus={value => setSecondary(current => current && openSessionKey(current) === openSessionKey(secondary) ? { ...current, status: value } : current)} onRestart={() => setConfirmation({ type: "restart", session: secondary })} /></Suspense>
                 </div>}
               </div>
             ) : (
@@ -944,22 +911,20 @@ function App() {
         </main>}
       </div>
       {switcherOpen && <SessionSwitcher opened={openSessions} order={tabOrder} activeKey={activeKey}
-        enabled={agentEnabled} initialCatalog={{ ...Object.fromEntries((["codex", "hermes", "pi"] as Kind[]).map(target => [target, sessionCache.current[target] || readSessionCache(user, target)])), local: localSessions }}
+        enabled={agentEnabled} catalog={catalog.areas}
         onClose={() => setSwitcherOpen(false)}
-        onSelect={session => { setSwitcherOpen(false); requestNavigation(() => activate(session)); }}
-        onCatalog={(target, rows) => {
-          if (target === "local") setLocalSessions(rows as LocalSession[]);
-          else { sessionCache.current[target] = rows as Session[]; writeSessionCache(user, target, rows as Session[]); }
-        }} />}
+        onRefresh={area => void catalog.refresh(area)}
+        onManage={() => { setSwitcherOpen(false); if (compactNavigation) setMobileNavigationOpen(true); else requestAnimationFrame(() => document.querySelector<HTMLInputElement>('.catalog-search input')?.focus()); }}
+        onSelect={session => { setSwitcherOpen(false); requestNavigation(() => activate(session)); }} />}
       {picking && (
-        <WorkspacePicker
+        <Suspense fallback={<p role="status">正在打开目录选择器…</p>}><WorkspacePicker
           sessions={all}
           profile={profile}
           kind={kind}
           creating={creating}
           close={() => setPicking(false)}
           select={(path, args) => create(path, args, profile, kind)}
-        />
+        /></Suspense>
       )}
       {dialog && (
         <SessionDialog

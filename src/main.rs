@@ -49,7 +49,7 @@ use crate::{
 };
 
 const COOKIE: &str = "jian_session";
-const SESSION_TTL_SECS: i64 = 24 * 60 * 60;
+const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 const QUICK_NOTE_STATE_LIMIT: usize = 1024 * 1024;
 const QUICK_NOTE_TEXT_LIMIT: usize = 100_000;
 
@@ -231,6 +231,7 @@ fn api_routes(state: Arc<AppState>) -> Router {
         .route("/api/local/sessions", post(create_local).get(list_local))
         .route("/api/local/sessions/{id}", delete(remove_local))
         .route("/api/local/sessions/{id}/terminal", get(local_terminal))
+        .route("/api/sessions/catalog", get(session_catalog))
         .route("/api/hermes/profiles", get(profiles))
         .route("/api/pi/agents", get(pi_agents))
         .route("/api/settings", get(settings).put(save_settings))
@@ -648,6 +649,9 @@ async fn save_settings(
         return fail(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
     state.runtime.set_settings(input.clone());
+    for kind in [AgentKind::Codex, AgentKind::Hermes, AgentKind::Pi] {
+        state.runtime.catalog_changed(kind);
+    }
     ok(input)
 }
 
@@ -817,6 +821,7 @@ async fn create_local(
         .write()
         .unwrap()
         .insert(session.id.clone(), session.clone());
+    state.runtime.update_catalog_session(session.clone());
     Ok((StatusCode::CREATED, Json(session)).into_response())
 }
 async fn list_local(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
@@ -835,7 +840,83 @@ async fn remove_local(
         return fail(StatusCode::NOT_FOUND, "session not found");
     }
     let _ = state.runtime.terminals.stop(&id);
+    state.runtime.remove_catalog_session(AgentKind::Local, &id);
     no_content()
+}
+
+#[derive(Deserialize, Default)]
+struct CatalogQuery {
+    areas: Option<String>,
+}
+
+async fn session_catalog(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<CatalogQuery>,
+) -> Api {
+    require(&state, &headers)?;
+    let mut areas = serde_json::Map::new();
+    for area in query
+        .areas
+        .as_deref()
+        .unwrap_or("local,codex,hermes,pi")
+        .split(',')
+    {
+        let kind = match area {
+            "local" => AgentKind::Local,
+            "codex" => AgentKind::Codex,
+            "hermes" => AgentKind::Hermes,
+            "pi" => AgentKind::Pi,
+            _ => return fail(StatusCode::BAD_REQUEST, "invalid catalog area"),
+        };
+        let mut catalog = state.runtime.catalog_state(kind);
+        if kind == AgentKind::Local {
+            let remembered = catalog.rows.clone();
+            catalog.rows = state
+                .locals
+                .read()
+                .unwrap()
+                .values()
+                .map(|session| {
+                    let mut row = session.clone();
+                    row.status = if state.runtime.terminals.running(&row.id) {
+                        "running".into()
+                    } else {
+                        remembered
+                            .iter()
+                            .find(|value| value.id == row.id)
+                            .map(|value| {
+                                if value.status == "running" {
+                                    "ended".into()
+                                } else {
+                                    value.status.clone()
+                                }
+                            })
+                            .unwrap_or(row.status)
+                    };
+                    row
+                })
+                .collect();
+            catalog.last_success_at = Some(chrono::Utc::now());
+        }
+        // A snapshot is cached discovery plus current server-owned processes; no CLI runs here.
+        for live in state.runtime.terminals.sessions(kind) {
+            if let Some(row) = catalog
+                .rows
+                .iter_mut()
+                .find(|row| row.id == live.id && row.profile == live.profile)
+            {
+                *row = live;
+            } else {
+                catalog.rows.push(live);
+            }
+        }
+        catalog
+            .rows
+            .sort_by_key(|row| std::cmp::Reverse(row.updated_at));
+        areas.insert(area.into(), serde_json::to_value(catalog).unwrap());
+    }
+    ok(json!({"areas":areas}))
 }
 async fn profiles(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
     require(&state, &headers)?;
@@ -859,10 +940,17 @@ async fn release_terminal(
     AxumPath(id): AxumPath<String>,
 ) -> Api {
     require(&state, &headers)?;
+    let kind = state
+        .runtime
+        .terminals
+        .session(&id)
+        .map(|row| row.kind)
+        .unwrap_or(AgentKind::Local);
     state.locals.write().unwrap().remove(&id);
     if let Err(e) = state.runtime.terminals.stop(&id) {
         return fail(StatusCode::NOT_FOUND, e);
     }
+    state.runtime.remove_catalog_session(kind, &id);
     ok(json!({"released":true,"id":id}))
 }
 async fn restart_terminal(
@@ -874,6 +962,9 @@ async fn restart_terminal(
     if let Err(e) = state.runtime.restart_terminal(&id) {
         return fail(StatusCode::BAD_REQUEST, e);
     }
+    if let Some(session) = state.runtime.terminals.session(&id) {
+        state.runtime.update_catalog_session(session);
+    }
     ok(json!({"restarted":true,"id":id}))
 }
 async fn release_all(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
@@ -881,6 +972,19 @@ async fn release_all(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
     state.locals.write().unwrap().clear();
     if let Err(e) = state.runtime.terminals.stop_all() {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, e);
+    }
+    for kind in [
+        AgentKind::Local,
+        AgentKind::Codex,
+        AgentKind::Hermes,
+        AgentKind::Pi,
+    ] {
+        let rows = state.runtime.catalog_state(kind).rows;
+        for mut row in rows {
+            row.status = "ended".into();
+            state.runtime.update_catalog_session(row);
+        }
+        state.runtime.catalog_changed(kind);
     }
     ok(json!({"released":true}))
 }
@@ -973,6 +1077,7 @@ async fn agent_create(
     if let Err(e) = state.runtime.start_agent(session.clone()) {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
+    state.runtime.update_catalog_session(session.clone());
     Ok((StatusCode::CREATED, Json(session)).into_response())
 }
 async fn agent_get(state: &Arc<AppState>, headers: &HeaderMap, kind: AgentKind, id: &str) -> Api {
@@ -1014,6 +1119,8 @@ async fn agent_rename(
     }
     session.title = input.title.trim().into();
     session.updated_at = chrono::Utc::now();
+    state.runtime.terminals.update_session(session.clone());
+    state.runtime.update_catalog_session(session.clone());
     ok(session)
 }
 async fn agent_history(
@@ -1047,6 +1154,10 @@ async fn agent_stop(state: &Arc<AppState>, headers: &HeaderMap, kind: AgentKind,
     if let Err(e) = state.runtime.terminals.stop(id) {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
+    if let Ok(mut session) = state.runtime.session(kind, id) {
+        session.status = "ended".into();
+        state.runtime.update_catalog_session(session);
+    }
     no_content()
 }
 async fn agent_remove(
@@ -1064,6 +1175,7 @@ async fn agent_remove(
     if let Err(e) = state.runtime.delete_native(&session) {
         return fail(StatusCode::BAD_GATEWAY, e);
     }
+    state.runtime.remove_catalog_session(kind, id);
     no_content()
 }
 
@@ -1283,18 +1395,26 @@ async fn api_socket(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap,
         }
     });
     let mut updates = state.quick_note_updates.subscribe();
+    let mut catalog_updates = state.runtime.catalog_updates.subscribe();
     let outgoing_notifications = outgoing.clone();
     let notifications = tokio::spawn(async move {
-        while let Ok(event) = updates.recv().await {
-            if event.username == username
-                && outgoing_notifications
-                    .send(WsMessage::Text(
-                        json!({"type":"quick-note.update","update":event.update})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
-                    .is_err()
+        loop {
+            let message = tokio::select! {
+                event = updates.recv() => match event {
+                    Ok(event) if event.username == username => json!({"type":"quick-note.update","update":event.update}),
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                },
+                event = catalog_updates.recv() => match event {
+                    Ok((area, revision)) => json!({"type":"sessions.catalog.changed","area":area,"revision":revision}),
+                    Err(broadcast::error::RecvError::Lagged(_)) => json!({"type":"sessions.catalog.resync"}),
+                    Err(_) => break,
+                },
+            };
+            if outgoing_notifications
+                .send(WsMessage::Text(message.to_string().into()))
+                .await
+                .is_err()
             {
                 break;
             }
@@ -1904,6 +2024,15 @@ mod cli_tests {
             .get("auth_sessions", &token_hash(token))
             .unwrap();
         assert!(refreshed.expires > before);
+        let remaining = refreshed.expires - chrono::Utc::now();
+        assert!(remaining > chrono::Duration::days(30) - chrono::Duration::seconds(5));
+        assert!(remaining <= chrono::Duration::days(30));
+        assert!(
+            set_cookie(token, false, SESSION_TTL_SECS as i32)
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=2592000")
+        );
         drop(state);
         std::fs::remove_dir_all(root).unwrap();
     }

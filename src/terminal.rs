@@ -55,10 +55,20 @@ struct TerminalState {
     subscribers: usize,
 }
 
-#[derive(Default)]
 pub struct TerminalManager {
     active: RwLock<HashMap<String, Arc<Terminal>>>,
     pids: Mutex<HashMap<String, i32>>,
+    pub changes: broadcast::Sender<Session>,
+}
+
+impl Default for TerminalManager {
+    fn default() -> Self {
+        Self {
+            active: RwLock::new(HashMap::new()),
+            pids: Mutex::new(HashMap::new()),
+            changes: broadcast::channel(64).0,
+        }
+    }
 }
 
 impl TerminalManager {
@@ -113,6 +123,7 @@ impl TerminalManager {
             self.pids.lock().unwrap().insert(id.clone(), pid);
         }
         let manager = Arc::downgrade(self);
+        let _ = self.changes.send(terminal.session.read().unwrap().clone());
         std::thread::spawn(move || {
             let mut chunk = [0_u8; 4096];
             loop {
@@ -136,6 +147,10 @@ impl TerminalManager {
                 if is_current {
                     manager.active.write().unwrap().remove(&id);
                     manager.pids.lock().unwrap().remove(&id);
+                    let mut session = terminal.session.read().unwrap().clone();
+                    session.status = "ended".into();
+                    session.updated_at = chrono::Utc::now();
+                    let _ = manager.changes.send(session);
                 }
             }
         });
@@ -190,6 +205,9 @@ impl TerminalManager {
 
     pub fn stop(&self, id: &str) -> Result<()> {
         let terminal = self.active.read().unwrap().get(id).cloned();
+        let changed = terminal
+            .as_ref()
+            .map(|terminal| terminal.session.read().unwrap().clone());
         let pid = terminal
             .as_ref()
             .and_then(|terminal| terminal.child.lock().unwrap().process_id())
@@ -205,6 +223,11 @@ impl TerminalManager {
         }
         self.active.write().unwrap().remove(id);
         self.pids.lock().unwrap().remove(id);
+        if let Some(mut session) = changed {
+            session.status = "ended".into();
+            session.updated_at = chrono::Utc::now();
+            let _ = self.changes.send(session);
+        }
         Ok(())
     }
 

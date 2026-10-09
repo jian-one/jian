@@ -1,5 +1,5 @@
 type RpcResponse = { id: number; status: number; body: unknown };
-type SocketMessage = Partial<RpcResponse> & { type?: string };
+type SocketMessage = Partial<RpcResponse> & { type?: string; area?: string; revision?: number };
 type Pending = { resolve: (value: unknown) => void; reject: (error: Error) => void; timeout: number };
 
 let socket: WebSocket | null = null;
@@ -75,6 +75,7 @@ function connect(): Promise<void> {
           .catch(() => ws.close());
       }, 15 * 60 * 1000);
       resolve();
+      for (const listener of socketEvents.get('api.connected') || []) listener({ type: 'api.connected' });
     };
     ws.onmessage = event => {
       const message = parseSocketMessage(event.data);
