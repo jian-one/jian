@@ -191,6 +191,9 @@ try {
   console.log('PASS Codex quota remaining percentages, reset count, shared desktop/mobile snapshot and refresh errors (fixture data)');
   await waitFor(() => cdp.evaluate(`!!document.querySelector('nav.agent-rail button:first-child')`), 'desktop navigation after quota test');
 
+  // Headless Chrome has no physical pointer; exercise desktop terminal input before the next page reload.
+  await cdp.evaluate(`(() => { const matchMedia = window.matchMedia.bind(window); window.matchMedia = query => { const result = matchMedia(query); if (query === '(pointer: coarse), (hover: none)') Object.defineProperty(result, 'matches', { value: false }); return result; }; })()`);
+
   await clickSelector('nav.agent-rail button:first-child', 'Local agent');
   await waitFor(() => cdp.evaluate(`document.querySelector('.catalog-header strong')?.textContent === 'Local Bash'`), 'Local catalog');
   await click('新建会话');
@@ -202,6 +205,62 @@ try {
     throw new Error(`${error.message}; terminal state: ${JSON.stringify(state)}`);
   }
   await dismissUnavailableNotice();
+  await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+  await cdp.send('Browser.grantPermissions', { origin: `http://127.0.0.1:${port}`, permissions: ['clipboardReadWrite', 'clipboardSanitizedWrite'] });
+  await cdp.evaluate(`(() => {
+    const socket = window.__terminalSockets[0];
+    window.__clipboardInputs = []; window.__clipboardAttachments = []; window.__clipboardSend = socket.send;
+    socket.send = data => { const message = JSON.parse(data); if (message.type === 'input') window.__clipboardInputs.push(message.data); else if (message.type === 'attachment') window.__clipboardAttachments.push(message); else window.__clipboardSend.call(socket, data); };
+    socket.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'pty.output', payload: '\\x1b[?1002h\\x1b[?1006h' }) }));
+  })()`);
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const clipboardPoint = await cdp.evaluate(`(() => { const box = document.querySelector('.terminal .xterm-screen').getBoundingClientRect(); return { x: box.left + 100, y: box.top + 50 }; })()`);
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'right', buttons: 2, clickCount: 1, ...clipboardPoint });
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'right', buttons: 0, clickCount: 1, ...clipboardPoint });
+  const rightClickInputs = await cdp.evaluate(`window.__clipboardInputs`);
+  if (rightClickInputs.length) throw new Error('browser right click reached the PTY in Codex mouse mode: ' + JSON.stringify(rightClickInputs));
+  console.log('PASS Codex mouse mode leaves right click to the browser');
+  await cdp.evaluate(`navigator.clipboard.writeText('BEFORE_TERMINAL_COPY')`);
+  const copiedText = 'Codex 终端复制 👋';
+  const osc52 = '\x1b]52;c;' + Buffer.from(copiedText).toString('base64') + '\x07';
+  await cdp.evaluate(`window.__terminalSockets[0].dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'pty.output', payload: ${JSON.stringify(osc52)} }) }))`);
+  await waitFor(() => cdp.evaluate(`navigator.clipboard.readText().then(text => text === ${JSON.stringify(copiedText)})`), 'Codex OSC 52 copy reaches the browser clipboard', 3000);
+  console.log('PASS terminal OSC 52 copy reaches the browser clipboard');
+  const clipboardKey = async (key, modifiers = 2) => {
+    const params = { key, code: 'Key' + key.toUpperCase(), modifiers, windowsVirtualKeyCode: key.toUpperCase().charCodeAt(0) };
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', ...params });
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...params });
+  };
+  await clipboardKey('v');
+  await waitFor(() => cdp.evaluate(`window.__clipboardInputs.length > 0`), 'native browser text paste');
+  const pastedText = await cdp.evaluate(`window.__clipboardInputs.map(text => text.replaceAll('\\x1b[200~', '').replaceAll('\\x1b[201~', ''))`);
+  if (JSON.stringify(pastedText) !== JSON.stringify([copiedText])) throw new Error('copied terminal text was not pasted exactly once: ' + JSON.stringify(pastedText));
+  await cdp.evaluate(`(async () => { const canvas = document.createElement('canvas'); canvas.width = canvas.height = 1; const blob = await new Promise(resolve => canvas.toBlob(resolve)); await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]); })()`);
+  await clipboardKey('v');
+  await waitFor(() => cdp.evaluate(`window.__clipboardAttachments.length === 1`), 'native browser image paste');
+  if (!await cdp.evaluate(`window.__clipboardAttachments[0].mime === 'image/png' && !!window.__clipboardAttachments[0].data`)) throw new Error('clipboard image was not sent as an attachment');
+  console.log('PASS copied terminal text pastes once and clipboard images use the attachment path');
+  await cdp.evaluate(`(() => { window.__systemClipboard = navigator.clipboard; Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined }); })()`);
+  const fallbackCopy = '\x1b]52;c;' + Buffer.from('COPY_WITHOUT_CLIPBOARD_API').toString('base64') + '\x1b\\';
+  await cdp.evaluate(`window.__terminalSockets[0].dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'pty.output', payload: ${JSON.stringify(fallbackCopy)} }) }))`);
+  await waitFor(() => cdp.evaluate(`window.__systemClipboard.readText().then(text => text === 'COPY_WITHOUT_CLIPBOARD_API')`), 'clipboard copy fallback', 3000);
+  await cdp.evaluate(`delete navigator.clipboard`);
+  await cdp.evaluate(`(() => { window.__clipboardInputs = []; window.__terminalSockets[0].dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'pty.output', payload: '\\x1b]52;c;?\\x07\\x1b]52;c;invalid base64!\\x07' }) })); })()`);
+  await new Promise(resolve => setTimeout(resolve, 100));
+  if (!await cdp.evaluate(`navigator.clipboard.readText().then(text => text === 'COPY_WITHOUT_CLIPBOARD_API' && !window.__clipboardInputs.length)`)) throw new Error('terminal clipboard query or malformed data changed or exposed clipboard content');
+  console.log('PASS clipboard fallback works and terminal read/malformed requests are ignored');
+  await cdp.evaluate(`window.__terminalSockets[0].dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'pty.output', payload: '\\x1b[2J\\x1b[HJIAN_COPY_SELECTION\\r\\n' }) }))`);
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const selectionPoint = await cdp.evaluate(`(() => { const box = document.querySelector('.terminal .xterm-screen').getBoundingClientRect(); return { x: box.left + 20, y: box.top + 8 }; })()`);
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', buttons: 1, modifiers: 8, clickCount: 2, ...selectionPoint });
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', buttons: 0, modifiers: 8, clickCount: 2, ...selectionPoint });
+  await clipboardKey('c');
+  await waitFor(() => cdp.evaluate(`navigator.clipboard.readText().then(text => text === 'JIAN_COPY_SELECTION')`), 'xterm selection copy', 3000);
+  if (await cdp.evaluate(`window.__clipboardInputs.includes('\\x03')`)) throw new Error('copying an xterm selection interrupted the terminal');
+  await clipboardKey('c');
+  if (!await cdp.evaluate(`window.__clipboardInputs.includes('\\x03')`)) throw new Error('Ctrl+C without a selection no longer interrupts the terminal');
+  console.log('PASS xterm selection copy consumes Ctrl+C while unselected Ctrl+C keeps interrupt semantics');
+  await cdp.evaluate(`(() => { const socket = window.__terminalSockets[0]; socket.send = window.__clipboardSend; socket.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'pty.output', payload: '\\x1b[?1002l\\x1b[?1006l' }) })); })()`);
   await cdp.evaluate(`new Promise((resolve, reject) => {
     const id = localStorage.getItem('jian.active_local_session');
     const socket = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/local/sessions/' + encodeURIComponent(id) + '/terminal');

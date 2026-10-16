@@ -19,6 +19,7 @@ type MountOptions = {
   theme: TerminalTheme;
   fontSize: number;
   focus: () => void;
+  copyToClipboard: (text: string) => void;
   send: (data: string) => boolean;
   sendText: (data: string) => boolean;
   onUnsentText?: (text: string) => void;
@@ -31,7 +32,7 @@ type MountOptions = {
 };
 
 export function mountTerminal(options: MountOptions) {
-  const { host, inputBuffer, preview, terminalRef, socketRef, fitRequestRef, sessionID, terminalPath, theme, fontSize, focus, send, sendText, onUnsentText, onBufferChange, onStatus, onConnectionChange, reconnectRequestRef, onProgress, onSearchAddon } = options;
+  const { host, inputBuffer, preview, terminalRef, socketRef, fitRequestRef, sessionID, terminalPath, theme, fontSize, focus, copyToClipboard, send, sendText, onUnsentText, onBufferChange, onStatus, onConnectionChange, reconnectRequestRef, onProgress, onSearchAddon } = options;
   onProgress('正在建立终端连接…');
   const touchInput = window.matchMedia('(pointer: coarse), (hover: none)').matches;
   const term = new Terminal({ cursorBlink: true, disableStdin: true, fontSize, theme: terminalThemes[theme], scrollback: 10000 });
@@ -39,26 +40,24 @@ export function mountTerminal(options: MountOptions) {
   // of sending SIGINT. With no selection xterm keeps its normal control byte.
   term.attachCustomKeyEventHandler(event => {
     if (event.type === 'keydown' && event.ctrlKey && !event.altKey && !event.metaKey && event.key.toLowerCase() === 'c' && term.hasSelection()) {
-      const selected = term.getSelection();
-      const clipboardWrite = navigator.clipboard?.writeText(selected);
-      const fallbackCopy = () => {
-        const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-        const copy = document.createElement('textarea');
-        copy.value = selected;
-        copy.readOnly = true;
-        copy.style.position = 'fixed';
-        copy.style.opacity = '0';
-        document.body.append(copy);
-        copy.select();
-        try { document.execCommand('copy'); } catch {}
-        copy.remove();
-        if (previous?.isConnected) previous.focus({ preventScroll: true });
-      };
-      if (clipboardWrite) void clipboardWrite.catch(fallbackCopy); else fallbackCopy();
+      event.preventDefault();
+      copyToClipboard(term.getSelection());
       term.clearSelection();
       return false;
     }
     return !isPasteShortcut(event);
+  });
+  const clipboard = term.parser.registerOscHandler(52, data => {
+    // Replayed or unsolicited output must not change or read the browser clipboard.
+    if (term.options.disableStdin || document.hidden || !host.contains(document.activeElement) || navigator.userActivation?.isActive === false) return true;
+    const separator = data.indexOf(';');
+    const selection = data.slice(0, separator), encoded = data.slice(separator + 1);
+    if (separator < 0 || !['', 'c'].includes(selection) || encoded === '?' || encoded.length > 1024 * 1024) return true;
+    try {
+      const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0));
+      copyToClipboard(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    } catch {}
+    return true;
   });
   terminalRef.current = term;
   const fit = new FitAddon();
@@ -72,6 +71,19 @@ export function mountTerminal(options: MountOptions) {
     } catch {}
   }));
   term.open(host);
+  const browserContextMenu = (event: MouseEvent) => {
+    if (event.button !== 2 || touchInput) return;
+    event.stopPropagation();
+    const textarea = term.textarea, screen = host.querySelector('.xterm-screen');
+    if (!textarea || !screen) return;
+    // Place xterm's input under the pointer so the native menu offers copy/paste, including in Firefox.
+    const box = screen.getBoundingClientRect();
+    Object.assign(textarea.style, { width: '20px', height: '20px', left: `${event.clientX - box.left - 10}px`, top: `${event.clientY - box.top - 10}px`, zIndex: '1000' });
+    textarea.value = term.getSelection();
+    textarea.focus({ preventScroll: true });
+    textarea.select();
+  };
+  host.addEventListener('mousedown', browserContextMenu, true);
   onSearchAddon(search);
   let webgl: WebglAddon | undefined;
   try {
@@ -286,6 +298,8 @@ export function mountTerminal(options: MountOptions) {
     window.clearInterval(heartbeatTimer);
     window.clearTimeout(pongTimer);
     inputCleanup?.();
+    host.removeEventListener('mousedown', browserContextMenu, true);
+    clipboard.dispose();
     input.dispose(); scrolled.dispose(); written.dispose();
     render.dispose();
     resizeObserver?.disconnect();

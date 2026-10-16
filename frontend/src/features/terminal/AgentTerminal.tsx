@@ -11,7 +11,6 @@ import { initialTerminalFontSize, connectionView, type ConnectionFeedback, type 
 import { TerminalFontSizeControl } from "../../shared/ui/TerminalFontSizeControl";
 import { mountTerminal } from "./mountTerminal";
 import { terminalThemeColors, terminalThemes, type TerminalTheme } from "./themes";
-import { isPasteShortcut } from "../../terminal-input-buffer";
 
 export function AgentTerminal({
   session,
@@ -89,28 +88,33 @@ export function AgentTerminal({
       inputBufferRef.current.focus({ preventScroll: true });
     else termRef.current?.focus();
   };
-  const copySelection = () => {
-    const term = termRef.current;
-    if (!term?.hasSelection()) return false;
-    const selected = term.getSelection();
+  const copyToClipboard = (text: string) => {
+    setOperationMessage('');
     const fallback = () => {
       const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
       const copy = document.createElement("textarea");
-      copy.value = selected;
+      copy.value = text;
       copy.readOnly = true;
       copy.style.position = "fixed";
       copy.style.opacity = "0";
       document.body.append(copy);
       copy.select();
+      let copied = false;
       try {
-        document.execCommand("copy");
+        copied = document.execCommand("copy");
       } catch {}
       copy.remove();
       if (previous?.isConnected) previous.focus({ preventScroll: true });
+      if (!copied) setOperationMessage('复制失败，请按住 Shift 选择终端文本后使用系统复制。');
     };
-    const pending = navigator.clipboard?.writeText(selected);
+    const pending = navigator.clipboard?.writeText(text);
     if (pending) void pending.catch(fallback);
     else fallback();
+  };
+  const copySelection = () => {
+    const term = termRef.current;
+    if (!term?.hasSelection()) return false;
+    copyToClipboard(term.getSelection());
     term.clearSelection();
     return true;
   };
@@ -206,7 +210,7 @@ export function AgentTerminal({
       pasteText(text);
       return;
     }
-    try { document.execCommand("paste"); } catch {}
+    if (!event) try { document.execCommand("paste"); } catch {}
   };
   useEffect(() => {
     if (!host.current) return;
@@ -222,6 +226,7 @@ export function AgentTerminal({
       theme: terminalTheme,
       fontSize,
       focus,
+      copyToClipboard,
       send: data => sendRef.current(data),
       sendText: data => mobileRef.current && inputModeRef.current !== 'direct' ? false : sendRef.current(data),
       onUnsentText: data => unsentRef.current?.(data),
@@ -385,12 +390,11 @@ export function AgentTerminal({
       </div>
       <div
         className="terminal-stage"
-        onKeyDownCapture={event => {
-          if (!isPasteShortcut(event.nativeEvent)) return;
+        onPasteCapture={event => {
           event.preventDefault();
-          void pasteClipboard();
+          event.stopPropagation();
+          void pasteClipboard(event.nativeEvent);
         }}
-        onPaste={event => void pasteClipboard(event.nativeEvent)}
       >
         <button
           className="terminal-search-toggle"

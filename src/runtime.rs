@@ -671,18 +671,21 @@ fn merge_sessions(mut native: Vec<Session>, live: Vec<Session>) -> Vec<Session> 
             if !live.native_id.is_empty() {
                 return session_key(found) == session_key(&live);
             }
+            let age = (found.created_at - live.created_at).num_seconds().abs();
+            // shortcut: matches within five minutes because launches lack native IDs; use a Codex-provided ID when available.
             found.kind == live.kind
                 && found.workspace == live.workspace
                 && found.agent_id == live.agent_id
-                && found.created_at + chrono::Duration::seconds(1) >= live.created_at
+                && age <= 5 * 60
         };
-        let candidates: Vec<_> = native
+        let candidate = native
             .iter()
             .enumerate()
-            .filter_map(|(index, found)| matches(found).then_some(index))
-            .collect();
-        if candidates.len() == 1 {
-            let mut found = native.remove(candidates[0]);
+            .filter(|(_, found)| matches(found))
+            .min_by_key(|(_, found)| (found.created_at - live.created_at).num_seconds().abs())
+            .map(|(index, _)| index);
+        if let Some(index) = candidate {
+            let mut found = native.remove(index);
             found.id = live.id;
             found.status = "running".into();
             found.yolo = live.yolo;
@@ -986,7 +989,7 @@ mod tests {
         native.id = "native-thread-1".into();
         native.native_id = "thread-1".into();
         native.title = "默认标题".into();
-        native.created_at += chrono::Duration::seconds(1);
+        native.created_at += chrono::Duration::seconds(30);
 
         let sessions = merge_sessions(vec![native], vec![live.clone()]);
 
@@ -994,6 +997,19 @@ mod tests {
         assert_eq!(sessions[0].id, live.id);
         assert_eq!(sessions[0].native_id, "thread-1");
         assert_eq!(sessions[0].title, "默认标题");
+    }
+
+    #[test]
+    fn unrelated_native_session_is_not_merged_with_a_later_terminal() {
+        let live = Session::new(AgentKind::Codex, "/work".into(), "无标题".into());
+        let mut native = live.clone();
+        native.id = "native-old-thread".into();
+        native.native_id = "old-thread".into();
+        native.created_at -= chrono::Duration::minutes(10);
+
+        let sessions = merge_sessions(vec![native], vec![live]);
+
+        assert_eq!(sessions.len(), 2);
     }
 
     #[test]
