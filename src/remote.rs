@@ -1,8 +1,8 @@
-use std::{collections::HashMap, sync::RwLock};
+use std::{collections::HashMap, sync::RwLock, time::Duration};
 
 use anyhow::{Result, anyhow};
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 struct Connection {
     id: String,
@@ -13,6 +13,7 @@ struct Connection {
 pub struct RemoteHub {
     connections: RwLock<HashMap<String, Connection>>,
     sessions: RwLock<HashMap<String, broadcast::Sender<String>>>,
+    requests: RwLock<HashMap<String, (String, oneshot::Sender<Value>)>>,
 }
 
 impl RemoteHub {
@@ -66,6 +67,44 @@ impl RemoteHub {
             .ok_or_else(|| anyhow!("主机当前未连接"))?;
         connection.sender.send(command.to_string())?;
         Ok(())
+    }
+
+    pub async fn request(&self, host_id: &str, command: Value) -> Result<Value> {
+        let request_id = command
+            .get("request_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("remote request ID is missing"))?
+            .to_owned();
+        let (reply, response) = oneshot::channel();
+        self.requests
+            .write()
+            .unwrap()
+            .insert(request_id.clone(), (host_id.to_owned(), reply));
+        if let Err(error) = self.send(host_id, command) {
+            self.requests.write().unwrap().remove(&request_id);
+            return Err(error);
+        }
+        match tokio::time::timeout(Duration::from_secs(10), response).await {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(_)) => Err(anyhow!("remote host closed the request")),
+            Err(_) => {
+                self.requests.write().unwrap().remove(&request_id);
+                Err(anyhow!("remote host request timed out"))
+            }
+        }
+    }
+
+    pub fn respond(&self, host_id: &str, request_id: &str, response: Value) -> bool {
+        let mut requests = self.requests.write().unwrap();
+        if !requests
+            .get(request_id)
+            .is_some_and(|(expected_host, _)| expected_host == host_id)
+        {
+            return false;
+        }
+        requests
+            .remove(request_id)
+            .is_some_and(|(_, reply)| reply.send(response).is_ok())
     }
 
     pub fn subscribe(&self, session_id: &str) -> broadcast::Receiver<String> {
@@ -122,5 +161,27 @@ mod tests {
         let command: Value = serde_json::from_str(&commands.try_recv().unwrap()).unwrap();
         assert_eq!(command["type"], "pty.input");
         assert_eq!(command["session_id"], "s1");
+    }
+
+    #[tokio::test]
+    async fn remote_requests_only_accept_responses_from_the_target_host() {
+        let hub = std::sync::Arc::new(RemoteHub::default());
+        let (_, mut commands) = hub.connect("host-1".into());
+        let requester = hub.clone();
+        let pending = tokio::spawn(async move {
+            requester
+                .request(
+                    "host-1",
+                    serde_json::json!({"type":"workspace.browse","request_id":"request-1"}),
+                )
+                .await
+                .unwrap()
+        });
+
+        let command: Value = serde_json::from_str(&commands.recv().await.unwrap()).unwrap();
+        assert_eq!(command["type"], "workspace.browse");
+        assert!(!hub.respond("host-2", "request-1", serde_json::json!({"wrong":true})));
+        assert!(hub.respond("host-1", "request-1", serde_json::json!({"ok":true})));
+        assert_eq!(pending.await.unwrap()["ok"], true);
     }
 }

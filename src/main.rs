@@ -253,6 +253,10 @@ fn api_routes(state: Arc<AppState>) -> Router {
         .route("/api/auth/status", get(auth_status))
         .route("/api/auth/me", get(me))
         .route("/api/workspaces/browse", get(browse))
+        .route(
+            "/api/hosts/{id}/workspaces/browse",
+            get(browse_remote_workspace),
+        )
         .route("/api/workspaces/file", get(read_workspace_file))
         .route("/api/hosts", get(list_hosts).post(register_host))
         .route("/api/hosts/{id}", delete(remove_host))
@@ -996,6 +1000,97 @@ async fn browse(
     ok(json!({"path":path,"parent":parent.to_string_lossy(),"entries":values}))
 }
 
+async fn browse_remote_workspace(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(host_id): AxumPath<String>,
+    Query(query): Query<BrowseQuery>,
+) -> Api {
+    require(&state, &headers)?;
+    if query.path.len() > 4096 {
+        return fail(StatusCode::BAD_REQUEST, "path is too long");
+    }
+    match query.r#type.as_str() {
+        "all" | "dir" | "directory" | "file" => {}
+        value => return fail(StatusCode::BAD_REQUEST, format!("invalid type: {value}")),
+    }
+    let file_ext = query
+        .file_ext
+        .as_deref()
+        .map(|value| value.trim_start_matches('.').to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    if file_ext.as_ref().is_some_and(|value| value.len() > 32) {
+        return fail(StatusCode::BAD_REQUEST, "file extension is too long");
+    }
+    if !state
+        .hosts
+        .read()
+        .unwrap()
+        .iter()
+        .any(|host| host.id == host_id)
+    {
+        return fail(StatusCode::NOT_FOUND, "registered host not found");
+    }
+    if !state.runtime.remote.is_connected(&host_id) {
+        return fail(StatusCode::SERVICE_UNAVAILABLE, "目标主机当前未连接");
+    }
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response = match state
+        .runtime
+        .remote
+        .request(
+            &host_id,
+            json!({
+                "type":"workspace.browse",
+                "request_id":request_id,
+                "path":query.path,
+                "filter":query.r#type,
+                "file_ext":file_ext,
+            }),
+        )
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "远程目录请求未完成，请更新 jian-client 并检查 WAF WebSocket 双向转发：{error}"
+                ),
+            );
+        }
+    };
+    match response.get("type").and_then(Value::as_str) {
+        Some("workspace.browse.result") => match response.get("result") {
+            Some(result) => ok(result.clone()),
+            None => fail(
+                StatusCode::BAD_GATEWAY,
+                "remote host returned an invalid directory",
+            ),
+        },
+        Some("workspace.browse.error") => {
+            let status = response
+                .get("status")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .and_then(|value| StatusCode::from_u16(value).ok())
+                .filter(|status| status.is_client_error() || status.is_server_error())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            fail(
+                status,
+                response
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("remote directory request failed"),
+            )
+        }
+        _ => fail(
+            StatusCode::BAD_GATEWAY,
+            "remote host returned an invalid directory",
+        ),
+    }
+}
+
 #[derive(Deserialize)]
 struct WorkspaceFileQuery {
     path: String,
@@ -1388,6 +1483,24 @@ fn modify_remote_sessions<T>(
     state.store.put("remote_sessions", "all", &next)?;
     *current = next;
     Ok(result)
+}
+
+fn update_remote_session_status(
+    sessions: &mut [Session],
+    host_id: &str,
+    session_id: &str,
+    run_id: &str,
+    status: &str,
+) -> Option<(Session, bool)> {
+    let session = sessions.iter_mut().find(|session| {
+        session.id == session_id && session.host_id == host_id && session.run_id == run_id
+    })?;
+    if session.status == status {
+        return Some((session.clone(), false));
+    }
+    session.status = status.into();
+    session.updated_at = chrono::Utc::now();
+    Some((session.clone(), true))
 }
 
 async fn stop_remote_session(state: &AppState, session: &Session) -> Result<()> {
@@ -2042,7 +2155,13 @@ async fn remote_client_socket(socket: WebSocket, state: Arc<AppState>, host: Reg
                                 Err(error) => tracing::error!(%error, "could not reconcile remote sessions"),
                             }
                         }
-                        Some("pty.output" | "pty.exit" | "pty.stopped" | "session.started" | "session.replay.complete") if handshaken => {
+                        Some("workspace.browse.result" | "workspace.browse.error") if handshaken => {
+                            let request_id = value.get("request_id").and_then(Value::as_str).unwrap_or_default().to_owned();
+                            if !request_id.is_empty() && request_id.len() <= 64 {
+                                state.runtime.remote.respond(&host.id, &request_id, value);
+                            }
+                        }
+                        Some("pty.output" | "pty.exit" | "pty.stopped" | "pty.input.error" | "session.started" | "session.replay.complete") if handshaken => {
                             let session_id = value.get("session_id").and_then(Value::as_str).unwrap_or_default();
                             let run_id = value.get("run_id").and_then(Value::as_str).unwrap_or_default();
                             if session_id.is_empty() || run_id.is_empty() { continue; }
@@ -2054,21 +2173,17 @@ async fn remote_client_socket(socket: WebSocket, state: Arc<AppState>, host: Reg
                             } else { None };
                             let updated = if let Some(status) = status_update {
                                 match modify_remote_sessions(&state, |sessions| {
-                                    let Some(session) = sessions.iter_mut().find(|session| session.id == session_id && session.host_id == host.id && session.run_id == run_id) else { return Ok(None) };
-                                    if session.status == status { return Ok(None); }
-                                    session.status = status.into();
-                                    session.updated_at = chrono::Utc::now();
-                                    Ok(Some(session.clone()))
+                                    Ok(update_remote_session_status(sessions, &host.id, session_id, run_id, status))
                                 }) {
                                     Ok(session) => session,
                                     Err(error) => { tracing::error!(%error, "could not persist remote session state"); continue; }
                                 }
                             } else {
-                                state.remote_sessions.read().unwrap().iter().find(|session| session.id == session_id && session.host_id == host.id && session.run_id == run_id).cloned()
+                                state.remote_sessions.read().unwrap().iter().find(|session| session.id == session_id && session.host_id == host.id && session.run_id == run_id).cloned().map(|session| (session, false))
                             };
-                            let Some(session) = updated else { continue; };
-                            if matches!(event_type, "pty.exit" | "pty.stopped" | "session.started") {
-                                state.runtime.update_catalog_session(session);
+                            let Some((session, changed)) = updated else { continue; };
+                            if changed {
+                                state.runtime.update_catalog_session(session.clone());
                             }
                             state.runtime.remote.publish(session_id, text.to_string());
                         }
@@ -2841,6 +2956,21 @@ fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
 mod cli_tests {
     use super::*;
     use yrs::Text;
+
+    #[test]
+    fn duplicate_remote_running_status_remains_available_for_event_forwarding() {
+        let mut session = Session::new(AgentKind::Codex, "/Users/test".into(), "Codex".into());
+        session.host_id = "host-1".into();
+        session.run_id = "run-1".into();
+        session.status = "running".into();
+        let mut sessions = vec![session];
+        let session_id = sessions[0].id.clone();
+
+        let event =
+            update_remote_session_status(&mut sessions, "host-1", &session_id, "run-1", "running");
+
+        assert_eq!(event.map(|(_, changed)| changed), Some(false));
+    }
 
     #[test]
     fn help_documents_commands_and_aliases() {

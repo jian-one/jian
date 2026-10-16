@@ -317,6 +317,95 @@ fn expand_home_path(value: &str, home: Option<&std::path::Path>) -> std::path::P
     }
 }
 
+fn remote_workspace_browse(
+    value: &str,
+    filter: &str,
+    file_ext: Option<&str>,
+) -> std::result::Result<Value, (u16, String)> {
+    if value.is_empty() || value.len() > 4096 {
+        return Err((400, "path is empty or too long".into()));
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| (400, "remote home directory is unavailable".into()))?;
+    let home = std::fs::canonicalize(&home).map_err(|error| (500, error.to_string()))?;
+    let requested = expand_home_path(value, Some(&home));
+    let requested = if requested.is_absolute() {
+        requested
+    } else {
+        home.join(requested)
+    };
+    let path = std::fs::canonicalize(requested).map_err(|error| {
+        (
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                403
+            } else {
+                400
+            },
+            error.to_string(),
+        )
+    })?;
+    if !path.starts_with(&home) {
+        return Err((403, "path is outside the home directory".into()));
+    }
+    if !path.is_dir() {
+        return Err((400, "path is not a directory".into()));
+    }
+    let directory_filter = match filter {
+        "all" => None,
+        "dir" | "directory" => Some(true),
+        "file" => Some(false),
+        _ => return Err((400, "invalid directory filter".into())),
+    };
+    let file_ext = file_ext
+        .map(|value| value.trim_start_matches('.').to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    if file_ext.as_ref().is_some_and(|value| value.len() > 32) {
+        return Err((400, "file extension is too long".into()));
+    }
+    let entries = std::fs::read_dir(&path).map_err(|error| {
+        (
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                403
+            } else {
+                400
+            },
+            error.to_string(),
+        )
+    })?;
+    let values: Vec<_> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let directory = entry.file_type().ok()?.is_dir();
+            if directory_filter.is_some_and(|want_directory| directory != want_directory) {
+                return None;
+            }
+            if !directory
+                && let Some(extension) = &file_ext
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .as_deref()
+                    != Some(extension)
+            {
+                return None;
+            }
+            Some(json!({"name":entry.file_name().to_string_lossy(),"directory":directory}))
+        })
+        .collect();
+    let parent = path
+        .parent()
+        .filter(|parent| parent.starts_with(&home))
+        .unwrap_or(&home);
+    Ok(json!({
+        "path":path.to_string_lossy(),
+        "parent":parent.to_string_lossy(),
+        "entries":values,
+    }))
+}
+
 async fn connect(
     endpoint: &str,
     token: &str,
@@ -405,6 +494,31 @@ fn handle_command(
             "this jian-client version is incompatible with the server; upgrade both binaries"
         );
         return true;
+    }
+    if kind == "workspace.browse" {
+        let request_id = command
+            .get("request_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if request_id.is_empty() || request_id.len() > 64 {
+            return false;
+        }
+        let result = remote_workspace_browse(
+            command
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+            command
+                .get("filter")
+                .and_then(Value::as_str)
+                .unwrap_or("all"),
+            command.get("file_ext").and_then(Value::as_str),
+        );
+        *response = Some(match result {
+            Ok(result) => json!({"type":"workspace.browse.result","request_id":request_id,"result":result}).to_string(),
+            Err((status, error)) => json!({"type":"workspace.browse.error","request_id":request_id,"status":status,"error":error}).to_string(),
+        });
+        return false;
     }
     let session = command
         .get("session_id")
@@ -535,16 +649,23 @@ fn handle_command(
             }
         }
         "pty.input" => {
-            if let (Some(terminal), Some(data)) = (
-                terminals
+            if let Some(data) = command.get("data").and_then(Value::as_str) {
+                let terminal = terminals
                     .lock()
                     .unwrap()
                     .get(session)
                     .filter(|terminal| terminal.run_id == run_id)
-                    .cloned(),
-                command.get("data").and_then(Value::as_str),
-            ) {
-                let _ = terminal.write(data);
+                    .cloned();
+                let error = match terminal {
+                    Some(terminal) => terminal.write(data).err().map(|error| {
+                        let seq = terminal.record_output(&[]);
+                        (seq, error.to_string())
+                    }),
+                    None => Some((0, "remote terminal is not running".into())),
+                };
+                if let Some((seq, error)) = error {
+                    let _ = outgoing.try_send(json!({"session_id":session,"run_id":run_id,"seq":seq,"type":"pty.input.error","payload":error}).to_string());
+                }
             }
         }
         "pty.attachment" => {
@@ -734,6 +855,37 @@ mod tests {
             expand_home_path("~/work", None),
             std::path::PathBuf::from("~/work")
         );
+    }
+
+    #[test]
+    fn remote_workspace_browse_lists_directories_inside_home() {
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .expect("test home directory");
+        let home = std::fs::canonicalize(home).unwrap();
+        let path = home.join(format!(".jian-browse-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&path).unwrap();
+        std::fs::create_dir(path.join("project")).unwrap();
+
+        let result = remote_workspace_browse(path.to_str().unwrap(), "dir", None);
+        let (outgoing, _receiver) = mpsc::channel(1);
+        let mut response = None;
+        let command = json!({"type":"workspace.browse","request_id":"browse-1","path":path.to_string_lossy()}).to_string();
+        assert!(!handle_command(
+            &command,
+            &Arc::new(Mutex::new(HashMap::new())),
+            &outgoing,
+            &mut response,
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let result = result.unwrap();
+        let protocol: Value = serde_json::from_str(&response.unwrap()).unwrap();
+
+        assert_eq!(result["path"], path.to_string_lossy().as_ref());
+        assert_eq!(result["entries"][0]["name"], "project");
+        assert_eq!(result["entries"][0]["directory"], true);
+        assert_eq!(protocol["type"], "workspace.browse.result");
+        assert_eq!(protocol["result"]["entries"][0]["name"], "project");
     }
 
     #[test]

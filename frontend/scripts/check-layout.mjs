@@ -32,6 +32,7 @@ const checks = [
   ['mobile navigation uses a controlled Radix drawer', main.includes('mobileNavigationOpen') && navigation.includes('Dialog.Root open={navigationOpen}') && navigation.includes('onCloseAutoFocus')],
   ['mobile terminal uses its dedicated IME input buffer', terminal.includes('attachTerminalInputBuffer') && terminal.includes('xtermTextarea.disabled = touchInput')],
   ['terminal focus does not steal focus from dialogs', main.includes('[role="dialog"][aria-modal="true"]')],
+  ['remote PTY startup and input errors reach the user', terminal.includes('message.type === \'pty.input.error\'') && terminal.includes('message.payload.slice(0, 300)') && terminal.includes('终端已结束${reason}')],
   ['terminal search and navigation use the Search addon', terminal.includes("from '@xterm/addon-search'") && main.includes('aria-label="搜索终端输出"') && main.includes('findPrevious') && main.includes('findNext')],
   ['terminal links are restricted to HTTP(S) and WebGL loss falls back safely', terminal.includes("from '@xterm/addon-web-links'") && terminal.includes("from '@xterm/addon-webgl'") && terminal.includes("url.protocol === 'http:'") && terminal.includes("url.protocol === 'https:'") && terminal.includes('onContextLoss(() => addon.dispose())')],
   ['terminal status and release controls remain available', main.includes('terminal-status-menu') && main.includes('释放会话')],
@@ -43,6 +44,7 @@ const checks = [
   ['navigation records the actual catalog scroll container', navigation.includes('ref={setListNode} className="catalog-list"') && !main.includes('sidebarRef.current.scrollTop')],
   ['keyboard focus and reduced motion remain styled', css.includes(':focus-visible') && css.includes('prefers-reduced-motion: reduce')],
   ['workspace uses Radix and Agent shortcuts open the unified settings view', app.includes('targetAgent={settingsTarget}') && main.includes('Dialog.Root open onOpenChange') && main.includes('Dialog.Content className="workspace-picker"') && !main.includes('useDialogFocus')],
+  ['remote workspace picker browses the selected host', main.includes('/hosts/${encodeURIComponent(hostId)}/workspaces/browse') && main.includes('if (remoteHost?.connected) void browse(home)') && main.includes('<div className="directory-list" aria-busy={loading}>')],
   ['settings saves lock navigation and preserve other drafts', main.includes('settingsBusyRef') && main.includes('locked={settingsBusy || creating || operationBusy}') && settings.includes('mergeSettingsFields(value, saved, fields)') && settings.includes('disabled={busy}')],
   ['mobile dialog viewport updates are coalesced and forms scroll inside fixed actions', main.includes("--dialog-viewport-height") && css.includes('.workspace-picker-body') && css.includes('overscroll-behavior: contain')],
 ];

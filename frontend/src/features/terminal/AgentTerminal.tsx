@@ -230,6 +230,7 @@ export function AgentTerminal({
       send: data => sendRef.current(data),
       sendText: data => mobileRef.current && inputModeRef.current !== 'direct' ? false : sendRef.current(data),
       onUnsentText: data => unsentRef.current?.(data),
+      onInputError: message => setOperationMessage(`远程终端输入失败：${message}`),
       onBufferChange: value => setBehind(value),
       onStatus,
       reconnectRequestRef,

@@ -23,6 +23,7 @@ type MountOptions = {
   send: (data: string) => boolean;
   sendText: (data: string) => boolean;
   onUnsentText?: (text: string) => void;
+  onInputError: (message: string) => void;
   onBufferChange: (behind: boolean) => void;
   onStatus: (value: 'running' | 'ended') => void;
   onConnectionChange: (value: ConnectionFeedback) => void;
@@ -32,7 +33,7 @@ type MountOptions = {
 };
 
 export function mountTerminal(options: MountOptions) {
-  const { host, inputBuffer, preview, terminalRef, socketRef, fitRequestRef, sessionID, terminalPath, theme, fontSize, focus, copyToClipboard, send, sendText, onUnsentText, onBufferChange, onStatus, onConnectionChange, reconnectRequestRef, onProgress, onSearchAddon } = options;
+  const { host, inputBuffer, preview, terminalRef, socketRef, fitRequestRef, sessionID, terminalPath, theme, fontSize, focus, copyToClipboard, send, sendText, onUnsentText, onInputError, onBufferChange, onStatus, onConnectionChange, reconnectRequestRef, onProgress, onSearchAddon } = options;
   onProgress('正在建立终端连接…');
   const touchInput = window.matchMedia('(pointer: coarse), (hover: none)').matches;
   const term = new Terminal({ cursorBlink: true, disableStdin: true, fontSize, theme: terminalThemes[theme], scrollback: 10000 });
@@ -226,7 +227,11 @@ export function mountTerminal(options: MountOptions) {
       }
       if (message.type === 'pty.exit') {
         ended = true; term.options.disableStdin = true; clearConnectionTimers();
-        onStatus('ended'); onConnectionChange({ state: 'ended', attempt: 0, retrying: false }); onProgress('终端已结束');
+        const reason = typeof message.payload === 'string' && message.payload !== 'terminal exited' ? `：${message.payload.slice(0, 300)}` : '';
+        onStatus('ended'); onConnectionChange({ state: 'ended', attempt: 0, retrying: false }); onProgress(`终端已结束${reason}`);
+      }
+      if (message.type === 'pty.input.error') {
+        onInputError(typeof message.payload === 'string' ? message.payload.slice(0, 300) : '远程终端拒绝输入');
       }
       if (message.type === 'session.started' && !ended) {
         if (message.payload?.running === false) {

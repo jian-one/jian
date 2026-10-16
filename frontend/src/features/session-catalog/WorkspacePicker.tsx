@@ -57,9 +57,8 @@ export function WorkspacePicker({
     setBrowseReady(false);
     setError("");
     try {
-      const r = await api<BrowseResult>(
-        `/workspaces/browse?path=${encodeURIComponent(path)}`,
-      );
+      const endpoint = remote ? `/hosts/${encodeURIComponent(hostId)}/workspaces/browse` : "/workspaces/browse";
+      const r = await api<BrowseResult>(`${endpoint}?path=${encodeURIComponent(path)}`);
       if (!isCurrentSessionLoad(browseVersion.current, version)) return;
       setCurrent(r.path);
       setParent(r.parent);
@@ -73,14 +72,6 @@ export function WorkspacePicker({
       if (isCurrentSessionLoad(browseVersion.current, version))
         setLoading(false);
     }
-  };
-  const choosePath = (path: string) => {
-    if (!remote) { void browse(path); return; }
-    setCurrent(path);
-    setManual(path);
-    setBrowseReady(!!path.trim());
-    setEntries([]);
-    setError("");
   };
   const loadArgs = async () => {
     if (readingArgs.current) return;
@@ -120,8 +111,9 @@ export function WorkspacePicker({
     invalidateSessionLoads(browseVersion.current);
     if (!hostId) { void browse("~"); return; }
     const home = remoteHost?.home || "~";
-    setCurrent(home); setManual(home); setParent(""); setEntries([]); setLoading(false); setError(""); setBrowseReady(!!home.trim());
-  }, [hostId]);
+    setCurrent(home); setManual(home); setParent(""); setEntries([]); setLoading(false); setError(""); setBrowseReady(false);
+    if (remoteHost?.connected) void browse(home);
+  }, [hostId, remoteHost?.home, remoteHost?.connected]);
   const start = async () => {
     if (starting.current || creating || !browseReady || !argsReady || loading || (remote && !remoteHost?.connected) || (kind === "command" && !agentId)) return;
     starting.current = true; submitted.current = true; setError("");
@@ -173,7 +165,7 @@ export function WorkspacePicker({
             <strong>最近使用</strong>
             <div>
               {recent.map((p) => (
-                <button key={p} onClick={() => choosePath(p)} title={p} disabled={creating}>
+                <button key={p} onClick={() => void browse(p)} title={p} disabled={creating}>
                   {p}
                 </button>
               ))}
@@ -184,7 +176,7 @@ export function WorkspacePicker({
           className="workspace-path"
           onSubmit={(e) => {
             e.preventDefault();
-            if (remote) choosePath(manual.trim()); else void browse(manual);
+            void browse(manual.trim());
           }}
         >
           <button
@@ -192,7 +184,7 @@ export function WorkspacePicker({
             aria-label="用户主目录"
             title="用户主目录"
             disabled={creating}
-            onClick={() => choosePath(remoteHost?.home || "~")}
+            onClick={() => void browse(remoteHost?.home || "~")}
           >
             <Home />
           </button>
@@ -200,7 +192,7 @@ export function WorkspacePicker({
             type="button"
             aria-label="上级目录"
             title="上级目录"
-            disabled={creating || remote || !parent || parent === current}
+            disabled={creating || loading || !parent || parent === current || (remote && !remoteHost?.connected)}
             onClick={() => void browse(parent)}
           >
             <ChevronLeft />
@@ -213,13 +205,13 @@ export function WorkspacePicker({
           />
           <button type="submit" disabled={creating}>前往</button>
         </form>
-        {!remote && <label className="workspace-hidden-files" htmlFor="show-hidden-files">
+        <label className="workspace-hidden-files" htmlFor="show-hidden-files">
           <Checkbox.Root id="show-hidden-files" disabled={creating} checked={showHidden} onCheckedChange={(checked) => setShowHidden(checked === true)}>
             <Checkbox.Indicator>✓</Checkbox.Indicator>
           </Checkbox.Root>
           显示隐藏文件
-        </label>}
-        {!remote && <div className="directory-list" aria-busy={loading}>
+        </label>
+        <div className="directory-list" aria-busy={loading}>
           {loading ? (
             <p className="muted">正在读取目录…</p>
           ) : visibleEntries.length ? (
@@ -236,7 +228,7 @@ export function WorkspacePicker({
               <p>当前目录没有子目录</p>
             </div>
           )}
-        </div>}
+        </div>
         <Collapsible.Root className="workspace-advanced"><Collapsible.Trigger asChild><button type="button" disabled={creating}>启动参数 <ChevronDown /></button></Collapsible.Trigger><Collapsible.Content><fieldset className="workspace-launch-args" disabled={creating || !argsReady}>
           <legend>{kind === "command" ? "附加启动参数" : "启动参数"}</legend>
           <div className="launch-argument-list">
