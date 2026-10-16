@@ -121,7 +121,7 @@ export function useSessionCatalog(user: string | null, enabled: Partial<Record<K
     window.addEventListener('online', resume); window.addEventListener('pageshow', resume); document.addEventListener('visibilitychange', resume);
     return () => { epoch.current++; window.clearTimeout(timer.current); timer.current = 0; pending.current.clear(); scans.current.clear(); wanted.current.clear(); dirty.current.clear(); changed(); resync(); connected(); window.removeEventListener('online', resume); window.removeEventListener('pageshow', resume); document.removeEventListener('visibilitychange', resume); };
   }, [user]);
-  useEffect(() => { if (user) void latest.current.sync(); }, [enabled.codex, enabled.hermes, enabled.pi]);
+  useEffect(() => { if (user) void latest.current.sync(); }, [enabled.codex, enabled.command]);
   const read = async (area: CatalogArea, native = false) => { if (native) await refresh(area); else await sync([area]); return state.current[area] || emptyCatalogSlice(); };
   return { areas, sync, refresh, read, clear, upsert, remove, updateStatus };
 }

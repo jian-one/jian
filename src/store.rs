@@ -20,6 +20,9 @@ const BUCKETS: &[&str] = &[
     "runtime_state",
     "monitor_definitions",
     "agent_settings",
+    "instance_config",
+    "registered_hosts",
+    "remote_sessions",
     "quick_notes",
 ];
 
@@ -55,7 +58,7 @@ impl Store {
         Ok(Self { db })
     }
 
-    pub fn put<T: Serialize>(&self, bucket: &str, key: &str, value: &T) -> Result<()> {
+    pub fn put<T: Serialize + ?Sized>(&self, bucket: &str, key: &str, value: &T) -> Result<()> {
         let bytes = serde_json::to_vec(value)?;
         let tx = self.db.tx(true)?;
         tx.get_bucket(bucket)?.put(key.as_bytes(), bytes)?;
@@ -63,13 +66,51 @@ impl Store {
         Ok(())
     }
 
+    pub fn put_many(&self, entries: &[(&str, &str, serde_json::Value)]) -> Result<()> {
+        let tx = self.db.tx(true)?;
+        for (bucket, key, value) in entries {
+            tx.get_bucket(*bucket)?
+                .put(key.as_bytes(), serde_json::to_vec(value)?)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn get<T: DeserializeOwned>(&self, bucket: &str, key: &str) -> Result<T> {
+        self.get_optional(bucket, key)?
+            .ok_or_else(|| anyhow!("not found"))
+    }
+
+    pub fn get_optional<T: DeserializeOwned>(&self, bucket: &str, key: &str) -> Result<Option<T>> {
         let tx = self.db.tx(false)?;
-        let data = tx
-            .get_bucket(bucket)?
+        let data = tx.get_bucket(bucket)?.get(key.as_bytes());
+        data.map(|data| serde_json::from_slice(data.kv().value()).map_err(Into::into))
+            .transpose()
+    }
+
+    pub fn update_existing<T, F>(&self, bucket: &str, key: &str, update: F) -> Result<Option<T>>
+    where
+        T: Serialize + DeserializeOwned,
+        F: FnOnce(T) -> Option<T>,
+    {
+        let tx = self.db.tx(true)?;
+        let bucket = tx.get_bucket(bucket)?;
+        let Some(bytes) = bucket
             .get(key.as_bytes())
-            .ok_or_else(|| anyhow!("not found"))?;
-        Ok(serde_json::from_slice(data.kv().value())?)
+            .map(|data| data.kv().value().to_vec())
+        else {
+            tx.commit()?;
+            return Ok(None);
+        };
+        let current = serde_json::from_slice(&bytes)?;
+        let next = update(current);
+        if let Some(value) = &next {
+            bucket.put(key.as_bytes(), serde_json::to_vec(value)?)?;
+        } else {
+            bucket.delete(key.as_bytes())?;
+        }
+        tx.commit()?;
+        Ok(next)
     }
 
     pub fn delete(&self, bucket: &str, key: &str) -> Result<()> {
@@ -79,11 +120,8 @@ impl Store {
         Ok(())
     }
 
-    pub fn settings(&self, username: &str) -> Option<AgentSettings> {
-        self.get("agent_settings", username).ok()
-    }
-    pub fn save_settings(&self, username: &str, value: &AgentSettings) -> Result<()> {
-        self.put("agent_settings", username, value)
+    pub fn save_instance_settings(&self, value: &AgentSettings) -> Result<()> {
+        self.put("instance_config", "agents", value)
     }
     pub fn quick_note(&self, username: &str) -> Option<QuickNote> {
         self.get("quick_notes", username).ok()
@@ -99,12 +137,18 @@ impl Store {
             .map(str::to_owned)
     }
     pub fn ensure_admin(&self, username: &str, password_hash: &str) -> Result<()> {
-        if self.admin_hash(username).is_none() {
-            self.put(
+        match self.get_optional::<serde_json::Value>("users", username)? {
+            Some(user)
+                if user
+                    .get("password_hash")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some() => {}
+            Some(_) => return Err(anyhow!("stored administrator record is invalid")),
+            None => self.put(
                 "users",
                 username,
                 &serde_json::json!({"username": username, "password_hash": password_hash}),
-            )?;
+            )?,
         }
         Ok(())
     }
@@ -165,4 +209,41 @@ pub fn dirs_home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn put_many_rolls_back_all_values_on_error() {
+        let root = std::env::temp_dir().join(format!("jian-store-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(root.join("jian.db")).unwrap();
+        store
+            .put("registered_hosts", "all", &serde_json::json!(["before"]))
+            .unwrap();
+        store
+            .put("remote_sessions", "all", &serde_json::json!(["before"]))
+            .unwrap();
+
+        let result = store.put_many(&[
+            ("registered_hosts", "all", serde_json::json!(["after"])),
+            ("missing_bucket", "all", serde_json::json!([])),
+        ]);
+
+        assert!(result.is_err());
+        assert_eq!(
+            store
+                .get::<serde_json::Value>("registered_hosts", "all")
+                .unwrap(),
+            serde_json::json!(["before"])
+        );
+        assert_eq!(
+            store
+                .get::<serde_json::Value>("remote_sessions", "all")
+                .unwrap(),
+            serde_json::json!(["before"])
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

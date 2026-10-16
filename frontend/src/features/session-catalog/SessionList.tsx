@@ -6,7 +6,7 @@ type Props = {
   searching?: boolean; onClearFilter?: () => void;
   rows: Session[];
   listKind: Kind;
-  listProfile?: string;
+  listScope?: string;
   activeID?: string;
   connectedID?: string | null;
   visibleCount: number;
@@ -24,10 +24,10 @@ function SessionActions({ kind, session, connected, onDialog, onDisconnect, onRe
 }
 
 /** Session rows own their rendering rules; the workspace only supplies data and commands. */
-export function SessionList({ searching, onClearFilter, rows, listKind, listProfile = '', activeID, connectedID, visibleCount, onSelect, onDialog, onDisconnect, onRelease, onOpenSecondary, onShowMore }: Props) {
+export function SessionList({ searching, onClearFilter, rows, listKind, listScope = '', activeID, connectedID, visibleCount, onSelect, onDialog, onDisconnect, onRelease, onOpenSecondary, onShowMore }: Props) {
   const shown = rows.slice(0, visibleCount);
   const hasMore = rows.length > shown.length;
-  const key = `${listKind}:${listProfile}`;
+  const key = `${listKind}:${listScope}`;
   return <div className="session-list">
     {shown.map(session => {
       const title = displayTitle(session);
@@ -41,7 +41,7 @@ export function SessionList({ searching, onClearFilter, rows, listKind, listProf
         <div className="session-menu"><SessionActions kind={listKind} session={session} connected={connectedID === session.id} onDialog={onDialog} onDisconnect={onDisconnect} onRelease={onRelease} onOpenSecondary={onOpenSecondary} /></div>
       </div>;
     })}
-    {!rows.length && <div className="nav-empty"><span>{searching ? '没有匹配的会话' : '暂无会话'}</span><small>{searching ? '尝试其他关键词或工作目录。' : `点击新建，开始一个 ${{ codex: 'Codex', hermes: 'Hermes', pi: 'Pi' }[listKind]} 会话。`}</small>{searching && <button onClick={onClearFilter}>清除筛选</button>}</div>}
+    {!rows.length && <div className="nav-empty"><span>{searching ? '没有匹配的会话' : '暂无会话'}</span><small>{searching ? '尝试其他关键词或工作目录。' : `点击新建，开始一个 ${listKind === 'codex' ? 'Codex' : '通用启动器'} 会话。`}</small>{searching && <button onClick={onClearFilter}>清除筛选</button>}</div>}
     {hasMore ? <button className="session-more" onClick={onShowMore}>显示更多会话</button> : rows.length > 0 && <span className="session-end">已显示全部 {rows.length} 个会话</span>}
     <span aria-hidden="true" data-session-list-key={key} hidden />
   </div>;

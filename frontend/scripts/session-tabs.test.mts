@@ -3,10 +3,10 @@ import { test } from 'node:test';
 import { adjacentTab, moveTab } from '../src/session-tabs.ts';
 
 test('close chooses the visual neighbor, among session tabs', () => {
-  const order = ['local:a', 'codex:third', 'pi:role:b'];
+  const order = ['local:a', 'codex:third', 'command:b'];
   assert.equal(adjacentTab(order, 'codex:third'), 'local:a');
   assert.equal(adjacentTab(order, 'local:a'), 'codex:third');
-  assert.equal(adjacentTab(order, 'pi:role:b'), 'codex:third');
+  assert.equal(adjacentTab(order, 'command:b'), 'codex:third');
   assert.equal(adjacentTab(['codex:third'], 'codex:third'), null);
   assert.equal(adjacentTab(order, 'missing'), null);
 });
@@ -29,7 +29,7 @@ test('connection messages cannot turn disconnected or unknown process state into
   assert.equal(statusView('已断开连接').tone, 'idle');
   assert.equal(statusView('unknown').label, 'unknown');
   assert.equal(statusView('running').label, '运行中');
-  assert.notEqual(openSessionKey({ id: 'same', kind: 'pi', profile: 'ops', title: '', workspace: '', status: '' }), openSessionKey({ id: 'same', kind: 'pi', profile: 'research', title: '', workspace: '', status: '' }));
+  assert.notEqual(openSessionKey({ id: 'same', kind: 'codex', title: '', workspace: '', status: '' }), openSessionKey({ id: 'same', kind: 'command', title: '', workspace: '', status: '' }));
 });
 test('new users get light while legacy and independent theme choices remain valid', () => {
   const values = new Map<string, string>();
@@ -42,19 +42,20 @@ test('new users get light while legacy and independent theme choices remain vali
   delete (globalThis as { localStorage?: unknown }).localStorage;
 });
 
-test('Pi sessions in different roles retain separate restore keys', () => {
-  assert.notEqual(activeSessionKey('pi', 'first'), activeSessionKey('pi', 'second'));
+test('each supported launcher keeps its own restore key', () => {
+  assert.notEqual(activeSessionKey('codex'), activeSessionKey('command'));
 });
 
 import { switcherRows } from '../src/features/session-catalog/session-switcher-model.ts';
-test('switcher preserves role identity, opened order and token search without mutating data', () => {
-  const base = { id: 'same', title: 'Build API', workspace: '/work/team', status: 'idle', updated_at: '2026-10-05T10:00:00Z' };
-  const first = { ...base, kind: 'pi' as const, profile: 'ops' }, second = { ...base, kind: 'pi' as const, profile: 'research' };
+test('switcher preserves opened order and searches host and launcher identity without mutating data', () => {
+  const base = { title: 'Build API', workspace: '/work/team', status: 'idle', updated_at: '2026-10-05T10:00:00Z' };
+  const first = { ...base, id: 'command-ops', kind: 'command' as const, host_id: 'host-ops', agent_id: 'review' };
+  const second = { ...base, id: 'command-local', kind: 'command' as const, host_id: '', agent_id: 'lint' };
   const local = { id: 'local-one', kind: 'local' as const, title: 'Shell', workspace: '/work/team', status: 'running' };
   const order = [openSessionKey(second), openSessionKey(local)];
   const opened = [local, second], catalog = [first, second, local];
   assert.deepEqual(switcherRows(opened, order, catalog).map(openSessionKey), [...order, openSessionKey(first)]);
-  assert.deepEqual(switcherRows(opened, order, catalog, 'PI ops TEAM'), [first]);
+  assert.deepEqual(switcherRows(opened, order, catalog, 'command host-ops TEAM'), [first]);
   assert.deepEqual(switcherRows(opened, order, catalog, '', true), [second, local]);
   assert.deepEqual(switcherRows(opened, order, catalog, 'missing'), []);
   assert.deepEqual(opened, [local, second]); assert.equal(catalog.length, 3);

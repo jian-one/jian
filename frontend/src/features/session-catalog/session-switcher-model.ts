@@ -4,14 +4,14 @@ export function switcherRows(opened: OpenSession[], order: string[], catalog: Op
   const open = new Map(opened.map(session => [openSessionKey(session), session]));
   const rows = new Map<string, OpenSession>();
   for (const session of [...catalog, ...opened]) {
-    if (!session || typeof session.id !== 'string' || !session.id || typeof session.title !== 'string' || typeof session.workspace !== 'string' || !['local', 'codex', 'hermes', 'pi'].includes(session.kind)) continue;
+    if (!session || typeof session.id !== 'string' || !session.id || typeof session.title !== 'string' || typeof session.workspace !== 'string' || !['local', 'codex', 'command'].includes(session.kind)) continue;
     rows.set(openSessionKey(session), session);
   }
   const positions = new Map(order.map((key, index) => [key, index]));
   const words = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
   return [...rows.values()].filter(session => {
     const key = openSessionKey(session);
-    const text = `${openSessionTitle(session)} ${session.workspace} ${session.id} ${openSessionLabel(session)} ${session.kind === 'local' ? '' : session.profile || 'default'}`.toLocaleLowerCase();
+    const text = `${openSessionTitle(session)} ${session.workspace} ${session.id} ${openSessionLabel(session)} ${session.kind === 'local' ? '' : session.host_id || ''} ${session.kind === 'command' ? session.agent_id || '' : ''}`.toLocaleLowerCase();
     return (!onlyOpened || open.has(key)) && words.every(word => text.includes(word));
   }).sort((a, b) => {
     const ak = openSessionKey(a), bk = openSessionKey(b);

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type RefObject } from 'react';
-import { Collapsible, ToggleGroup, Popover, Toolbar } from 'radix-ui';
+import { Collapsible, ToggleGroup, Toolbar } from 'radix-ui';
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp } from 'lucide-react';
 import type { MobileInputMode, TerminalDraft } from './mobile-state';
 
 export type TerminalActions = {
@@ -35,20 +36,21 @@ export function MobileTerminalInput({ mode, draft, storageError, editor, ready, 
   return <div className="mobile-terminal-input">
     {mode !== 'read' && <ToggleGroup.Root type="single" value={mode} className="mobile-input-modes" aria-label="输入方式" onValueChange={value => { if (value === 'compose' || value === 'direct') enter(value); }}><ToggleGroup.Item value="compose">文本编辑</ToggleGroup.Item><ToggleGroup.Item value="direct" disabled={!ready}>实时终端</ToggleGroup.Item></ToggleGroup.Root>}
     {mode === 'direct' && <Toolbar.Root className="mobile-control-bar" aria-label="终端控制键"
-      onPointerDownCapture={event => { if ((event.target as HTMLElement).closest('button')) event.preventDefault(); }}>
-      <div className="mobile-control-scroll">
-        <Toolbar.Button disabled={!ready} onClick={() => send('\u001b')}>ESC</Toolbar.Button>
-        <Toolbar.Button disabled={!ready} onClick={() => send(shift ? '\u001b[Z' : '\t')}>TAB</Toolbar.Button>
-        {(['D', 'A', 'B', 'C'] as const).map((direction, index) => <Toolbar.Button key={direction} disabled={!ready}
-          aria-label={['方向键左', '方向键上', '方向键下', '方向键右'][index]}
-          onClick={() => send('\u001b[' + (shift ? '1;2' : '') + direction)}>{['←', '↑', '↓', '→'][index]}</Toolbar.Button>)}
-        <Toolbar.Button aria-label="Shift" aria-pressed={shift} disabled={!ready} onClick={() => setShift(value => !value)}>SHIFT</Toolbar.Button>
-        <Toolbar.Button disabled={!ready} aria-label="中断 Ctrl+C" onClick={() => send('\u0003')}>Ctrl+C</Toolbar.Button>
-        <Popover.Root><Popover.Trigger asChild><Toolbar.Button disabled={!ready} aria-label="扩展终端按键">扩展按键</Toolbar.Button></Popover.Trigger><Popover.Portal><Popover.Content className="terminal-extra-keys" side="top" onOpenAutoFocus={event => event.preventDefault()} onCloseAutoFocus={event => event.preventDefault()} onPointerDownCapture={event => event.preventDefault()}>
-          {([['Ctrl+D', '\u0004'], ['Ctrl+L', '\u000c'], ['Ctrl+Z', '\u001a'], ['Home', '\u001b[H'], ['End', '\u001b[F'], ['PageUp', '\u001b[5~'], ['PageDown', '\u001b[6~']] as const).map(([label, data]) => <Toolbar.Button key={label} onClick={() => send(data)}>{label}</Toolbar.Button>)}
-        </Popover.Content></Popover.Portal></Popover.Root>
-      </div>
-      <Toolbar.Button disabled={!ready} onClick={() => send('\r')}>Enter</Toolbar.Button><Toolbar.Button onClick={() => { setShift(false); leave(); }}>收起</Toolbar.Button>
+      // Shortcut presses preserve the current software keyboard state.
+      onMouseDownCapture={event => event.preventDefault()}
+      onPointerDown={event => { if ((event.target as HTMLElement).closest('button')) event.preventDefault(); }}>
+      <Toolbar.Button disabled={!ready} onClick={() => send('\u001b')}>ESC</Toolbar.Button>
+      <Toolbar.Button disabled={!ready} onClick={() => send(shift ? '\u001b[Z' : '\t')}>TAB</Toolbar.Button>
+      <Toolbar.Button aria-label="Shift" aria-pressed={shift} disabled={!ready} onClick={() => setShift(value => !value)}>SHIFT</Toolbar.Button>
+      <Toolbar.Button disabled={!ready} aria-label="方向键上" onClick={() => send('\u001b[' + (shift ? '1;2' : '') + 'A')}><ArrowUp /></Toolbar.Button>
+      <Toolbar.Button disabled={!ready} aria-label="中断 Ctrl+C" onClick={() => send('\u0003')}>Ctrl+C</Toolbar.Button>
+      <Toolbar.Button disabled={!ready} aria-label="结束输入 Ctrl+D" onClick={() => send('\u0004')}>Ctrl+D</Toolbar.Button>
+      <Toolbar.Button disabled={!ready} onClick={() => send('\u001b[Z')}>Shift+Tab</Toolbar.Button>
+      <Toolbar.Button disabled={!ready} aria-label="清屏 Ctrl+L" onClick={() => send('\u000c')}>Ctrl+L</Toolbar.Button>
+      {([['左', 'D', ArrowLeft], ['下', 'B', ArrowDown], ['右', 'C', ArrowRight]] as const).map(([label, direction, Icon]) =>
+        <Toolbar.Button key={direction} disabled={!ready} aria-label={'方向键' + label}
+          onClick={() => send('\u001b[' + (shift ? '1;2' : '') + direction)}><Icon /></Toolbar.Button>)}
+      <Toolbar.Button disabled={!ready} onClick={() => send('\r')}>Enter</Toolbar.Button>
     </Toolbar.Root>}
     <Collapsible.Root open={mode === 'compose'} className="mobile-composer">
       <Collapsible.Content>

@@ -15,16 +15,16 @@ export function isCurrentSessionLoad(version: SessionLoadVersion, requestVersion
   return version.current === requestVersion;
 }
 
-export function shouldRestoreNativeSession({ hasOpenSessions, hasActiveSession, isLocalArea, explicitHome }: { hasOpenSessions: boolean; hasActiveSession: boolean; isLocalArea: boolean; explicitHome: boolean }): boolean {
-  return !hasOpenSessions && !hasActiveSession && !isLocalArea && !explicitHome;
+export function shouldRestoreNativeSession({ hasOpenSessions, hasActiveSession, isLocalArea }: { hasOpenSessions: boolean; hasActiveSession: boolean; isLocalArea: boolean }): boolean {
+  return !hasOpenSessions && !hasActiveSession && !isLocalArea;
 }
 
 export function normalizeSessions(sessions: Session[]): Session[] {
   return sessions
-    .map(session => ({ ...activeView(session), profile: session.profile || 'default' }))
+    .map(activeView)
     .sort(byLastActiveDesc);
 }
 
-export function savedSession(sessions: Session[], id: string | null, kind: Kind, profile: string): Session | undefined {
-  return sessions.find(session => session.id === id && (kind !== 'hermes' || (session.profile || 'default') === profile));
+export function savedSession(sessions: Session[], id: string | null, kind: Kind): Session | undefined {
+  return sessions.find(session => session.id === id && session.kind === kind);
 }

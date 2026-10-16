@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Bot, Check, ChevronDown, LogOut, Menu, Plus, RefreshCw, Search, Settings2, Trash2, X } from 'lucide-react';
-import { Dialog, Select, Tabs, ToggleGroup } from 'radix-ui';
+import { Dialog, Select, ToggleGroup } from 'radix-ui';
 import { SessionList } from '../session-catalog/SessionList';
 import { byLastActiveDesc, displayWorkspacePath, navScrollKey, statusView, type Kind, type LocalSession, type Session } from '../../shared/model';
 import { catalogFeedback, type Catalog } from '../session-catalog/catalog-state';
@@ -11,22 +11,22 @@ type ActiveSession = Session | LocalSession | null;
 type Area = Kind | 'local';
 type Props = {
   busy: boolean; creating: boolean; catalogError?: string; catalog: Catalog; opened: OpenSession[]; onSync: () => void;
-  active: ActiveSession; currentKind: Area; profile: string; profiles: string[]; piAgents?: string[]; sessions: Session[]; localSessions: LocalSession[];
-  compact: boolean; navigationOpen: boolean; onNavigationOpenChange: (open: boolean) => void; handingOffFocus: boolean; onAreaChange: (area: Area) => void; onProfileChange: (profile: string) => void;
+  active: ActiveSession; currentKind: Area; sessions: Session[]; localSessions: LocalSession[];
+  compact: boolean; navigationOpen: boolean; onNavigationOpenChange: (open: boolean) => void; handingOffFocus: boolean; onAreaChange: (area: Area) => void;
   onSelectSession: (session: Session) => void; onSelectLocal: (session: LocalSession) => void; onCreateLocal: () => void; onRemoveLocal: (session: LocalSession) => void;
-  onOpenWorkspace: (kind: Kind, profile?: string) => void; onRefresh: (kind: Kind) => void; refreshingKind?: Kind | null; onSettings: (kind: Area) => void;
+  onOpenWorkspace: (kind: Kind) => void; onRefresh: (kind: Kind) => void; refreshingKind?: Kind | null; onSettings: (kind: Area) => void;
   onDialog: (mode: 'rename' | 'delete', session: Session) => void; onRelease: (session: Session) => void; connectedSessionID?: string | null; onDisconnect: (session: Session) => void;
   onOpenSecondary: (session: Session) => void;
-  visibleCount: (kind: Kind, profile?: string) => number; onShowMore: (kind: Kind, profile?: string) => void; username: string; onLogout: () => void; settingsOpen: boolean; onSettingsPage: () => void;
+  visibleCount: (kind: Kind, scope?: string) => number; onShowMore: (kind: Kind, scope?: string) => void; username: string; onLogout: () => void; settingsOpen: boolean; onSettingsPage: () => void;
 };
 
-const rowsFor = (sessions: Session[], kind: Kind, profile?: string) => sessions
-  .filter(session => session.kind === kind && (kind !== 'hermes' && kind !== 'pi' || (session.profile || 'default') === profile) && session.title.trim().toLowerCase() !== `new ${kind} session`)
+const rowsFor = (sessions: Session[], kind: Kind) => sessions
+  .filter(session => session.kind === kind && session.title.trim().toLowerCase() !== `new ${kind} session`)
   .sort(byLastActiveDesc);
 const matches = (query: string, value: { title: string; workspace: string; id: string }) => !query || `${value.title} ${value.workspace} ${value.id}`.toLowerCase().includes(query);
 
-export function SidebarNavigation({ active, currentKind, profile, profiles, piAgents = profiles, sessions, localSessions, compact, navigationOpen, onNavigationOpenChange, handingOffFocus, onAreaChange, onProfileChange, onSelectSession, onSelectLocal, onCreateLocal, onRemoveLocal, onOpenWorkspace, onRefresh, refreshingKind, onSettings, onDialog, onRelease, connectedSessionID, onDisconnect, onOpenSecondary, visibleCount, onShowMore, username, onLogout, settingsOpen, onSettingsPage, busy, creating, catalogError, catalog, opened, onSync }: Props) {
-  const [agentEnabled, setAgentEnabled] = useState({ codex: localStorage.getItem('jian.codex-enabled') !== 'false', hermes: localStorage.getItem('jian.hermes-enabled') !== 'false', pi: localStorage.getItem('jian.pi-enabled') !== 'false' });
+export function SidebarNavigation({ active, currentKind, sessions, localSessions, compact, navigationOpen, onNavigationOpenChange, handingOffFocus, onAreaChange, onSelectSession, onSelectLocal, onCreateLocal, onRemoveLocal, onOpenWorkspace, onRefresh, refreshingKind, onSettings, onDialog, onRelease, connectedSessionID, onDisconnect, onOpenSecondary, visibleCount, onShowMore, username, onLogout, settingsOpen, onSettingsPage, busy, creating, catalogError, catalog, opened, onSync }: Props) {
+  const [agentEnabled, setAgentEnabled] = useState({ codex: localStorage.getItem('jian.codex-enabled') !== 'false', command: localStorage.getItem('jian.command-enabled') !== 'false' });
   const [scope, setScope] = useState('all');
   const openedKeys = new Set(opened.map(openSessionKey));
   const slice = catalog[currentKind];
@@ -36,14 +36,13 @@ export function SidebarNavigation({ active, currentKind, profile, profiles, piAg
   const [listNode, setListNode] = useState<HTMLDivElement | null>(null);
   const drawerRef = useRef<HTMLDivElement>(null);
   const restored = useRef<{ key: string; node: HTMLElement } | null>(null);
-  useEffect(() => { const update = (event: Event) => { const next = (event as CustomEvent<Partial<typeof agentEnabled>>).detail; setAgentEnabled(next ? { codex: next.codex !== false, hermes: next.hermes !== false, pi: next.pi !== false } : { codex: localStorage.getItem('jian.codex-enabled') !== 'false', hermes: localStorage.getItem('jian.hermes-enabled') !== 'false', pi: localStorage.getItem('jian.pi-enabled') !== 'false' }); }; window.addEventListener('jian-agent-settings', update); return () => window.removeEventListener('jian-agent-settings', update); }, []);
-  useEffect(() => setWorkspace(''), [currentKind, profile]);
-  const roles = currentKind === 'hermes' ? (profiles.length ? profiles : ['default']) : currentKind === 'pi' ? (piAgents.length ? piAgents : ['default']) : [];
-  const rows = useMemo(() => currentKind === 'local' ? [] : rowsFor(sessions, currentKind, currentKind === 'hermes' || currentKind === 'pi' ? profile : undefined), [sessions, currentKind, profile]);
+  useEffect(() => { const update = (event: Event) => { const next = (event as CustomEvent<Partial<typeof agentEnabled>>).detail; setAgentEnabled(next ? { codex: next.codex !== false, command: next.command !== false } : { codex: localStorage.getItem('jian.codex-enabled') !== 'false', command: localStorage.getItem('jian.command-enabled') !== 'false' }); }; window.addEventListener('jian-agent-settings', update); return () => window.removeEventListener('jian-agent-settings', update); }, []);
+  useEffect(() => setWorkspace(''), [currentKind]);
+  const rows = useMemo(() => currentKind === 'local' ? [] : rowsFor(sessions, currentKind), [sessions, currentKind]);
   const workspaces = useMemo(() => Array.from(new Set(rows.map(session => displayWorkspacePath(session.workspace) || '未知工作区'))), [rows]);
   const filtered = rows.filter(session => (workspace === '' || (displayWorkspacePath(session.workspace) || '未知工作区') === workspace) && matches(query, session) && (scope === 'all' || openedKeys.has(openSessionKey(session))));
   const filteredLocal = localSessions.filter(session => matches(query, session) && (scope === 'all' || openedKeys.has(openSessionKey(session))));
-  const scrollKey = navScrollKey(currentKind, currentKind === 'local' ? 'default' : profile);
+  const scrollKey = navScrollKey(currentKind, 'default');
   const hasRows = (currentKind === 'local' ? localSessions : rows).length > 0;
   useLayoutEffect(() => {
     const node = listNode;
@@ -58,19 +57,17 @@ export function SidebarNavigation({ active, currentKind, profile, profiles, piAg
     try { localStorage.setItem(scrollKey, '0'); } catch {}
   };
   const selectAgent = (area: Area) => { setQuery(''); onAreaChange(area); };
-  const create = () => currentKind === 'local' ? onCreateLocal() : onOpenWorkspace(currentKind, currentKind === 'hermes' || currentKind === 'pi' ? profile : undefined);
+  const create = () => currentKind === 'local' ? onCreateLocal() : onOpenWorkspace(currentKind);
   const content = <aside className="sidebar">
     <div className="brand"><span className="brand-mark"><Bot /></span><span className="brand-copy"><strong>Jian</strong><small>LOCAL AGENT CONTROL</small></span></div>
     <nav className="agent-rail" aria-label="Agent" inert={busy}>
       <button className={currentKind === 'local' ? 'active' : ''} onClick={() => selectAgent('local')}><AgentIcon /><span>Local</span></button>
       {agentEnabled.codex && <button className={currentKind === 'codex' ? 'active' : ''} onClick={() => selectAgent('codex')}><AgentIcon kind="codex" /><span>Codex</span></button>}
-      {agentEnabled.hermes && <button className={currentKind === 'hermes' ? 'active' : ''} onClick={() => selectAgent('hermes')}><AgentIcon kind="hermes" /><span>Hermes</span></button>}
-      {agentEnabled.pi && <button className={currentKind === 'pi' ? 'active' : ''} onClick={() => selectAgent('pi')}><AgentIcon kind="pi" /><span>Pi</span></button>}
+      {agentEnabled.command && <button className={currentKind === 'command' ? 'active' : ''} onClick={() => selectAgent('command')}><AgentIcon kind="command" /><span>命令</span></button>}
     </nav>
     <section className="session-catalog" inert={busy} aria-busy={creating}>
       <header className="catalog-header"><div><strong>{currentKind === 'local' ? 'Local Bash' : currentKind[0].toUpperCase() + currentKind.slice(1)}</strong></div><div><button className="icon" aria-label={`${currentKind} 设置`} title="Agent 设置" onClick={() => onSettings(currentKind)}><Settings2 /></button>{<button className="icon" aria-label={`刷新 ${currentKind} 会话`} title="刷新原生会话" disabled={updating} aria-busy={updating} onClick={() => currentKind === 'local' ? onSync() : onRefresh(currentKind)}><RefreshCw /></button>}<button className="icon catalog-create" aria-label="新建会话" title="新建会话" onClick={create}><Plus /><span>新建</span></button></div></header>
       <ToggleGroup.Root type="single" className="catalog-scope" value={scope} onValueChange={value => { if (value) { setScope(value); resetScroll(); } }} aria-label="目录会话范围"><ToggleGroup.Item value="all">全部会话</ToggleGroup.Item><ToggleGroup.Item value="open">已打开</ToggleGroup.Item></ToggleGroup.Root>
-      {roles.length > 0 && <Tabs.Root value={profile} onValueChange={onProfileChange} activationMode="manual"><Tabs.List className="role-strip" aria-label={currentKind === 'pi' ? 'Pi 角色' : 'Hermes profile'}>{roles.map(role => <Tabs.Trigger key={role} value={role} className={profile === role ? 'active' : ''}>{role}</Tabs.Trigger>)}</Tabs.List></Tabs.Root>}
       <label className="catalog-search"><Search /><input value={query} onChange={event => { resetScroll(); setQuery(event.target.value.trimStart().toLowerCase()); }} placeholder="搜索会话或工作目录" aria-label="搜索会话或工作目录" /></label>
       {workspaces.length > 1 && <div className="catalog-filter"><span>目录</span><Select.Root value={workspace || '__all__'} onValueChange={value => { resetScroll(); setWorkspace(value === '__all__' ? '' : value); }}><Select.Trigger className="catalog-filter-trigger" aria-label="筛选工作目录"><Select.Value /><Select.Icon><ChevronDown /></Select.Icon></Select.Trigger><Select.Portal><Select.Content className="catalog-filter-menu" position="popper" sideOffset={4}><Select.Viewport><Select.Item className="catalog-filter-item" value="__all__"><Select.ItemText>全部工作目录</Select.ItemText><Select.ItemIndicator><Check /></Select.ItemIndicator></Select.Item>{workspaces.map(value => <Select.Item className="catalog-filter-item" key={value} value={value}><Select.ItemText>{value}</Select.ItemText><Select.ItemIndicator><Check /></Select.ItemIndicator></Select.Item>)}</Select.Viewport></Select.Content></Select.Portal></Select.Root></div>}
       <p className="catalog-feedback catalog-freshness" role="status">{catalogFeedback(slice)}</p>
@@ -79,7 +76,7 @@ export function SidebarNavigation({ active, currentKind, profile, profiles, piAg
         if (compact && !navigationOpen) return;
         try { localStorage.setItem(scrollKey, String(event.currentTarget.scrollTop)); } catch {}
       }}>
-        {currentKind === 'local' ? <div className="session-list">{filteredLocal.map(session => <div className={'session-row ' + (active?.id === session.id ? 'active' : '')} key={session.id}><button className="session" onClick={() => onSelectLocal(session)}><span className={'session-state ' + statusView(session.status).tone} /><span className="session-copy"><strong title={session.title}>{session.title}</strong><small title={session.workspace}>{displayWorkspacePath(session.workspace)}</small></span></button><button className="icon local-session-remove" aria-label={`删除 ${session.title}`} title="删除会话" onClick={() => onRemoveLocal(session)}><Trash2 /></button></div>)}{!filteredLocal.length && <div className="nav-empty"><span>{query ? '没有匹配的会话' : '暂无本地终端'}</span><small>{query ? '尝试其他关键词，或清除筛选。' : '新建一个 Bash 会话开始工作。'}</small><button onClick={() => query ? setQuery('') : create()}>{query ? '清除筛选' : '新建会话'}</button></div>}</div> : <SessionList searching={!!query || !!workspace} onClearFilter={() => { setQuery(''); setWorkspace(''); resetScroll(); }} rows={filtered} listKind={currentKind} listProfile={profile} activeID={active?.id} connectedID={connectedSessionID} visibleCount={visibleCount(currentKind, `${profile}:${workspace}`)} onSelect={onSelectSession} onDialog={onDialog} onDisconnect={onDisconnect} onRelease={onRelease} onOpenSecondary={onOpenSecondary} onShowMore={() => onShowMore(currentKind, `${profile}:${workspace}`)} />}
+        {currentKind === 'local' ? <div className="session-list">{filteredLocal.map(session => <div className={'session-row ' + (active?.id === session.id ? 'active' : '')} key={session.id}><button className="session" onClick={() => onSelectLocal(session)}><span className={'session-state ' + statusView(session.status).tone} /><span className="session-copy"><strong title={session.title}>{session.title}</strong><small title={session.workspace}>{displayWorkspacePath(session.workspace)}</small></span></button><button className="icon local-session-remove" aria-label={`删除 ${session.title}`} title="删除会话" onClick={() => onRemoveLocal(session)}><Trash2 /></button></div>)}{!filteredLocal.length && <div className="nav-empty"><span>{query ? '没有匹配的会话' : '暂无本地终端'}</span><small>{query ? '尝试其他关键词，或清除筛选。' : '新建一个 Bash 会话开始工作。'}</small><button onClick={() => query ? setQuery('') : create()}>{query ? '清除筛选' : '新建会话'}</button></div>}</div> : <SessionList searching={!!query || !!workspace} onClearFilter={() => { setQuery(''); setWorkspace(''); resetScroll(); }} rows={filtered} listKind={currentKind} listScope={workspace} activeID={active?.id} connectedID={connectedSessionID} visibleCount={visibleCount(currentKind, workspace)} onSelect={onSelectSession} onDialog={onDialog} onDisconnect={onDisconnect} onRelease={onRelease} onOpenSecondary={onOpenSecondary} onShowMore={() => onShowMore(currentKind, workspace)} />}
       </div>
     </section>
     <div className="user"><span><small>已登录</small>{username}</span><div className="user-actions"><button disabled={busy} className={'icon ' + (settingsOpen ? 'active' : '')} aria-label="设置" title="设置" onClick={onSettingsPage}><Settings2 /></button><button className="icon" aria-label="退出登录" title="退出登录" onClick={onLogout}><LogOut /></button></div></div>

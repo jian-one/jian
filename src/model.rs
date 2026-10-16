@@ -7,8 +7,7 @@ use serde_json::Value;
 pub enum AgentKind {
     #[default]
     Codex,
-    Hermes,
-    Pi,
+    Command,
     Local,
 }
 
@@ -16,8 +15,7 @@ impl AgentKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
-            Self::Hermes => "hermes",
-            Self::Pi => "pi",
+            Self::Command => "command",
             Self::Local => "local",
         }
     }
@@ -30,7 +28,11 @@ pub struct Session {
     #[serde(default)]
     pub native_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub profile: String,
+    pub host_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub run_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub src: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -53,7 +55,9 @@ impl Session {
             id: uuid::Uuid::new_v4().to_string(),
             kind,
             native_id: String::new(),
-            profile: String::new(),
+            host_id: String::new(),
+            agent_id: String::new(),
+            run_id: String::new(),
             src: String::new(),
             channel: String::new(),
             workspace,
@@ -83,10 +87,31 @@ pub struct Message {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvVar {
     pub key: String,
     pub value: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RegisteredHost {
+    pub id: String,
+    pub name: String,
+    pub token_hash: String,
+    pub platform: String,
+    #[serde(default)]
+    pub home: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HostView {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    pub home: String,
+    pub connected: bool,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,46 +121,32 @@ pub struct AgentSettings {
     #[serde(default)]
     pub path: String,
     #[serde(default)]
-    pub hermes_home: String,
-    #[serde(default)]
-    pub hermes_bin: String,
-    #[serde(default)]
-    pub hermes_profiles: Vec<String>,
-    #[serde(default)]
     pub local_profiles: Vec<String>,
     #[serde(default)]
     pub codex_args: Vec<String>,
     #[serde(default)]
-    pub hermes_args: Vec<String>,
-    #[serde(default)]
     pub codex_env: Vec<EnvVar>,
     #[serde(default)]
-    pub hermes_env: Vec<EnvVar>,
-    #[serde(default)]
-    pub pi_default: String,
-    #[serde(default)]
-    pub pi_roles: Vec<PiRole>,
-    #[serde(default)]
-    pub pi_args: Vec<String>,
-    #[serde(default)]
-    pub pi_env: Vec<EnvVar>,
+    pub command_configs: Vec<CommandConfig>,
     #[serde(default)]
     pub local_enabled: bool,
     #[serde(default)]
     pub codex_enabled: bool,
-    #[serde(default)]
-    pub hermes_enabled: bool,
-    #[serde(default)]
-    pub pi_enabled: bool,
+    #[serde(default = "default_enabled")]
+    pub command_enabled: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub agent_toggles_set: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PiRole {
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandConfig {
+    pub id: String,
     pub name: String,
-    pub entry: String,
-    pub home: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<EnvVar>,
 }
 
 impl Default for AgentSettings {
@@ -143,27 +154,20 @@ impl Default for AgentSettings {
         Self {
             codex_bin: env_first(&["JIAN_CODEX_BIN", "CODEX_BIN"]),
             path: std::env::var("PATH").unwrap_or_default(),
-            hermes_home: env_first(&["JIAN_HERMES_HOME", "HERMES_HOME"]),
-            hermes_bin: env_first(&["JIAN_HERMES_BIN", "HERMES_BIN"]),
-            hermes_profiles: split_profiles(
-                &std::env::var("JIAN_HERMES_PROFILES").unwrap_or_default(),
-            ),
             local_profiles: vec!["~/.bashrc".into()],
             codex_args: vec![],
-            hermes_args: vec![],
             codex_env: vec![],
-            hermes_env: vec![],
-            pi_default: env_first(&["JIAN_PI_BIN", "PI_BIN"]),
-            pi_roles: vec![],
-            pi_args: vec![],
-            pi_env: vec![],
+            command_configs: vec![],
             local_enabled: true,
             codex_enabled: true,
-            hermes_enabled: true,
-            pi_enabled: true,
+            command_enabled: true,
             agent_toggles_set: false,
         }
     }
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 pub fn env_first(names: &[&str]) -> String {
@@ -171,11 +175,4 @@ pub fn env_first(names: &[&str]) -> String {
         .iter()
         .find_map(|n| std::env::var(n).ok().filter(|v| !v.trim().is_empty()))
         .unwrap_or_default()
-}
-pub fn split_profiles(raw: &str) -> Vec<String> {
-    raw.split(',')
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-        .collect()
 }

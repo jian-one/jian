@@ -217,6 +217,11 @@ export function mountTerminal(options: MountOptions) {
         onStatus('ended'); onConnectionChange({ state: 'ended', attempt: 0, retrying: false }); onProgress('终端已结束');
       }
       if (message.type === 'session.started' && !ended) {
+        if (message.payload?.running === false) {
+          ended = true; term.options.disableStdin = true; clearConnectionTimers();
+          onStatus('ended'); onConnectionChange({ state: 'ended', attempt: 0, retrying: false }); onProgress('终端已结束');
+          return;
+        }
         resetOutput(); started = true; reconnectDelay = 1000; attempt = 0;
         allowInput();
         onStatus('running'); onConnectionChange({ state: 'connected', attempt: 0, retrying: false }); onProgress('已连接');

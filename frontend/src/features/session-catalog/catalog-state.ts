@@ -3,7 +3,7 @@ import { openSessionKey, type OpenSession, type Kind } from '../../shared/model.
 export type CatalogArea = Kind | 'local';
 export type CatalogSlice = { rows: OpenSession[]; revision: number; last_success_at: string | null; refreshing: boolean; error: string | null };
 export type Catalog = Partial<Record<CatalogArea, CatalogSlice>>;
-export const catalogAreas: CatalogArea[] = ['local', 'codex', 'hermes', 'pi'];
+export const catalogAreas: CatalogArea[] = ['local', 'codex', 'command'];
 export const emptyCatalogSlice = (): CatalogSlice => ({ rows: [], revision: -1, last_success_at: null, refreshing: false, error: null });
 
 export function mergeCatalog(current: Catalog, incoming: Catalog): Catalog {

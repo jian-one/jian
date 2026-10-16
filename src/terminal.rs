@@ -31,8 +31,6 @@ pub struct TerminalStatus {
     label: AgentKind,
     title: String,
     workspace: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    profile: String,
     running: bool,
     busy: bool,
     subscribers: usize,
@@ -49,7 +47,7 @@ struct Terminal {
 }
 
 struct TerminalState {
-    buffer: Vec<u8>,
+    buffer: std::collections::VecDeque<u8>,
     seq: u64,
     running: bool,
     subscribers: usize,
@@ -58,6 +56,7 @@ struct TerminalState {
 pub struct TerminalManager {
     active: RwLock<HashMap<String, Arc<Terminal>>>,
     pids: Mutex<HashMap<String, i32>>,
+    lifecycle: Mutex<()>,
     pub changes: broadcast::Sender<Session>,
 }
 
@@ -66,6 +65,7 @@ impl Default for TerminalManager {
         Self {
             active: RwLock::new(HashMap::new()),
             pids: Mutex::new(HashMap::new()),
+            lifecycle: Mutex::new(()),
             changes: broadcast::channel(64).0,
         }
     }
@@ -76,6 +76,7 @@ impl TerminalManager {
         if spec.session.id.is_empty() || spec.argv.first().is_none_or(String::is_empty) {
             return Err(anyhow!("terminal command is required"));
         }
+        let _lifecycle = self.lifecycle.lock().unwrap();
         if self.running(&spec.session.id) {
             return Ok(());
         }
@@ -109,7 +110,7 @@ impl TerminalManager {
             writer: Mutex::new(writer),
             child: Mutex::new(child),
             state: Mutex::new(TerminalState {
-                buffer: vec![],
+                buffer: std::collections::VecDeque::new(),
                 seq: 0,
                 running: true,
                 subscribers: 0,
@@ -168,7 +169,11 @@ impl TerminalManager {
         let guard = Arc::new(SubscriberGuard {
             terminal: terminal.clone(),
         });
-        Ok((state.buffer.clone(), terminal.events.subscribe(), guard))
+        Ok((
+            state.buffer.iter().copied().collect(),
+            terminal.events.subscribe(),
+            guard,
+        ))
     }
 
     pub fn send(&self, id: &str, input: &str) -> Result<()> {
@@ -179,12 +184,9 @@ impl TerminalManager {
         if !terminal.state.lock().unwrap().running {
             return Err(anyhow!("terminal is not running"));
         }
-        terminal
-            .writer
-            .lock()
-            .unwrap()
-            .write_all(input.as_bytes())?;
-        terminal.writer.lock().unwrap().flush()?;
+        let mut writer = terminal.writer.lock().unwrap();
+        writer.write_all(input.as_bytes())?;
+        writer.flush()?;
         Ok(())
     }
 
@@ -205,6 +207,7 @@ impl TerminalManager {
     }
 
     pub fn stop(&self, id: &str) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
         let terminal = self.active.read().unwrap().get(id).cloned();
         let changed = terminal
             .as_ref()
@@ -286,7 +289,6 @@ impl TerminalManager {
                     label: t.spec.label,
                     title: session.title.clone(),
                     workspace: session.workspace.clone(),
-                    profile: session.profile.clone(),
                     running: state.running,
                     busy: t.spec.label != AgentKind::Local,
                     subscribers: state.subscribers,
@@ -362,10 +364,9 @@ impl Terminal {
         if kind == "pty.output"
             && let Some(value) = payload.as_str()
         {
-            state.buffer.extend_from_slice(value.as_bytes());
-            if state.buffer.len() > MAX_BUFFER {
-                let excess = state.buffer.len() - MAX_BUFFER;
-                state.buffer.drain(..excess);
+            state.buffer.extend(value.as_bytes().iter().copied());
+            while state.buffer.len() > MAX_BUFFER {
+                state.buffer.pop_front();
             }
         }
         let _ = self.events.send(Event {
@@ -430,6 +431,39 @@ mod tests {
     #[test]
     fn stopping_missing_terminal_is_idempotent() {
         TerminalManager::default().stop("already-gone").unwrap();
+    }
+
+    #[test]
+    fn concurrent_starts_for_one_session_keep_one_terminal() {
+        let manager = Arc::new(TerminalManager::default());
+        let session = Session::new(AgentKind::Local, "/tmp".into(), "Bash".into());
+        let spec = TerminalSpec {
+            session: session.clone(),
+            label: AgentKind::Local,
+            cwd: "/tmp".into(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "sleep 5".into()],
+            env: std::env::vars()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect(),
+        };
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let manager = manager.clone();
+                let spec = spec.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    manager.start(spec).unwrap();
+                })
+            })
+            .collect();
+        barrier.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(manager.active.read().unwrap().len(), 1);
+        manager.stop(&session.id).unwrap();
     }
 
     #[test]

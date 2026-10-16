@@ -388,11 +388,9 @@
   .switcher-filters { gap:6px; }
 }
 
-.terminal-extra-keys { z-index:90; display:grid; grid-template-columns:repeat(3,1fr); gap:6px; padding:10px; background:var(--surface); border:1px solid var(--line-strong); border-radius:8px; }
-.terminal-extra-keys button { min-height:44px; }
 .settings-account { display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin-top:24px; color:var(--muted); font-size:13px; }
 .secondary-open-action { display:flex; }
-@media(max-width:800px) { .settings-navigation-list { grid-template-columns:repeat(4,minmax(0,1fr)); } .settings-navigation-item { padding:8px 4px; font-size:12px; } .settings-account { margin:8px 0 0; justify-content:space-between; } }
+@media(max-width:800px) { .settings-navigation-list { grid-template-columns:repeat(5,minmax(0,1fr)); } .settings-navigation-item { padding:8px 4px; font-size:12px; } .settings-account { margin:8px 0 0; justify-content:space-between; } }
 @media(max-width:800px) { .settings-shell .settings-navigation-heading { padding-left:0; } .settings-theme-bar { display:none; } }
 
 .switcher-filters-toggle { display:flex; align-items:center; justify-content:space-between; gap:8px; width:100%; margin-bottom:8px; font-size:13px; background:transparent; }

@@ -13,42 +13,42 @@ test('a session list request cannot overwrite a session created after it started
   assert.equal(isCurrentSessionLoad(version, listRequest), false);
 });
 
-test('explicit Hermes profile selection stays on its home page when the list refreshes', () => {
-  assert.equal(shouldRestoreNativeSession({ hasOpenSessions: false, hasActiveSession: false, isLocalArea: false, explicitHome: true }), false);
-  assert.equal(shouldRestoreNativeSession({ hasOpenSessions: false, hasActiveSession: false, isLocalArea: false, explicitHome: false }), true);
+test('saved launcher restores only when there is no current selection', () => {
+  assert.equal(shouldRestoreNativeSession({ hasOpenSessions: false, hasActiveSession: false, isLocalArea: false }), true);
+  assert.equal(shouldRestoreNativeSession({ hasOpenSessions: true, hasActiveSession: false, isLocalArea: false }), false);
+  assert.equal(shouldRestoreNativeSession({ hasOpenSessions: false, hasActiveSession: true, isLocalArea: false }), false);
 });
 
-test('session normalization and saved-profile lookup have one shared rule', () => {
+test('session normalization and saved-session lookup have one shared rule', () => {
   const rows = normalizeSessions([
-    { id: 'older', kind: 'hermes', profile: '', title: '-', workspace: '/tmp', status: 'idle', updated_at: '2024-01-01' },
-    { id: 'newer', kind: 'hermes', profile: 'work', title: ' New ', workspace: '/tmp', status: 'idle', updated_at: '2024-02-01' },
+    { id: 'older', kind: 'codex', title: '-', workspace: '/tmp', status: 'idle', updated_at: '2024-01-01' },
+    { id: 'newer', kind: 'codex', title: ' New ', workspace: '/tmp', status: 'idle', updated_at: '2024-02-01' },
   ]);
-  assert.deepEqual(rows.map(row => [row.id, row.profile, row.title]), [
-    ['newer', 'work', 'New'],
-    ['older', 'default', '无标题'],
+  assert.deepEqual(rows.map(row => [row.id, row.title]), [
+    ['newer', 'New'],
+    ['older', '无标题'],
   ]);
-  assert.equal(savedSession(rows, 'newer', 'hermes', 'default'), undefined);
-  assert.equal(savedSession(rows, 'newer', 'hermes', 'work')?.id, 'newer');
+  assert.equal(savedSession(rows, 'newer', 'command'), undefined);
+  assert.equal(savedSession(rows, 'newer', 'codex')?.id, 'newer');
 });
 
-test('the app keeps profile-aware restoration while list navigation reads the cache first', () => {
+test('the app restores a saved launcher while list navigation reads the cache first', () => {
   const source = readFileSync(new URL('../src/main.tsx', import.meta.url), 'utf8');
 
   assert.match(source, /shouldRestoreNativeSession\(/);
-  assert.match(source, /explicitHome:\s*target === "hermes" && hermesHomeSelected\.current/);
   assert.match(source, /catalog.read\(target, refresh\)/);
   const catalog = readFileSync(new URL('../src/features/session-catalog/useSessionCatalog.ts', import.meta.url), 'utf8');
   assert.match(catalog, /sessions\/catalog\?areas=/);
   assert.match(catalog, /if \(area !== 'local'\) await api/);
-  assert.match(source, /const selectProfile = \(nextProfile: string\) => \{[\s\S]*localStorage\.removeItem\(activeSessionKey\(kind, nextProfile\)\)/);
+  assert.match(source, /localStorage\.getItem\(activeSessionKey\(target\)\)/);
 });
 
 test('closing the final native session tab clears its persisted restore key', () => {
   const source = readFileSync(new URL('../src/main.tsx', import.meta.url), 'utf8');
 
-  assert.match(source, /const closeTab = \(key: string\) => \{[\s\S]*localStorage\.removeItem\(selectedSessionKey\(closed, profile\)\)/);
+  assert.match(source, /const closeTab = \(key: string\) => \{[\s\S]*localStorage\.removeItem\(selectedSessionKey\(closed\)\)/);
   assert.equal(selectedSessionKey({ kind: 'local' }), 'jian.active_local_session');
-  assert.equal(selectedSessionKey({ kind: 'hermes', profile: 'work' }), 'jian.active_hermes_work_session');
+  assert.equal(selectedSessionKey({ kind: 'command' }), 'jian.active_command_session');
 });
 
 test('terminal release errors are caught and shown in a dialog', () => {

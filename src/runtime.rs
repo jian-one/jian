@@ -1,6 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
+    collections::HashMap,
     io::{BufRead, BufReader, Write},
     os::fd::AsRawFd,
     path::{Path, PathBuf},
@@ -14,12 +13,12 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, TimeZone, Utc};
-use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::{
-    model::{AgentKind, AgentSettings, EnvVar, Message, PiRole, Session},
+    model::{AgentKind, AgentSettings, EnvVar, Message, Session},
+    remote::RemoteHub,
     store::dirs_home,
     terminal::{TerminalManager, TerminalSpec},
 };
@@ -37,6 +36,7 @@ pub struct CatalogState {
 
 pub struct Runtime {
     pub terminals: Arc<TerminalManager>,
+    pub remote: RemoteHub,
     settings: RwLock<AgentSettings>,
     cache: RwLock<HashMap<AgentKind, CatalogState>>,
     refresh_locks: HashMap<AgentKind, Mutex<()>>,
@@ -49,17 +49,13 @@ impl Runtime {
     pub fn new(settings: AgentSettings) -> Arc<Self> {
         Arc::new(Self {
             terminals: Arc::new(TerminalManager::default()),
+            remote: RemoteHub::default(),
             settings: RwLock::new(settings),
             cache: RwLock::new(HashMap::new()),
-            refresh_locks: [
-                AgentKind::Codex,
-                AgentKind::Hermes,
-                AgentKind::Pi,
-                AgentKind::Local,
-            ]
-            .into_iter()
-            .map(|kind| (kind, Mutex::new(())))
-            .collect(),
+            refresh_locks: [AgentKind::Codex, AgentKind::Command, AgentKind::Local]
+                .into_iter()
+                .map(|kind| (kind, Mutex::new(())))
+                .collect(),
             settings_epoch: AtomicU64::new(0),
             catalog_updates: tokio::sync::broadcast::channel(64).0,
             codex_app: Mutex::new(None),
@@ -73,28 +69,22 @@ impl Runtime {
             loop {
                 match changes.recv().await {
                     Ok(session) => {
-                        let revision =
+                        let revision = {
+                            let mut cache = runtime.cache.write().unwrap();
+                            let entry = cache.entry(session.kind).or_default();
+                            if let Some(row) =
+                                entry.rows.iter_mut().find(|row| row.id == session.id)
                             {
-                                let mut cache = runtime.cache.write().unwrap();
-                                let entry = cache.entry(session.kind).or_default();
-                                if let Some(row) = entry.rows.iter_mut().find(|row| {
-                                    row.id == session.id && row.profile == session.profile
-                                }) {
-                                    row.status = session.status.clone();
-                                    row.updated_at = session.updated_at;
-                                }
-                                entry.revision += 1;
-                                entry.revision
-                            };
+                                row.status = session.status.clone();
+                                row.updated_at = session.updated_at;
+                            }
+                            entry.revision += 1;
+                            entry.revision
+                        };
                         let _ = runtime.catalog_updates.send((session.kind, revision));
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        for kind in [
-                            AgentKind::Local,
-                            AgentKind::Codex,
-                            AgentKind::Hermes,
-                            AgentKind::Pi,
-                        ] {
+                        for kind in [AgentKind::Local, AgentKind::Codex, AgentKind::Command] {
                             runtime.catalog_changed(kind);
                         }
                     }
@@ -102,19 +92,18 @@ impl Runtime {
                 }
             }
         });
-        for kind in [AgentKind::Codex, AgentKind::Hermes, AgentKind::Pi] {
-            let runtime = self.clone();
-            tokio::spawn(async move {
-                loop {
-                    if runtime.enabled(kind)
-                        && let Err(error) = runtime.refresh_async(kind).await
-                    {
-                        tracing::warn!(agent = kind.as_str(), %error, "session cache refresh failed");
-                    }
-                    tokio::time::sleep(Duration::from_secs(30)).await;
+        let kind = AgentKind::Codex;
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if runtime.enabled(kind)
+                    && let Err(error) = runtime.refresh_async(kind).await
+                {
+                    tracing::warn!(agent = kind.as_str(), %error, "session cache refresh failed");
                 }
-            });
-        }
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+        });
     }
 
     pub async fn refresh_async(self: &Arc<Self>, kind: AgentKind) -> Result<Vec<Session>> {
@@ -140,11 +129,21 @@ impl Runtime {
     }
 
     pub fn available(&self, kind: AgentKind) -> bool {
+        if kind == AgentKind::Command {
+            return self
+                .settings()
+                .command_configs
+                .iter()
+                .any(|config| resolve_binary(&config.program, &config.name).is_some());
+        }
         self.binary(kind).is_ok()
     }
     pub fn refresh(&self, kind: AgentKind) -> Result<Vec<Session>> {
         if !self.enabled(kind) {
             return Err(anyhow!("Agent 已停用"));
+        }
+        if kind == AgentKind::Command {
+            return Ok(self.catalog_state(kind).rows);
         }
         self.refresh_with(kind, || self.discover(kind))
     }
@@ -204,8 +203,7 @@ impl Runtime {
         !settings.agent_toggles_set
             || match kind {
                 AgentKind::Codex => settings.codex_enabled,
-                AgentKind::Hermes => settings.hermes_enabled,
-                AgentKind::Pi => settings.pi_enabled,
+                AgentKind::Command => settings.command_enabled,
                 AgentKind::Local => true,
             }
     }
@@ -231,9 +229,7 @@ impl Runtime {
         let revision = {
             let mut cache = self.cache.write().unwrap();
             let entry = cache.entry(kind).or_default();
-            entry
-                .rows
-                .retain(|row| row.id != session.id || row.profile != session.profile);
+            entry.rows.retain(|row| row.id != session.id);
             entry.rows.insert(0, session);
             entry.revision += 1;
             entry.revision
@@ -273,16 +269,7 @@ impl Runtime {
     pub fn discover(&self, kind: AgentKind) -> Result<Vec<Session>> {
         let native = match kind {
             AgentKind::Codex => self.codex_threads()?,
-            AgentKind::Hermes => self.hermes_sessions()?,
-            AgentKind::Pi => self
-                .pi_agents()
-                .into_iter()
-                .map(|profile| self.pi_sessions(&profile))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect(),
-            AgentKind::Local => vec![],
+            AgentKind::Command | AgentKind::Local => vec![],
         };
         let live = self.terminals.sessions(kind);
         let mut out = merge_sessions(native, live.clone());
@@ -307,24 +294,7 @@ impl Runtime {
 
     pub fn start_agent(&self, mut session: Session) -> Result<()> {
         let settings = self.settings();
-        let binary = if session.kind == AgentKind::Pi {
-            self.pi_entry(&session.profile)?
-        } else {
-            self.binary(session.kind)?
-        };
-        let mut overrides = match session.kind {
-            AgentKind::Codex => environment_overrides(&settings.codex_env),
-            AgentKind::Hermes => environment_overrides(&settings.hermes_env),
-            AgentKind::Pi => environment_overrides(&settings.pi_env),
-            AgentKind::Local => return Err(anyhow!("invalid agent")),
-        };
-        if session.kind == AgentKind::Hermes {
-            if !settings.hermes_home.is_empty() {
-                overrides.push(format!("HERMES_HOME={}", settings.hermes_home));
-            }
-            overrides.push("HERMES_TUI_BACKGROUND=#0d1117".into());
-        }
-        let args = match session.kind {
+        let (binary, mut args, vars) = match session.kind {
             AgentKind::Codex => {
                 if !session.native_id.is_empty() && !self.codex_thread_exists(&session.native_id) {
                     session.native_id.clear();
@@ -337,34 +307,29 @@ impl Runtime {
                     args.push("--yolo".into());
                 }
                 args.extend(preferred_args(&session.launch_args, &settings.codex_args));
-                args
+                (self.binary(AgentKind::Codex)?, args, settings.codex_env)
             }
-            AgentKind::Hermes => {
-                session.profile = normalize_profile(&session.profile);
-                let mut args = vec!["-p".into(), session.profile.clone(), "--cli".into()];
-                if !session.native_id.is_empty() {
-                    args.extend(["--resume".into(), session.native_id.clone()]);
-                }
-                args.extend(if session.id.starts_with("native") {
-                    preferred_args(&session.launch_args, &settings.hermes_args)
-                } else {
-                    session.launch_args.clone()
-                });
-                args
+            AgentKind::Command => {
+                let config = settings
+                    .command_configs
+                    .iter()
+                    .find(|config| config.id == session.agent_id)
+                    .ok_or_else(|| anyhow!("启动配置不存在"))?;
+                let mut args = config.args.clone();
+                args.extend(session.launch_args.clone());
+                (
+                    resolve_binary(&config.program, &config.program)
+                        .ok_or_else(|| anyhow!("启动程序不可用"))?,
+                    args,
+                    config.env.clone(),
+                )
             }
-            AgentKind::Pi => preferred_args(&session.launch_args, &settings.pi_args),
             AgentKind::Local => return Err(anyhow!("invalid agent")),
         };
-        let args = if session.kind == AgentKind::Pi && !session.native_id.is_empty() {
-            let mut resume = vec!["--session".into(), session.native_id.clone()];
-            resume.extend(args);
-            resume
-        } else {
-            args
-        };
+        let overrides = environment_overrides(&vars);
         let env = merge_environment(local_environment(), &overrides);
         let mut command = vec![binary.to_string_lossy().into_owned()];
-        command.extend(args);
+        command.append(&mut args);
         let argv = command_with_profiles(
             &self.shell(),
             &profile_paths(&settings.local_profiles),
@@ -397,179 +362,15 @@ impl Runtime {
         }
     }
 
-    pub fn profiles(&self) -> Vec<String> {
-        let settings = self.settings();
-        if !settings.hermes_profiles.is_empty() {
-            return unique(settings.hermes_profiles);
-        }
-        self.available_profiles()
-    }
-    pub fn available_profiles(&self) -> Vec<String> {
-        let settings = self.settings();
-        let root = if settings.hermes_home.is_empty() {
-            std::env::var_os("JIAN_HERMES_HOME")
-                .or_else(|| std::env::var_os("HERMES_HOME"))
-                .map(PathBuf::from)
-                .unwrap_or_else(|| dirs_home().join(".hermes"))
-        } else {
-            PathBuf::from(settings.hermes_home)
-        };
-        let mut out = vec!["default".into()];
-        if let Ok(entries) = std::fs::read_dir(root.join("profiles")) {
-            for entry in entries
-                .flatten()
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-            {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if !out.contains(&name) {
-                    out.push(name);
-                }
-            }
-        }
-        out
-    }
-
-    pub fn pi_agents(&self) -> Vec<String> {
-        let settings = self.settings();
-        let mut agents = vec!["default".into()];
-        agents.extend(settings.pi_roles.into_iter().map(|role| role.name));
-        unique(agents)
-    }
-
-    fn pi_role(&self, profile: &str) -> Option<PiRole> {
-        self.settings()
-            .pi_roles
-            .into_iter()
-            .find(|role| role.name == normalize_profile(profile))
-    }
-
-    fn pi_sessions(&self, profile: &str) -> Result<Vec<Session>> {
-        let root = if profile == "default" {
-            dirs_home().join(".pi/agent/sessions")
-        } else {
-            self.pi_role(profile)
-                .map(|role| expand_pi_path(&role.home).join("sessions"))
-                .ok_or_else(|| anyhow!("Pi role unavailable: {profile}"))?
-        };
-        let mut files = Vec::new();
-        collect_pi_session_files(&root, true, &mut files);
-        files.sort_by_key(|path| {
-            fs::metadata(path)
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-        });
-        files
-            .into_iter()
-            .map(|path| parse_pi_session(&path, profile))
-            .collect::<Result<Vec<_>>>()
-            .map(|rows| {
-                rows.into_iter()
-                    .flatten()
-                    .filter(|session| {
-                        pi_workspace_matches(profile, &session.workspace, &self.settings().pi_roles)
-                    })
-                    .collect()
-            })
-    }
-
-    pub fn pi_workspace(&self, profile: &str) -> Option<PathBuf> {
-        self.pi_role(profile).map(|role| expand_pi_path(&role.home))
-    }
-
-    fn pi_entry(&self, profile: &str) -> Result<PathBuf> {
-        let profile = normalize_profile(profile);
-        let path = if profile == "default" {
-            expand_pi_path(&self.settings().pi_default)
-        } else {
-            self.pi_role(&profile)
-                .map(|role| expand_pi_path(&role.entry))
-                .ok_or_else(|| anyhow!("Pi role unavailable: {profile}"))?
-        };
-        path.is_file()
-            .then_some(path)
-            .ok_or_else(|| anyhow!("Pi role entry unavailable: {profile}"))
-    }
-
-    pub fn rename_hermes(&self, session: &Session, title: &str) -> Result<()> {
-        self.run_hermes(&[
-            "-p",
-            &normalize_profile(&session.profile),
-            "sessions",
-            "rename",
-            &session.native_id,
-            title,
-        ])
-        .map(|_| ())
-    }
-    pub fn rename_pi(&self, session: &Session, title: &str) -> Result<()> {
-        let content = fs::read_to_string(&session.native_id)?;
-        let mut lines = content.lines();
-        let header = lines.next().ok_or_else(|| anyhow!("empty Pi session"))?;
-        let mut value: serde_json::Value = serde_json::from_str(header)?;
-        value["name"] = serde_json::Value::String(title.into());
-        let mut updated = serde_json::to_string(&value)?;
-        updated.push('\n');
-        updated.push_str(&lines.collect::<Vec<_>>().join("\n"));
-        if content.ends_with('\n') {
-            updated.push('\n');
-        }
-        fs::write(&session.native_id, updated)?;
-        Ok(())
-    }
     pub fn delete_native(&self, session: &Session) -> Result<()> {
-        if session.native_id.is_empty() {
+        if session.native_id.is_empty() || session.kind != AgentKind::Codex {
             return Ok(());
         }
-        match session.kind {
-            AgentKind::Codex => {
-                self.run_command(AgentKind::Codex, &["delete", "--force", &session.native_id])?;
-            }
-            AgentKind::Hermes => {
-                self.run_hermes(&[
-                    "-p",
-                    &normalize_profile(&session.profile),
-                    "sessions",
-                    "delete",
-                    &session.native_id,
-                ])?;
-            }
-            AgentKind::Pi => fs::remove_file(&session.native_id)?,
-            AgentKind::Local => {}
-        }
+        self.run_command(AgentKind::Codex, &["delete", "--force", &session.native_id])?;
         Ok(())
     }
-    pub fn history(&self, session: &Session) -> Result<Vec<Message>> {
-        if matches!(session.kind, AgentKind::Codex | AgentKind::Pi) {
-            return Ok(vec![]);
-        }
-        let out = self.run_hermes(&[
-            "-p",
-            &normalize_profile(&session.profile),
-            "sessions",
-            "export",
-            "-",
-            "--format",
-            "jsonl",
-            "--session-id",
-            &session.native_id,
-            "--redact",
-        ])?;
-        #[derive(Deserialize)]
-        struct Row {
-            role: String,
-            content: String,
-            timestamp: DateTime<Utc>,
-        }
-        Ok(String::from_utf8_lossy(&out)
-            .lines()
-            .filter_map(|line| serde_json::from_str::<Row>(line).ok())
-            .filter(|r| !r.content.is_empty())
-            .map(|r| Message {
-                role: r.role,
-                content: r.content,
-                created_at: r.timestamp,
-            })
-            .collect())
+    pub fn history(&self, _session: &Session) -> Result<Vec<Message>> {
+        Ok(vec![])
     }
 
     pub fn codex_rate_limits(&self) -> Result<Value> {
@@ -581,11 +382,11 @@ impl Runtime {
             .as_mut()
             .unwrap()
             .call("account/rateLimits/read", json!({}));
-        if result.is_err() {
-            if let Some(mut app) = guard.take() {
-                let _ = app.child.kill();
-                let _ = app.child.wait();
-            }
+        if result.is_err()
+            && let Some(mut app) = guard.take()
+        {
+            let _ = app.child.kill();
+            let _ = app.child.wait();
         }
         result
     }
@@ -688,112 +489,43 @@ impl Runtime {
         )?;
         Ok(app)
     }
-    fn hermes_sessions(&self) -> Result<Vec<Session>> {
-        let mut all = vec![];
-        for profile in self.profiles() {
-            all.extend(self.hermes_sessions_for(&profile)?);
-        }
-        Ok(all)
-    }
-    fn hermes_sessions_for(&self, profile: &str) -> Result<Vec<Session>> {
-        let out = self.run_hermes(&["-p", profile, "sessions", "list"])?;
-        let columns = Regex::new(r"\s{2,}").unwrap();
-        let id_re = Regex::new(r"^[A-Za-z0-9][A-Za-z0-9_-]*$").unwrap();
-        let mut rows = vec![];
-        for line in String::from_utf8_lossy(&out).lines().map(str::trim) {
-            if line.is_empty()
-                || line.starts_with("Title")
-                || line.starts_with("ID")
-                || line.starts_with('-')
-                || line.starts_with('─')
-            {
-                continue;
-            }
-            let parts: Vec<_> = columns.split(line).collect();
-            if parts.len() < 4 {
-                continue;
-            }
-            let native_id = parts.last().unwrap().to_string();
-            if !id_re.is_match(&native_id) {
-                continue;
-            }
-            let title = if parts[0].is_empty() || ["—", "-"].contains(&parts[0]) {
-                "无标题"
-            } else {
-                parts[0]
-            }
-            .to_string();
-            let timestamp = legacy_time(&native_id);
-            let workspace = if Path::new(parts[1]).is_dir() {
-                parts[1].to_string()
-            } else {
-                String::new()
-            };
-            rows.push(Session {
-                id: format!("native:{profile}:{native_id}"),
-                kind: AgentKind::Hermes,
-                native_id,
-                profile: profile.into(),
-                src: "cli".into(),
-                channel: "cli".into(),
-                workspace,
-                yolo: false,
-                launch_args: vec![],
-                title,
-                status: "idle".into(),
-                created_at: timestamp,
-                updated_at: timestamp,
-            });
-        }
-        Ok(rows)
-    }
-    fn run_hermes(&self, args: &[&str]) -> Result<Vec<u8>> {
-        self.run_command(AgentKind::Hermes, args)
-    }
     fn run_command(&self, kind: AgentKind, args: &[&str]) -> Result<Vec<u8>> {
-        let settings = self.settings();
-        let binary = self.binary(kind)?;
-        let mut raw = vec![binary.to_string_lossy().into_owned()];
-        raw.extend(args.iter().map(|v| (*v).to_string()));
-        let vars = match kind {
-            AgentKind::Codex => &settings.codex_env,
-            AgentKind::Hermes => &settings.hermes_env,
-            AgentKind::Pi => &settings.pi_env,
-            AgentKind::Local => unreachable!(),
-        };
-        let mut overrides = environment_overrides(vars);
-        if kind == AgentKind::Hermes && !settings.hermes_home.is_empty() {
-            overrides.push(format!("HERMES_HOME={}", settings.hermes_home));
+        if kind != AgentKind::Codex {
+            return Err(anyhow!("unsupported command"));
         }
+        let settings = self.settings();
+        let binary = self.binary(AgentKind::Codex)?;
+        let overrides = environment_overrides(&settings.codex_env);
+        let mut raw = vec![binary.to_string_lossy().into_owned()];
+        raw.extend(args.iter().map(|value| (*value).to_string()));
         let command = command_with_profiles(
             &self.shell(),
             &profile_paths(&settings.local_profiles),
             &overrides,
             &raw,
         );
-        let env = merge_environment(local_environment(), &overrides);
         let mut cmd = Command::new(&command[0]);
         cmd.args(&command[1..]).env_clear();
-        for item in env {
-            if let Some((k, v)) = item.split_once('=') {
-                cmd.env(k, v);
+        for item in merge_environment(local_environment(), &overrides) {
+            if let Some((key, value)) = item.split_once('=') {
+                cmd.env(key, value);
             }
         }
         let output = cmd.output()?;
         if !output.status.success() {
-            return Err(anyhow!("{} exited with {}", kind.as_str(), output.status));
+            return Err(anyhow!("codex exited with {}", output.status));
         }
         Ok(output.stdout)
     }
     fn binary(&self, kind: AgentKind) -> Result<PathBuf> {
-        if kind == AgentKind::Pi {
-            return self.pi_entry("default");
-        }
         let settings = self.settings();
         let value = match kind {
             AgentKind::Codex => settings.codex_bin,
-            AgentKind::Hermes => settings.hermes_bin,
-            AgentKind::Pi => unreachable!(),
+            AgentKind::Command => settings
+                .command_configs
+                .first()
+                .map(|config| config.program.clone())
+                .unwrap_or_default(),
             AgentKind::Local => self.shell(),
         };
         resolve_binary(&value, kind.as_str())
@@ -805,25 +537,6 @@ impl Runtime {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "/bin/bash".into())
     }
-}
-
-fn expand_pi_path(value: &str) -> PathBuf {
-    value
-        .strip_prefix("~/")
-        .map_or_else(|| PathBuf::from(value), |rest| dirs_home().join(rest))
-}
-
-fn pi_workspace_matches(profile: &str, workspace: &str, roles: &[PiRole]) -> bool {
-    let workspace = Path::new(workspace);
-    if profile == "default" {
-        return !roles
-            .iter()
-            .any(|role| workspace.starts_with(expand_pi_path(&role.home)));
-    }
-    roles
-        .iter()
-        .find(|role| role.name == profile)
-        .is_some_and(|role| workspace.starts_with(expand_pi_path(&role.home)))
 }
 
 struct AppServer {
@@ -912,7 +625,9 @@ fn codex_row(row: &Value) -> Session {
         id: format!("native-{native_id}"),
         kind: AgentKind::Codex,
         native_id,
-        profile: String::new(),
+        host_id: String::new(),
+        agent_id: String::new(),
+        run_id: String::new(),
         src: String::new(),
         channel: String::new(),
         workspace: string(row, "cwd"),
@@ -943,18 +658,11 @@ fn json_time(value: Option<&Value>) -> DateTime<Utc> {
         })
         .unwrap_or_else(zero_time)
 }
-fn legacy_time(id: &str) -> DateTime<Utc> {
-    id.get(..15)
-        .and_then(|v| chrono::NaiveDateTime::parse_from_str(v, "%Y%m%d_%H%M%S").ok())
-        .and_then(|value| chrono::Local.from_local_datetime(&value).single())
-        .map(|value| value.with_timezone(&Utc))
-        .unwrap_or_else(zero_time)
-}
 fn zero_time() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(1, 1, 1, 0, 0, 0).single().unwrap()
 }
 fn session_key(s: &Session) -> String {
-    format!("{}:{}:{}", s.kind.as_str(), s.profile, s.native_id)
+    format!("{}:{}", s.kind.as_str(), s.native_id)
 }
 fn merge_sessions(mut native: Vec<Session>, live: Vec<Session>) -> Vec<Session> {
     let mut out = Vec::with_capacity(native.len() + live.len());
@@ -965,7 +673,7 @@ fn merge_sessions(mut native: Vec<Session>, live: Vec<Session>) -> Vec<Session> 
             }
             found.kind == live.kind
                 && found.workspace == live.workspace
-                && normalize_profile(&found.profile) == normalize_profile(&live.profile)
+                && found.agent_id == live.agent_id
                 && found.created_at + chrono::Duration::seconds(1) >= live.created_at
         };
         let candidates: Vec<_> = native
@@ -989,133 +697,6 @@ fn merge_sessions(mut native: Vec<Session>, live: Vec<Session>) -> Vec<Session> 
     }
     out.extend(native);
     out
-}
-fn normalize_profile(value: &str) -> String {
-    if value.trim().is_empty() {
-        "default".into()
-    } else {
-        value.trim().into()
-    }
-}
-
-fn collect_pi_session_files(root: &Path, recurse: bool, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.extension().is_some_and(|ext| ext == "jsonl") {
-            files.push(path);
-        } else if recurse && path.is_dir() {
-            collect_pi_session_files(&path, true, files);
-        }
-    }
-}
-
-fn parse_pi_session(path: &Path, profile: &str) -> Result<Option<Session>> {
-    let text = fs::read_to_string(path)?;
-    let mut lines = text.lines();
-    let Some(first) = lines.next() else {
-        return Ok(None);
-    };
-    let header: Value = serde_json::from_str(first)?;
-    if header.get("type").and_then(Value::as_str) != Some("session") {
-        return Ok(None);
-    }
-    let native_id = header.get("id").and_then(Value::as_str).unwrap_or_default();
-    let workspace = header
-        .get("cwd")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if native_id.is_empty() || workspace.is_empty() {
-        return Ok(None);
-    }
-    let mut message_title = String::new();
-    let mut session_name = None;
-    let mut updated_at = json_time(header.get("timestamp"));
-    for line in lines {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        updated_at = value
-            .get("timestamp")
-            .map(|timestamp| json_time(Some(timestamp)))
-            .filter(|time| *time > updated_at)
-            .unwrap_or(updated_at);
-        if value.get("type").and_then(Value::as_str) == Some("session_info") {
-            session_name = Some(
-                value
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string(),
-            );
-        }
-        if message_title.is_empty()
-            && value.get("type").and_then(Value::as_str) == Some("message")
-            && value
-                .get("message")
-                .and_then(|message| message.get("role"))
-                .and_then(Value::as_str)
-                == Some("user")
-        {
-            message_title = value
-                .get("message")
-                .and_then(|message| message.get("content"))
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|part| part.get("text").and_then(Value::as_str))
-                .collect::<Vec<_>>()
-                .join(" ");
-        }
-    }
-    let title = session_name
-        .filter(|name| !name.is_empty())
-        .unwrap_or(message_title);
-    Ok(Some(Session {
-        id: format!("native-pi-{profile}-{native_id}"),
-        kind: AgentKind::Pi,
-        native_id: path.to_string_lossy().into_owned(),
-        profile: profile.into(),
-        src: String::new(),
-        channel: String::new(),
-        workspace: workspace.into(),
-        yolo: false,
-        launch_args: vec![],
-        title: title.trim().chars().take(80).collect::<String>(),
-        status: "ended".into(),
-        created_at: json_time(header.get("timestamp")),
-        updated_at,
-    }))
-}
-fn unique(values: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    values
-        .into_iter()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty() && seen.insert(v.clone()))
-        .collect()
-}
-fn capitalize(value: &str) -> String {
-    let mut chars = value.chars();
-    chars
-        .next()
-        .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
-        .unwrap_or_default()
-}
-fn resolve_binary(configured: &str, fallback: &str) -> Option<PathBuf> {
-    if !configured.is_empty() {
-        return std::fs::canonicalize(configured)
-            .ok()
-            .or_else(|| Some(PathBuf::from(configured)));
-    }
-    std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(fallback))
-            .find(|p| p.is_file())
-    })
 }
 fn local_environment() -> Vec<String> {
     let mut env: Vec<_> = std::env::vars()
@@ -1179,6 +760,28 @@ fn preferred_args(custom: &[String], defaults: &[String]) -> Vec<String> {
         custom.to_vec()
     }
 }
+
+fn capitalize(value: &str) -> String {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
+}
+
+fn resolve_binary(configured: &str, fallback: &str) -> Option<PathBuf> {
+    if !configured.is_empty() {
+        return std::fs::canonicalize(configured)
+            .ok()
+            .or_else(|| Some(PathBuf::from(configured)));
+    }
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(fallback))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
 fn command_with_profiles(
     shell: &str,
     profiles: &[String],
@@ -1209,19 +812,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generic_launcher_availability_checks_all_configured_programs() {
+        let settings = AgentSettings {
+            command_configs: vec![
+                crate::model::CommandConfig {
+                    id: "missing".into(),
+                    name: "Missing".into(),
+                    program: "/jian-test-missing-program".into(),
+                    args: vec![],
+                    env: vec![],
+                },
+                crate::model::CommandConfig {
+                    id: "available".into(),
+                    name: "Available".into(),
+                    program: std::env::current_exe()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    args: vec![],
+                    env: vec![],
+                },
+            ],
+            ..AgentSettings::default()
+        };
+        let runtime = Runtime::new(settings);
+
+        assert!(runtime.available(AgentKind::Command));
+    }
+
+    #[test]
     fn catalog_keeps_last_success_when_discovery_fails() {
         let runtime = Runtime::new(AgentSettings::default());
-        let row = Session::new(AgentKind::Hermes, "/work".into(), "Saved".into());
+        let row = Session::new(AgentKind::Command, "/work".into(), "Saved".into());
         runtime
-            .refresh_with(AgentKind::Hermes, || Ok(vec![row.clone()]))
+            .refresh_with(AgentKind::Command, || Ok(vec![row.clone()]))
             .unwrap();
-        let successful = runtime.catalog_state(AgentKind::Hermes);
+        let successful = runtime.catalog_state(AgentKind::Command);
         assert!(
             runtime
-                .refresh_with(AgentKind::Hermes, || Err(anyhow!("offline")))
+                .refresh_with(AgentKind::Command, || Err(anyhow!("offline")))
                 .is_err()
         );
-        let failed = runtime.catalog_state(AgentKind::Hermes);
+        let failed = runtime.catalog_state(AgentKind::Command);
         assert_eq!(failed.rows[0].id, row.id);
         assert_eq!(failed.last_success_at, successful.last_success_at);
         assert!(failed.revision > successful.revision);
@@ -1236,7 +868,7 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let first_runtime = runtime.clone();
         let first = thread::spawn(move || {
-            first_runtime.refresh_with(AgentKind::Hermes, || {
+            first_runtime.refresh_with(AgentKind::Command, || {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 Ok(vec![])
@@ -1245,40 +877,40 @@ mod tests {
         entered_rx.recv().unwrap();
         let second_runtime = runtime.clone();
         let second = thread::spawn(move || {
-            second_runtime.refresh_with(AgentKind::Hermes, || panic!("duplicate native discovery"))
+            second_runtime.refresh_with(AgentKind::Command, || panic!("duplicate native discovery"))
         });
         thread::sleep(Duration::from_millis(30));
         release_tx.send(()).unwrap();
         first.join().unwrap().unwrap();
         second.join().unwrap().unwrap();
-        assert_eq!(runtime.catalog_state(AgentKind::Hermes).completed, 1);
+        assert_eq!(runtime.catalog_state(AgentKind::Command).completed, 1);
         assert!(
             runtime
-                .refresh_with(AgentKind::Hermes, || {
+                .refresh_with(AgentKind::Command, || {
                     let mut settings = runtime.settings();
-                    settings.hermes_home = "/new-home".into();
+                    settings.command_enabled = false;
                     runtime.set_settings(settings);
                     Ok(vec![])
                 })
                 .is_err()
         );
-        assert!(!runtime.catalog_state(AgentKind::Hermes).refreshing);
+        assert!(!runtime.catalog_state(AgentKind::Command).refreshing);
     }
 
     #[test]
     fn catalog_does_not_replace_a_mutation_with_an_old_scan() {
         let runtime = Runtime::new(AgentSettings::default());
-        let row = Session::new(AgentKind::Hermes, "/work".into(), "New".into());
+        let row = Session::new(AgentKind::Command, "/work".into(), "New".into());
         let mut updates = runtime.catalog_updates.subscribe();
         assert!(
             runtime
-                .refresh_with(AgentKind::Hermes, || {
+                .refresh_with(AgentKind::Command, || {
                     runtime.update_catalog_session(row.clone());
                     Ok(vec![])
                 })
                 .is_err()
         );
-        let result = runtime.catalog_state(AgentKind::Hermes);
+        let result = runtime.catalog_state(AgentKind::Command);
         assert_eq!(result.rows[0].id, row.id);
         assert!(!result.refreshing);
         assert!(result.error.is_some());
@@ -1371,63 +1003,6 @@ mod tests {
             preferred_args(&["custom".into()], &["default".into()]),
             ["custom"]
         );
-    }
-
-    #[test]
-    fn pi_sessions_do_not_cross_role_workspaces() {
-        let roles = [PiRole {
-            name: "swork".into(),
-            entry: "/bin/pi-swork".into(),
-            home: "/home/gaofei/.pi/agents/swork".into(),
-        }];
-        assert!(!pi_workspace_matches(
-            "default",
-            "/home/gaofei/.pi/agents/swork/workspace",
-            &roles
-        ));
-        assert!(pi_workspace_matches(
-            "swork",
-            "/home/gaofei/.pi/agents/swork/workspace",
-            &roles
-        ));
-        assert!(pi_workspace_matches(
-            "default",
-            "/home/gaofei/project",
-            &roles
-        ));
-    }
-
-    #[test]
-    fn pi_role_sessions_are_collected_recursively() {
-        let root = std::env::temp_dir().join(format!("jian-pi-sessions-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(root.join("2026-08-31")).unwrap();
-        let nested = root.join("2026-08-31/session.jsonl");
-        fs::write(&nested, "").unwrap();
-        let mut files = Vec::new();
-        collect_pi_session_files(&root, true, &mut files);
-        assert_eq!(files, [nested]);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn pi_session_name_from_tui_overrides_first_message_title() {
-        let path =
-            std::env::temp_dir().join(format!("jian-pi-title-{}.jsonl", uuid::Uuid::new_v4()));
-        fs::write(
-            &path,
-            concat!(
-                r#"{"type":"session","id":"session-1","cwd":"/tmp","timestamp":"2026-08-31T00:00:00Z"}"#,
-                "\n",
-                r#"{"type":"message","message":{"role":"user","content":[{"text":"旧标题"}]}}"#,
-                "\n",
-                r#"{"type":"session_info","name":"TUI 标题"}"#,
-                "\n"
-            ),
-        )
-        .unwrap();
-        let session = parse_pi_session(&path, "swork").unwrap().unwrap();
-        assert_eq!(session.title, "TUI 标题");
-        fs::remove_file(path).unwrap();
     }
 
     #[test]

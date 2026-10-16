@@ -1,6 +1,7 @@
 #![allow(clippy::result_large_err)]
 
 mod model;
+mod remote;
 mod runtime;
 mod store;
 mod terminal;
@@ -43,7 +44,7 @@ use tower::ServiceExt;
 use yrs::{Doc, GetString, ReadTxn, StateVector, Transact, Update, updates::decoder::Decode};
 
 use crate::{
-    model::{AgentKind, AgentSettings, Session},
+    model::{AgentKind, AgentSettings, HostView, RegisteredHost, Session},
     runtime::Runtime,
     store::{Store, default_path, dirs_home, token_hash},
 };
@@ -138,6 +139,9 @@ struct AppState {
     store: Arc<Store>,
     runtime: Arc<Runtime>,
     locals: RwLock<HashMap<String, Session>>,
+    hosts: RwLock<Vec<RegisteredHost>>,
+    remote_sessions: RwLock<Vec<Session>>,
+    settings_write: Mutex<()>,
     attempts: Mutex<HashMap<String, Vec<SystemTime>>>,
     quick_notes: QuickNoteWorker,
     quick_note_updates: broadcast::Sender<QuickNoteEvent>,
@@ -164,11 +168,11 @@ async fn dispatch() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args
         .first()
-        .is_some_and(|arg| !matches!(arg.as_str(), "run" | "--config" | "-c"))
+        .is_some_and(|arg| !matches!(arg.as_str(), "run" | "serve" | "--config" | "-c"))
     {
         return cli(&args);
     }
-    let args = if args.first().is_some_and(|v| v == "run") {
+    let args = if args.first().is_some_and(|v| v == "run" || v == "serve") {
         &args[1..]
     } else {
         &args[..]
@@ -184,15 +188,36 @@ async fn run_server(config_path: Option<PathBuf>) -> Result<()> {
     let username = std::env::var("JIAN_ADMIN_USER").unwrap_or_else(|_| "admin".into());
     let password = std::env::var("JIAN_ADMIN_PASSWORD").unwrap_or_else(|_| "change-me".into());
     store.ensure_admin(&username, &hash(password, DEFAULT_COST)?)?;
-    let settings = store.settings(&username).unwrap_or_default();
+    let settings = match store.get_optional::<AgentSettings>("instance_config", "agents")? {
+        Some(settings) => settings,
+        None => store
+            .get_optional::<AgentSettings>("agent_settings", &username)?
+            .unwrap_or_default(),
+    };
+    store.save_instance_settings(&settings)?;
     let runtime = Runtime::new(settings);
     runtime.start_cache();
     let quick_notes = QuickNoteWorker::start(store.clone())?;
     let (quick_note_updates, _) = broadcast::channel(64);
+    let hosts = store
+        .get_optional::<Vec<RegisteredHost>>("registered_hosts", "all")?
+        .unwrap_or_default();
+    let mut remote_sessions = store
+        .get_optional::<Vec<Session>>("remote_sessions", "all")?
+        .unwrap_or_default();
+    for session in &mut remote_sessions {
+        if session.status == "running" {
+            session.status = "offline".into();
+        }
+    }
+    store.put("remote_sessions", "all", &remote_sessions)?;
     let state = Arc::new(AppState {
         store,
         runtime,
         locals: RwLock::new(HashMap::new()),
+        hosts: RwLock::new(hosts),
+        remote_sessions: RwLock::new(remote_sessions),
+        settings_write: Mutex::new(()),
         attempts: Mutex::new(HashMap::new()),
         quick_notes,
         quick_note_updates,
@@ -216,6 +241,7 @@ fn routes(state: Arc<AppState>) -> Router {
     api_routes(state.clone()).merge(
         Router::new()
             .route("/api/ws", get(api_websocket))
+            .route("/api/client/connect/{id}", get(client_connect))
             .with_state(state),
     )
 }
@@ -228,12 +254,13 @@ fn api_routes(state: Arc<AppState>) -> Router {
         .route("/api/auth/me", get(me))
         .route("/api/workspaces/browse", get(browse))
         .route("/api/workspaces/file", get(read_workspace_file))
+        .route("/api/hosts", get(list_hosts).post(register_host))
+        .route("/api/hosts/{id}", delete(remove_host))
+        .route("/api/hosts/{id}/rotate", post(rotate_host))
         .route("/api/local/sessions", post(create_local).get(list_local))
         .route("/api/local/sessions/{id}", delete(remove_local))
         .route("/api/local/sessions/{id}/terminal", get(local_terminal))
         .route("/api/sessions/catalog", get(session_catalog))
-        .route("/api/hermes/profiles", get(profiles))
-        .route("/api/pi/agents", get(pi_agents))
         .route("/api/settings", get(settings).put(save_settings))
         .route("/api/quick-note", get(quick_note).put(put_quick_note))
         .route("/api/settings/terminal-status", get(terminal_status))
@@ -267,34 +294,29 @@ fn api_routes(state: Arc<AppState>) -> Router {
             get(codex_terminal),
         )
         .route(
-            "/api/agents/hermes/sessions",
-            get(list_hermes).post(create_hermes),
+            "/api/agents/command/sessions",
+            get(list_command).post(create_command),
         )
-        .route("/api/agents/hermes/sessions/cache", get(list_hermes))
-        .route("/api/agents/hermes/sessions/refresh", post(refresh_hermes))
+        .route("/api/agents/command/sessions/cache", get(list_command))
         .route(
-            "/api/agents/hermes/sessions/{id}",
-            get(get_hermes).patch(rename_hermes).delete(remove_hermes),
+            "/api/agents/command/sessions/refresh",
+            post(refresh_command),
         )
         .route(
-            "/api/agents/hermes/sessions/{id}/history",
-            get(history_hermes),
+            "/api/agents/command/sessions/{id}",
+            get(get_command)
+                .patch(rename_command)
+                .delete(remove_command),
         )
-        .route("/api/agents/hermes/sessions/{id}/stop", post(stop_hermes))
         .route(
-            "/api/agents/hermes/sessions/{id}/terminal",
-            get(hermes_terminal),
+            "/api/agents/command/sessions/{id}/history",
+            get(history_command),
         )
-        .route("/api/agents/pi/sessions", get(list_pi).post(create_pi))
-        .route("/api/agents/pi/sessions/cache", get(list_pi))
-        .route("/api/agents/pi/sessions/refresh", post(refresh_pi))
+        .route("/api/agents/command/sessions/{id}/stop", post(stop_command))
         .route(
-            "/api/agents/pi/sessions/{id}",
-            get(get_pi).patch(rename_pi).delete(remove_pi),
+            "/api/agents/command/sessions/{id}/terminal",
+            get(command_terminal),
         )
-        .route("/api/agents/pi/sessions/{id}/history", get(history_pi))
-        .route("/api/agents/pi/sessions/{id}/stop", post(stop_pi))
-        .route("/api/agents/pi/sessions/{id}/terminal", get(pi_terminal))
         .with_state(state)
 }
 
@@ -324,12 +346,24 @@ fn cookie(headers: &HeaderMap) -> Option<String> {
 fn current(state: &AppState, headers: &HeaderMap) -> Option<String> {
     let token = cookie(headers)?;
     let key = token_hash(&token);
-    let mut session: AuthSession = state.store.get("auth_sessions", &key).ok()?;
-    if session.expires <= chrono::Utc::now() {
+    let now = chrono::Utc::now();
+    let mut session = state.store.get::<AuthSession>("auth_sessions", &key).ok()?;
+    if session.expires <= now {
+        state.store.delete("auth_sessions", &key).ok()?;
         return None;
     }
-    session.expires = chrono::Utc::now() + chrono::Duration::seconds(SESSION_TTL_SECS);
-    state.store.put("auth_sessions", &key, &session).ok()?;
+    if session.expires <= now + chrono::Duration::seconds(SESSION_TTL_SECS - 300) {
+        session = state
+            .store
+            .update_existing("auth_sessions", &key, |mut stored: AuthSession| {
+                if stored.expires <= now {
+                    return None;
+                }
+                stored.expires = now + chrono::Duration::seconds(SESSION_TTL_SECS);
+                Some(stored)
+            })
+            .ok()??;
+    }
     Some(session.username)
 }
 fn require(state: &AppState, headers: &HeaderMap) -> std::result::Result<String, Response> {
@@ -360,20 +394,26 @@ async fn login(
 ) -> Api {
     let ip = addr.ip().to_string();
     let now = SystemTime::now();
-    let mut attempts = state.attempts.lock().unwrap();
-    let recent = attempts.entry(ip).or_default();
-    recent.retain(|t| now.duration_since(*t).unwrap_or_default() < Duration::from_secs(60));
-    if recent.len() >= 10
-        || state
-            .store
-            .admin_hash(&input.username)
-            .is_none_or(|h| !verify(&input.password, &h).unwrap_or(false))
     {
+        let mut attempts = state.attempts.lock().unwrap();
+        let recent = attempts.entry(ip.clone()).or_default();
+        recent.retain(|t| now.duration_since(*t).unwrap_or_default() < Duration::from_secs(60));
+        if recent.len() >= 10 {
+            return fail(StatusCode::UNAUTHORIZED, "invalid credentials");
+        }
         recent.push(now);
+    }
+    let stored_hash = state.store.admin_hash(&input.username);
+    let password = input.password.clone();
+    let valid = tokio::task::spawn_blocking(move || {
+        stored_hash.is_some_and(|hash| verify(&password, &hash).unwrap_or(false))
+    })
+    .await
+    .unwrap_or(false);
+    if !valid {
         return fail(StatusCode::UNAUTHORIZED, "invalid credentials");
     }
-    recent.clear();
-    drop(attempts);
+    state.attempts.lock().unwrap().remove(&ip);
     let mut raw = [0_u8; 32];
     rand::rng().fill_bytes(&mut raw);
     let token = URL_SAFE_NO_PAD.encode(raw);
@@ -431,10 +471,8 @@ async fn auth_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
 }
 async fn me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
     let username = require(&state, &headers)?;
-    let (settings, available) = settings_view(&state, &username);
-    ok(
-        json!({"username":username,"settings":settings,"available_profiles":available,"available_pi_agents":state.runtime.pi_agents()}),
-    )
+    let settings = settings_view(&state, &username);
+    ok(json!({"username":username,"settings":settings,"hosts":host_views(&state)}))
 }
 
 #[derive(Deserialize)]
@@ -541,116 +579,321 @@ async fn put_quick_note(
     no_content()
 }
 
-fn merged_settings(state: &AppState, username: &str) -> AgentSettings {
-    let mut defaults = AgentSettings::default();
-    if let Some(saved) = state.store.settings(username) {
-        if !saved.codex_bin.is_empty() {
-            defaults.codex_bin = saved.codex_bin
-        }
-        if !saved.hermes_bin.is_empty() {
-            defaults.hermes_bin = saved.hermes_bin
-        }
-        if !saved.hermes_home.is_empty() {
-            defaults.hermes_home = saved.hermes_home
-        }
-        if !saved.hermes_profiles.is_empty() {
-            defaults.hermes_profiles = saved.hermes_profiles
-        }
-        if !saved.local_profiles.is_empty() {
-            defaults.local_profiles = saved.local_profiles
-        }
-        defaults.codex_args = saved.codex_args;
-        defaults.hermes_args = saved.hermes_args;
-        defaults.codex_env = saved.codex_env;
-        defaults.hermes_env = saved.hermes_env;
-        if !saved.pi_default.is_empty() {
-            defaults.pi_default = saved.pi_default;
-        }
-        defaults.pi_roles = saved.pi_roles;
-        defaults.pi_args = saved.pi_args;
-        defaults.pi_env = saved.pi_env;
-        if saved.agent_toggles_set {
-            defaults.codex_enabled = saved.codex_enabled;
-            defaults.hermes_enabled = saved.hermes_enabled;
-            defaults.pi_enabled = saved.pi_enabled;
-            defaults.agent_toggles_set = true;
-        }
-    }
-    defaults.path = std::env::var("PATH").unwrap_or_default();
-    defaults
+fn merged_settings(state: &AppState, _username: &str) -> AgentSettings {
+    let mut settings = state.runtime.settings();
+    settings.path = std::env::var("PATH").unwrap_or_default();
+    settings
 }
-fn settings_view(state: &AppState, username: &str) -> (AgentSettings, Vec<String>) {
-    let available = state.runtime.available_profiles();
-    let mut settings = merged_settings(state, username);
-    if settings.hermes_profiles.is_empty() {
-        settings.hermes_profiles = available.clone();
-    }
-    (settings, available)
+
+fn settings_view(state: &AppState, username: &str) -> AgentSettings {
+    merged_settings(state, username)
 }
-async fn settings(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
-    let username = require(&state, &headers)?;
-    let (settings, available) = settings_view(&state, &username);
+
+fn host_views(state: &AppState) -> Vec<HostView> {
+    state
+        .hosts
+        .read()
+        .unwrap()
+        .iter()
+        .map(|host| HostView {
+            id: host.id.clone(),
+            name: host.name.clone(),
+            platform: host.platform.clone(),
+            home: host.home.clone(),
+            connected: state.runtime.remote.is_connected(&host.id),
+            created_at: host.created_at,
+        })
+        .collect()
+}
+
+fn save_hosts(state: &AppState, hosts: &[RegisteredHost]) -> Result<()> {
+    state.store.put("registered_hosts", "all", hosts)
+}
+
+fn new_client_token() -> String {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+#[derive(Deserialize)]
+struct RegisterHost {
+    name: String,
+}
+
+async fn list_hosts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
+    require(&state, &headers)?;
+    ok(host_views(&state))
+}
+
+async fn register_host(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(input): Json<RegisterHost>,
+) -> Api {
+    require(&state, &headers)?;
+    let name = input.name.trim();
+    if name.is_empty() || name.chars().count() > 100 {
+        return fail(StatusCode::BAD_REQUEST, "主机名称长度需为 1 至 100 个字符");
+    }
+    let token = new_client_token();
+    let host = RegisteredHost {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: name.to_string(),
+        token_hash: token_hash(&token),
+        platform: "unknown".into(),
+        home: String::new(),
+        created_at: chrono::Utc::now(),
+    };
+    let mut hosts = state.hosts.write().unwrap();
+    let mut next = hosts.clone();
+    next.push(host.clone());
+    if let Err(error) = save_hosts(&state, &next) {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
+    }
+    *hosts = next;
     ok(
-        json!({"settings":settings,"available_profiles":available,"available_pi_agents":state.runtime.pi_agents()}),
+        json!({"host":{"id":host.id,"name":host.name,"platform":host.platform,"home":host.home,"connected":false,"created_at":host.created_at},"token":token}),
     )
 }
+
+async fn rotate_host(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Api {
+    require(&state, &headers)?;
+    let token = new_client_token();
+    let mut hosts = state.hosts.write().unwrap();
+    let mut next = hosts.clone();
+    let Some(host) = next.iter_mut().find(|host| host.id == id) else {
+        return fail(StatusCode::NOT_FOUND, "主机不存在");
+    };
+    host.token_hash = token_hash(&token);
+    let view = json!({"id":host.id,"name":host.name,"platform":host.platform,"home":host.home,"connected":false,"created_at":host.created_at});
+    if let Err(error) = save_hosts(&state, &next) {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
+    }
+    *hosts = next;
+    drop(hosts);
+    let _ = state
+        .runtime
+        .remote
+        .send(&id, json!({"type":"client.revoke"}));
+    ok(json!({"host":view,"token":token}))
+}
+
+async fn remove_host(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Api {
+    require(&state, &headers)?;
+    if !state.hosts.read().unwrap().iter().any(|host| host.id == id) {
+        return fail(StatusCode::NOT_FOUND, "主机不存在");
+    }
+    let initial_sessions: Vec<_> = state
+        .remote_sessions
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|session| session.host_id == id && session.status != "ended")
+        .cloned()
+        .collect();
+    if initial_sessions
+        .iter()
+        .any(|session| !state.runtime.remote.is_connected(&session.host_id))
+    {
+        return fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "主机离线时仍有未结束的终端，无法安全删除",
+        );
+    }
+    if let Err(error) = stop_remote_sessions(&state, &initial_sessions).await {
+        return fail(StatusCode::SERVICE_UNAVAILABLE, error);
+    }
+
+    let mut hosts = state.hosts.write().unwrap();
+    let Some(host_index) = hosts.iter().position(|host| host.id == id) else {
+        return fail(StatusCode::NOT_FOUND, "主机不存在");
+    };
+    let mut remote_sessions = state.remote_sessions.write().unwrap();
+    let stopped: std::collections::HashSet<_> = initial_sessions
+        .iter()
+        .map(|session| (session.id.as_str(), session.run_id.as_str()))
+        .collect();
+    if remote_sessions.iter().any(|session| {
+        session.host_id == id
+            && session.status != "ended"
+            && !stopped.contains(&(session.id.as_str(), session.run_id.as_str()))
+    }) {
+        return fail(StatusCode::CONFLICT, "删除期间主机新增了终端，请重试");
+    }
+    let removed: Vec<_> = remote_sessions
+        .iter()
+        .filter(|session| session.host_id == id)
+        .cloned()
+        .collect();
+    let mut next_hosts = hosts.clone();
+    next_hosts.remove(host_index);
+    let next_sessions: Vec<_> = remote_sessions
+        .iter()
+        .filter(|session| session.host_id != id)
+        .cloned()
+        .collect();
+    let hosts_value = match serde_json::to_value(&next_hosts) {
+        Ok(value) => value,
+        Err(error) => return fail(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let sessions_value = match serde_json::to_value(&next_sessions) {
+        Ok(value) => value,
+        Err(error) => return fail(StatusCode::INTERNAL_SERVER_ERROR, error),
+    };
+    let values = [
+        ("registered_hosts", "all", hosts_value),
+        ("remote_sessions", "all", sessions_value),
+    ];
+    if let Err(error) = state.store.put_many(&values) {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
+    }
+    *hosts = next_hosts;
+    *remote_sessions = next_sessions;
+    drop(remote_sessions);
+    drop(hosts);
+    let _ = state
+        .runtime
+        .remote
+        .send(&id, json!({"type":"client.revoke"}));
+    for session in removed {
+        state
+            .runtime
+            .remove_catalog_session(session.kind, &session.id);
+        state.runtime.remote.forget_session(&session.id);
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+async fn settings(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
+    let username = require(&state, &headers)?;
+    ok(json!({"settings":settings_view(&state, &username),"hosts":host_views(&state)}))
+}
+
 async fn save_settings(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(mut input): Json<AgentSettings>,
+    Json(update): Json<Value>,
 ) -> Api {
-    let username = require(&state, &headers)?;
-    let current = merged_settings(&state, &username);
+    require(&state, &headers)?;
+    let field_mask = match update.as_object().and_then(|object| object.get("_fields")) {
+        None => None,
+        Some(Value::Array(fields)) => {
+            let mut mask = Vec::with_capacity(fields.len());
+            for field in fields {
+                let Some(field) = field.as_str() else {
+                    return fail(StatusCode::BAD_REQUEST, "设置字段列表无效");
+                };
+                mask.push(field.to_owned());
+            }
+            Some(mask)
+        }
+        Some(_) => return fail(StatusCode::BAD_REQUEST, "设置字段列表无效"),
+    };
+    let mut update = update;
+    if let Some(object) = update.as_object_mut() {
+        object.remove("_fields");
+    }
+    let incoming = match serde_json::from_value::<AgentSettings>(update) {
+        Ok(settings) => settings,
+        Err(error) => return fail(StatusCode::BAD_REQUEST, error),
+    };
+    let _settings_write = state.settings_write.lock().unwrap();
+    let mut input = if let Some(fields) = field_mask {
+        let mut merged = state.runtime.settings();
+        for field in fields {
+            match field.as_str() {
+                "codex_bin" => merged.codex_bin = incoming.codex_bin.clone(),
+                "local_profiles" => merged.local_profiles = incoming.local_profiles.clone(),
+                "codex_args" => merged.codex_args = incoming.codex_args.clone(),
+                "codex_env" => merged.codex_env = incoming.codex_env.clone(),
+                "command_configs" => merged.command_configs = incoming.command_configs.clone(),
+                "codex_enabled" => merged.codex_enabled = incoming.codex_enabled,
+                "command_enabled" => merged.command_enabled = incoming.command_enabled,
+                _ => return fail(StatusCode::BAD_REQUEST, "设置字段不可更新"),
+            }
+        }
+        merged
+    } else {
+        incoming
+    };
+    let current = state.runtime.settings();
     input.codex_bin = input.codex_bin.trim().to_string();
-    input.hermes_bin = input.hermes_bin.trim().to_string();
-    input.hermes_home = input.hermes_home.trim().to_string();
-    input.pi_default = input.pi_default.trim().to_string();
     if input.codex_bin.is_empty() {
-        input.codex_bin = current.codex_bin
-    }
-    if input.hermes_bin.is_empty() {
-        input.hermes_bin = current.hermes_bin
-    }
-    if input.hermes_home.is_empty() {
-        input.hermes_home = current.hermes_home
-    }
-    if input.pi_default.is_empty() {
-        input.pi_default = current.pi_default
+        input.codex_bin = current.codex_bin;
     }
     input.path = std::env::var("PATH").unwrap_or_default();
     input.local_enabled = true;
     input.agent_toggles_set = true;
     input.local_profiles = normalize_profiles(&input.local_profiles);
-    input.hermes_profiles = normalize_profiles(&input.hermes_profiles);
-    let mut role_names = std::collections::HashSet::new();
-    if input.pi_roles.iter().any(|role| {
-        role.name.trim().is_empty()
-            || role.entry.trim().is_empty()
-            || role.home.trim().is_empty()
-            || role.name.trim() == "default"
-    }) {
+    input.codex_args = clean_args(&input.codex_args);
+    if !valid_args(&input.codex_args) {
         return fail(
             StatusCode::BAD_REQUEST,
-            "Pi 角色的名称、入口路径和主目录均为必填",
+            "Codex 最多允许 128 个参数且参数不能包含 NUL",
         );
     }
-    for role in &mut input.pi_roles {
-        role.name = role.name.trim().to_string();
-        role.entry = role.entry.trim().to_string();
-        role.home = role.home.trim().to_string();
-        role_names.insert(role.name.clone());
+    let mut ids = std::collections::HashSet::new();
+    for config in &mut input.command_configs {
+        config.id = config.id.trim().to_string();
+        config.name = config.name.trim().to_string();
+        config.program = config.program.trim().to_string();
+        if config.id.is_empty()
+            || config.id.len() > 64
+            || !config
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            || config.name.is_empty()
+            || config.name.chars().count() > 100
+            || config.program.is_empty()
+            || config.program.len() > 4096
+            || config.program.contains('\0')
+            || !ids.insert(config.id.clone())
+        {
+            return fail(
+                StatusCode::BAD_REQUEST,
+                "启动配置的 ID、名称和程序必须有效且 ID 唯一",
+            );
+        }
+        config.args = clean_args(&config.args);
+        if config.args.len() > 128
+            || config.env.len() > 128
+            || config.args.iter().any(|arg| arg.contains('\0'))
+        {
+            return fail(
+                StatusCode::BAD_REQUEST,
+                "每个启动配置最多允许 128 个参数和环境变量",
+            );
+        }
+        for env in &mut config.env {
+            env.key = env.key.trim().to_string();
+            if env.key.is_empty()
+                || !env.key.chars().enumerate().all(|(index, c)| {
+                    c == '_' || c.is_ascii_alphabetic() || index > 0 && c.is_ascii_digit()
+                })
+                || env.value.contains('\0')
+            {
+                return fail(StatusCode::BAD_REQUEST, "启动配置包含无效环境变量");
+            }
+        }
     }
-    if role_names.len() != input.pi_roles.len() {
-        return fail(StatusCode::BAD_REQUEST, "Pi 角色名称不能重复");
+    if input.command_configs.len() > 64 {
+        return fail(StatusCode::BAD_REQUEST, "最多允许 64 个启动配置");
     }
-    input.codex_args = clean_args(&input.codex_args);
-    input.hermes_args = clean_args(&input.hermes_args);
-    input.pi_args = clean_args(&input.pi_args);
-    if let Err(e) = state.store.save_settings(&username, &input) {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, e);
+    if let Err(error) = state.store.save_instance_settings(&input) {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
     }
     state.runtime.set_settings(input.clone());
-    for kind in [AgentKind::Codex, AgentKind::Hermes, AgentKind::Pi] {
+    for kind in [AgentKind::Codex, AgentKind::Command] {
         state.runtime.catalog_changed(kind);
     }
     ok(input)
@@ -728,19 +971,17 @@ async fn browse(
             if filter.is_some_and(|want_directory| directory != want_directory) {
                 return None;
             }
-            if !directory {
-                if let Some(extension) = &file_ext {
-                    if entry
-                        .path()
-                        .extension()
-                        .and_then(|value| value.to_str())
-                        .map(str::to_ascii_lowercase)
-                        .as_deref()
-                        != Some(extension)
-                    {
-                        return None;
-                    }
-                }
+            if !directory
+                && let Some(extension) = &file_ext
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .as_deref()
+                    != Some(extension)
+            {
+                return None;
             }
             Some(json!({
                 "name": entry.file_name().to_string_lossy(),
@@ -860,14 +1101,13 @@ async fn session_catalog(
     for area in query
         .areas
         .as_deref()
-        .unwrap_or("local,codex,hermes,pi")
+        .unwrap_or("local,codex,command")
         .split(',')
     {
         let kind = match area {
             "local" => AgentKind::Local,
             "codex" => AgentKind::Codex,
-            "hermes" => AgentKind::Hermes,
-            "pi" => AgentKind::Pi,
+            "command" => AgentKind::Command,
             _ => return fail(StatusCode::BAD_REQUEST, "invalid catalog area"),
         };
         let mut catalog = state.runtime.catalog_state(kind);
@@ -902,14 +1142,23 @@ async fn session_catalog(
         }
         // A snapshot is cached discovery plus current server-owned processes; no CLI runs here.
         for live in state.runtime.terminals.sessions(kind) {
-            if let Some(row) = catalog
-                .rows
-                .iter_mut()
-                .find(|row| row.id == live.id && row.profile == live.profile)
-            {
+            if let Some(row) = catalog.rows.iter_mut().find(|row| row.id == live.id) {
                 *row = live;
             } else {
                 catalog.rows.push(live);
+            }
+        }
+        for remote in state
+            .remote_sessions
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|session| session.kind == kind)
+        {
+            if let Some(row) = catalog.rows.iter_mut().find(|row| row.id == remote.id) {
+                *row = remote.clone();
+            } else {
+                catalog.rows.push(remote.clone());
             }
         }
         catalog
@@ -918,18 +1167,6 @@ async fn session_catalog(
         areas.insert(area.into(), serde_json::to_value(catalog).unwrap());
     }
     ok(json!({"areas":areas}))
-}
-async fn profiles(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
-    require(&state, &headers)?;
-    if state.runtime.available(AgentKind::Hermes) {
-        ok(state.runtime.profiles())
-    } else {
-        ok(Vec::<String>::new())
-    }
-}
-async fn pi_agents(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
-    require(&state, &headers)?;
-    ok(state.runtime.pi_agents())
 }
 async fn terminal_status(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
     require(&state, &headers)?;
@@ -941,6 +1178,35 @@ async fn release_terminal(
     AxumPath(id): AxumPath<String>,
 ) -> Api {
     require(&state, &headers)?;
+    let remote_session = {
+        state
+            .remote_sessions
+            .read()
+            .unwrap()
+            .iter()
+            .find(|session| session.id == id)
+            .cloned()
+    };
+    if let Some(mut session) = remote_session {
+        if let Err(error) = stop_remote_session(&state, &session).await {
+            return fail(StatusCode::SERVICE_UNAVAILABLE, error);
+        }
+        session.status = "ended".into();
+        session.updated_at = chrono::Utc::now();
+        let persisted = modify_remote_sessions(&state, |sessions| {
+            if let Some(row) = sessions.iter_mut().find(|row| row.id == id) {
+                *row = session.clone();
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        });
+        if let Err(error) = persisted {
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
+        }
+        state.runtime.update_catalog_session(session);
+        return ok(json!({"released":true,"id":id}));
+    }
     let session = state.runtime.terminals.session(&id);
     state.locals.write().unwrap().remove(&id);
     if let Err(e) = state.runtime.terminals.stop(&id) {
@@ -963,6 +1229,51 @@ async fn restart_terminal(
     AxumPath(id): AxumPath<String>,
 ) -> Api {
     require(&state, &headers)?;
+    let remote_session = {
+        state
+            .remote_sessions
+            .read()
+            .unwrap()
+            .iter()
+            .find(|session| session.id == id)
+            .cloned()
+    };
+    if let Some(mut session) = remote_session {
+        if !state.runtime.remote.is_connected(&session.host_id) {
+            return fail(StatusCode::SERVICE_UNAVAILABLE, "目标主机当前未连接");
+        }
+        let settings = merged_settings(&state, "");
+        let (program, args, env) = match command_spec(&session, &settings) {
+            Ok(command) => command,
+            Err(error) => return fail(StatusCode::BAD_REQUEST, error),
+        };
+        if let Err(error) = stop_remote_session(&state, &session).await {
+            return fail(StatusCode::SERVICE_UNAVAILABLE, error);
+        }
+        session.run_id = uuid::Uuid::new_v4().to_string();
+        session.status = "running".into();
+        session.updated_at = chrono::Utc::now();
+        if let Err(error) = modify_remote_sessions(&state, |sessions| {
+            if let Some(row) = sessions.iter_mut().find(|row| row.id == id) {
+                *row = session.clone();
+                Ok(())
+            } else {
+                anyhow::bail!("远程终端记录不存在")
+            }
+        }) {
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
+        }
+        if let Err(error) = state.runtime.remote.send(&session.host_id, json!({"type":"pty.open","session_id":id,"run_id":session.run_id,"program":program,"args":args,"env":env,"cwd":session.workspace})) {
+            session.status = "offline".into();
+            let _ = modify_remote_sessions(&state, |sessions| {
+                if let Some(row) = sessions.iter_mut().find(|row| row.id == id) { *row = session.clone(); }
+                Ok(())
+            });
+            return fail(StatusCode::SERVICE_UNAVAILABLE, error);
+        }
+        state.runtime.update_catalog_session(session);
+        return ok(json!({"restarted":true,"id":id}));
+    }
     if let Err(e) = state.runtime.restart_terminal(&id) {
         return fail(StatusCode::BAD_REQUEST, e);
     }
@@ -977,18 +1288,25 @@ async fn release_all(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
     if let Err(e) = state.runtime.terminals.stop_all() {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, e);
     }
-    for kind in [
-        AgentKind::Local,
-        AgentKind::Codex,
-        AgentKind::Hermes,
-        AgentKind::Pi,
-    ] {
+    for kind in [AgentKind::Local, AgentKind::Codex, AgentKind::Command] {
         let rows = state.runtime.catalog_state(kind).rows;
         for mut row in rows {
             row.status = "ended".into();
             state.runtime.update_catalog_session(row);
         }
         state.runtime.catalog_changed(kind);
+    }
+    for session in state.remote_sessions.write().unwrap().iter_mut() {
+        let _ = state.runtime.remote.send(
+            &session.host_id,
+            json!({"type":"pty.stop","session_id":session.id}),
+        );
+        session.status = "ended".into();
+        session.updated_at = chrono::Utc::now();
+        state.runtime.update_catalog_session(session.clone());
+    }
+    if let Err(error) = persist_remote_sessions(&state) {
+        return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
     }
     ok(json!({"released":true}))
 }
@@ -997,13 +1315,150 @@ async fn release_all(State(state): State<Arc<AppState>>, headers: HeaderMap) -> 
 struct CreateAgent {
     workspace: String,
     #[serde(default)]
-    profile: String,
+    host_id: String,
+    #[serde(default)]
+    agent_id: String,
     #[serde(default)]
     yolo: bool,
     launch_args: Option<Vec<String>>,
     #[serde(default)]
     title: String,
 }
+
+fn command_spec(
+    session: &Session,
+    settings: &AgentSettings,
+) -> Result<(String, Vec<String>, serde_json::Map<String, Value>)> {
+    let (program, args, env) = match session.kind {
+        AgentKind::Codex => {
+            let mut args = Vec::new();
+            if session.yolo {
+                args.push("--yolo".to_string());
+            }
+            let custom = if session.launch_args.is_empty() {
+                &settings.codex_args
+            } else {
+                &session.launch_args
+            };
+            args.extend(custom.iter().cloned());
+            (
+                if !session.host_id.is_empty() || settings.codex_bin.is_empty() {
+                    "codex".into()
+                } else {
+                    settings.codex_bin.clone()
+                },
+                args,
+                settings.codex_env.clone(),
+            )
+        }
+        AgentKind::Command => {
+            let config = settings
+                .command_configs
+                .iter()
+                .find(|item| item.id == session.agent_id)
+                .ok_or_else(|| anyhow!("启动配置不存在"))?;
+            let mut args = config.args.clone();
+            args.extend(session.launch_args.clone());
+            (config.program.clone(), args, config.env.clone())
+        }
+        AgentKind::Local => return Err(anyhow!("本地终端不通过远程启动配置运行")),
+    };
+    let mut environment = serde_json::Map::new();
+    for item in env {
+        environment.insert(item.key, Value::String(item.value));
+    }
+    Ok((program, args, environment))
+}
+
+fn persist_remote_sessions(state: &AppState) -> Result<()> {
+    state.store.put(
+        "remote_sessions",
+        "all",
+        &*state.remote_sessions.read().unwrap(),
+    )
+}
+
+fn modify_remote_sessions<T>(
+    state: &AppState,
+    update: impl FnOnce(&mut Vec<Session>) -> Result<T>,
+) -> Result<T> {
+    let mut current = state.remote_sessions.write().unwrap();
+    let mut next = current.clone();
+    let result = update(&mut next)?;
+    state.store.put("remote_sessions", "all", &next)?;
+    *current = next;
+    Ok(result)
+}
+
+async fn stop_remote_session(state: &AppState, session: &Session) -> Result<()> {
+    stop_remote_sessions(state, std::slice::from_ref(session)).await
+}
+
+async fn stop_remote_sessions(state: &AppState, sessions: &[Session]) -> Result<()> {
+    let mut pending = Vec::new();
+    for session in sessions.iter().filter(|session| session.status != "ended") {
+        if !state.runtime.remote.is_connected(&session.host_id) {
+            anyhow::bail!("目标主机当前未连接，无法确认终端已停止");
+        }
+        let events = state.runtime.remote.subscribe(&session.id);
+        state.runtime.remote.send(
+            &session.host_id,
+            json!({"type":"pty.stop","session_id":session.id,"run_id":session.run_id}),
+        )?;
+        pending.push((session.run_id.clone(), events));
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for (expected_run_id, events) in &mut pending {
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        anyhow::bail!("远程终端事件流已关闭")
+                    }
+                };
+                let Ok(value) = serde_json::from_str::<Value>(&event) else {
+                    continue;
+                };
+                let kind = value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let run_id = value
+                    .get("run_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if run_id == expected_run_id && matches!(kind, "pty.stopped" | "pty.exit") {
+                    break;
+                }
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("等待远程终端停止超时"))??;
+    Ok(())
+}
+
+fn agent_rows(state: &AppState, kind: AgentKind) -> Vec<Session> {
+    let mut rows = state.runtime.catalog_state(kind).rows;
+    for session in state
+        .remote_sessions
+        .read()
+        .unwrap()
+        .iter()
+        .filter(|session| session.kind == kind)
+    {
+        if let Some(row) = rows.iter_mut().find(|row| row.id == session.id) {
+            *row = session.clone();
+        } else {
+            rows.push(session.clone());
+        }
+    }
+    rows.sort_by_key(|row| std::cmp::Reverse(row.updated_at));
+    rows
+}
+
 async fn codex_rate_limits(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Api {
     require(&state, &headers)?;
     let runtime = state.runtime.clone();
@@ -1016,95 +1471,157 @@ async fn codex_rate_limits(State(state): State<Arc<AppState>>, headers: HeaderMa
 
 async fn agent_list(state: &Arc<AppState>, headers: &HeaderMap, kind: AgentKind) -> Api {
     require(state, headers)?;
-    match state.runtime.cached(kind) {
-        Ok(v) => ok(v),
-        Err(e) => fail(StatusCode::SERVICE_UNAVAILABLE, e),
+    let rows = agent_rows(state, kind);
+    if kind == AgentKind::Codex
+        && rows.is_empty()
+        && state.runtime.catalog_state(kind).last_success_at.is_none()
+    {
+        return fail(StatusCode::SERVICE_UNAVAILABLE, "Codex 会话目录尚未就绪");
     }
+    ok(rows)
 }
+
 async fn agent_refresh(state: &Arc<AppState>, headers: &HeaderMap, kind: AgentKind) -> Api {
     require(state, headers)?;
+    if kind == AgentKind::Command {
+        return ok(agent_rows(state, kind));
+    }
     match state.runtime.refresh_async(kind).await {
-        Ok(v) => ok(v),
-        Err(e) => fail(StatusCode::SERVICE_UNAVAILABLE, e),
+        Ok(_) => ok(agent_rows(state, kind)),
+        Err(error) => fail(StatusCode::SERVICE_UNAVAILABLE, error),
     }
 }
+
+fn agent_session(state: &AppState, kind: AgentKind, id: &str) -> Option<Session> {
+    if kind == AgentKind::Local {
+        return state.locals.read().unwrap().get(id).cloned();
+    }
+    state
+        .remote_sessions
+        .read()
+        .unwrap()
+        .iter()
+        .find(|session| session.kind == kind && session.id == id)
+        .cloned()
+        .or_else(|| state.runtime.session(kind, id).ok())
+}
+
 async fn agent_create(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     kind: AgentKind,
     input: CreateAgent,
 ) -> Api {
-    let username = require(state, headers)?;
-    if input.workspace.is_empty() {
+    let username = match require(state, headers) {
+        Ok(username) => username,
+        Err(response) => return Err(response),
+    };
+    let workspace = input.workspace.trim();
+    if workspace.is_empty() || workspace.len() > 4096 {
         return fail(StatusCode::BAD_REQUEST, "workspace is required");
     }
-    if kind == AgentKind::Pi {
-        let profile = if input.profile.trim().is_empty() {
-            "default"
-        } else {
-            input.profile.trim()
-        };
-        if !state.runtime.pi_agents().iter().any(|name| name == profile) {
-            return fail(StatusCode::BAD_REQUEST, "Pi 角色不存在");
+    let settings = merged_settings(state, &username);
+    if kind == AgentKind::Codex && !state.runtime.enabled(kind) {
+        return fail(StatusCode::SERVICE_UNAVAILABLE, "Codex 已停用");
+    }
+    if kind == AgentKind::Command {
+        if !state.runtime.enabled(kind) {
+            return fail(StatusCode::SERVICE_UNAVAILABLE, "通用启动器已停用");
         }
-        if let Some(fixed) = state.runtime.pi_workspace(profile) {
-            if expand_path(&input.workspace) != fixed {
-                return fail(StatusCode::BAD_REQUEST, "Pi 角色只能使用其角色目录");
-            }
+        if !settings
+            .command_configs
+            .iter()
+            .any(|config| config.id == input.agent_id)
+        {
+            return fail(StatusCode::BAD_REQUEST, "启动配置不存在");
         }
     }
-    if !state.runtime.available(kind) {
-        return fail(
-            StatusCode::SERVICE_UNAVAILABLE,
-            if kind == AgentKind::Codex {
-                "Codex CLI unavailable"
-            } else if kind == AgentKind::Hermes {
-                "Hermes integration unavailable"
-            } else {
-                "Pi CLI unavailable"
-            },
-        );
-    }
-    let workspace = match std::path::absolute(expand_path(&input.workspace)) {
-        Ok(v) => v,
-        Err(_) => return fail(StatusCode::BAD_REQUEST, "invalid workspace"),
+    let workspace = if input.host_id.is_empty() {
+        match std::path::absolute(expand_path(workspace)) {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(_) => return fail(StatusCode::BAD_REQUEST, "invalid workspace"),
+        }
+    } else {
+        workspace.to_string()
     };
     let mut session = Session::new(
         kind,
-        workspace.to_string_lossy().into_owned(),
-        if input.title.is_empty() {
+        workspace,
+        if input.title.trim().is_empty() {
             "无标题".into()
         } else {
-            input.title
+            input.title.trim().to_string()
         },
     );
-    session.profile = input.profile;
+    session.host_id = input.host_id;
+    session.agent_id = input.agent_id;
+    if !session.host_id.is_empty() {
+        session.run_id = uuid::Uuid::new_v4().to_string();
+    }
     session.yolo = input.yolo;
-    let settings = merged_settings(state, &username);
-    session.launch_args = input.launch_args.unwrap_or_else(|| {
-        if kind == AgentKind::Codex {
-            settings.codex_args.clone()
-        } else {
-            settings.hermes_args.clone()
+    session.launch_args = input.launch_args.unwrap_or_default();
+    if !valid_args(&session.launch_args) {
+        return fail(
+            StatusCode::BAD_REQUEST,
+            "启动参数最多允许 128 项且参数不能包含 NUL",
+        );
+    }
+
+    if !session.host_id.is_empty() {
+        let hosts = state.hosts.read().unwrap();
+        if !hosts.iter().any(|host| host.id == session.host_id) {
+            return fail(StatusCode::NOT_FOUND, "注册主机不存在");
         }
-    });
-    if let Err(e) = state.runtime.start_agent(session.clone()) {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, e);
+        if !state.runtime.remote.is_connected(&session.host_id) {
+            return fail(StatusCode::SERVICE_UNAVAILABLE, "目标主机当前未连接");
+        }
+        let (program, args, env) = match command_spec(&session, &settings) {
+            Ok(spec) => spec,
+            Err(error) => return fail(StatusCode::BAD_REQUEST, error),
+        };
+        let command = json!({"type":"pty.open","session_id":session.id,"run_id":session.run_id,"program":program,"args":args,"env":env,"cwd":session.workspace});
+        if let Err(error) = modify_remote_sessions(state, |sessions| {
+            sessions.push(session.clone());
+            Ok(())
+        }) {
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
+        }
+        if let Err(error) = state.runtime.remote.send(&session.host_id, command) {
+            let _ = modify_remote_sessions(state, |sessions| {
+                sessions.retain(|row| row.id != session.id);
+                Ok(())
+            });
+            return fail(StatusCode::SERVICE_UNAVAILABLE, error);
+        }
+        drop(hosts);
+    } else {
+        if !state.runtime.available(kind) {
+            return fail(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("{} CLI unavailable", kind.as_str()),
+            );
+        }
+        if let Err(error) = state.runtime.start_agent(session.clone()) {
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
+        }
     }
     state.runtime.update_catalog_session(session.clone());
     Ok((StatusCode::CREATED, Json(session)).into_response())
 }
+
 async fn agent_get(state: &Arc<AppState>, headers: &HeaderMap, kind: AgentKind, id: &str) -> Api {
     require(state, headers)?;
-    match state.runtime.session(kind, id) {
-        Ok(v) => ok(v),
-        Err(_) => fail(StatusCode::NOT_FOUND, "session not found"),
+    match agent_session(state, kind, id) {
+        Some(session) => ok(session),
+        None => fail(StatusCode::NOT_FOUND, "session not found"),
     }
 }
+
 #[derive(Deserialize)]
 struct Rename {
     title: String,
 }
+
 async fn agent_rename(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -1119,24 +1636,31 @@ async fn agent_rename(
     if input.title.trim().is_empty() {
         return fail(StatusCode::BAD_REQUEST, "title is required");
     }
-    let mut session = match state.runtime.session(kind, id) {
-        Ok(v) => v,
-        Err(_) => return fail(StatusCode::NOT_FOUND, "session not found"),
+    let Some(mut session) = agent_session(state, kind, id) else {
+        return fail(StatusCode::NOT_FOUND, "session not found");
     };
-    let result = if kind == AgentKind::Pi {
-        state.runtime.rename_pi(&session, input.title.trim())
-    } else {
-        state.runtime.rename_hermes(&session, input.title.trim())
-    };
-    if let Err(e) = result {
-        return fail(StatusCode::BAD_GATEWAY, e);
-    }
     session.title = input.title.trim().into();
     session.updated_at = chrono::Utc::now();
-    state.runtime.terminals.update_session(session.clone());
+    if !session.host_id.is_empty() {
+        match modify_remote_sessions(state, |sessions| {
+            if let Some(row) = sessions.iter_mut().find(|row| row.id == id) {
+                *row = session.clone();
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }) {
+            Ok(true) => {}
+            Ok(false) => return fail(StatusCode::NOT_FOUND, "session not found"),
+            Err(error) => return fail(StatusCode::INTERNAL_SERVER_ERROR, error),
+        }
+    } else {
+        state.runtime.terminals.update_session(session.clone());
+    }
     state.runtime.update_catalog_session(session.clone());
     ok(session)
 }
+
 async fn agent_history(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -1144,36 +1668,47 @@ async fn agent_history(
     id: &str,
 ) -> Api {
     require(state, headers)?;
-    let session = match state.runtime.session(kind, id) {
-        Ok(v) => v,
-        Err(_) => return fail(StatusCode::NOT_FOUND, "session not found"),
+    let Some(session) = agent_session(state, kind, id) else {
+        return fail(StatusCode::NOT_FOUND, "session not found");
     };
     match state.runtime.history(&session) {
-        Ok(v) => ok(v),
-        Err(e) => fail(
-            if kind == AgentKind::Hermes {
-                StatusCode::BAD_GATEWAY
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            },
-            e,
-        ),
+        Ok(rows) => ok(rows),
+        Err(error) => fail(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
 }
+
 async fn agent_stop(state: &Arc<AppState>, headers: &HeaderMap, kind: AgentKind, id: &str) -> Api {
     require(state, headers)?;
-    if state.runtime.session(kind, id).is_err() {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, "session not found");
-    }
-    if let Err(e) = state.runtime.terminals.stop(id) {
-        return fail(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
-    if let Ok(mut session) = state.runtime.session(kind, id) {
+    let Some(mut session) = agent_session(state, kind, id) else {
+        return fail(StatusCode::NOT_FOUND, "session not found");
+    };
+    if !session.host_id.is_empty() {
+        if let Err(error) = stop_remote_session(state, &session).await {
+            return fail(StatusCode::SERVICE_UNAVAILABLE, error);
+        }
         session.status = "ended".into();
-        state.runtime.update_catalog_session(session);
+        session.updated_at = chrono::Utc::now();
+        if let Err(error) = modify_remote_sessions(state, |sessions| {
+            if let Some(row) = sessions.iter_mut().find(|row| row.id == id) {
+                *row = session.clone();
+            }
+            Ok(())
+        }) {
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
+        }
+    } else {
+        if let Err(error) = state.runtime.terminals.stop(id) {
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
+        }
+        if let Some(updated) = agent_session(state, kind, id) {
+            session = updated;
+        }
+        session.status = "ended".into();
     }
+    state.runtime.update_catalog_session(session);
     no_content()
 }
+
 async fn agent_remove(
     state: &Arc<AppState>,
     headers: &HeaderMap,
@@ -1181,14 +1716,26 @@ async fn agent_remove(
     id: &str,
 ) -> Api {
     require(state, headers)?;
-    let session = match state.runtime.session(kind, id) {
-        Ok(v) => v,
-        Err(_) => return fail(StatusCode::NOT_FOUND, "session not found"),
+    let Some(session) = agent_session(state, kind, id) else {
+        return fail(StatusCode::NOT_FOUND, "session not found");
     };
-    let _ = state.runtime.terminals.stop(id);
-    if let Err(e) = state.runtime.delete_native(&session) {
-        return fail(StatusCode::BAD_GATEWAY, e);
+    if !session.host_id.is_empty() {
+        if let Err(error) = stop_remote_session(state, &session).await {
+            return fail(StatusCode::SERVICE_UNAVAILABLE, error);
+        }
+        if let Err(error) = modify_remote_sessions(state, |sessions| {
+            sessions.retain(|row| row.id != id);
+            Ok(())
+        }) {
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
+        }
+    } else {
+        let _ = state.runtime.terminals.stop(id);
+        if let Err(error) = state.runtime.delete_native(&session) {
+            return fail(StatusCode::BAD_GATEWAY, error);
+        }
     }
+    state.runtime.remote.forget_session(id);
     state.runtime.remove_catalog_session(kind, id);
     no_content()
 }
@@ -1258,26 +1805,15 @@ kind_handlers!(
     AgentKind::Codex
 );
 kind_handlers!(
-    list_hermes,
-    refresh_hermes,
-    create_hermes,
-    get_hermes,
-    rename_hermes,
-    history_hermes,
-    stop_hermes,
-    remove_hermes,
-    AgentKind::Hermes
-);
-kind_handlers!(
-    list_pi,
-    refresh_pi,
-    create_pi,
-    get_pi,
-    rename_pi,
-    history_pi,
-    stop_pi,
-    remove_pi,
-    AgentKind::Pi
+    list_command,
+    refresh_command,
+    create_command,
+    get_command,
+    rename_command,
+    history_command,
+    stop_command,
+    remove_command,
+    AgentKind::Command
 );
 
 async fn local_terminal(
@@ -1296,21 +1832,13 @@ async fn codex_terminal(
 ) -> Api {
     session_terminal(state, headers, id, ws, AgentKind::Codex).await
 }
-async fn hermes_terminal(
+async fn command_terminal(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
     ws: WebSocketUpgrade,
 ) -> Api {
-    session_terminal(state, headers, id, ws, AgentKind::Hermes).await
-}
-async fn pi_terminal(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    AxumPath(id): AxumPath<String>,
-    ws: WebSocketUpgrade,
-) -> Api {
-    session_terminal(state, headers, id, ws, AgentKind::Pi).await
+    session_terminal(state, headers, id, ws, AgentKind::Command).await
 }
 async fn session_terminal(
     state: Arc<AppState>,
@@ -1324,6 +1852,15 @@ async fn session_terminal(
     let Some(session) = find_terminal_session(&state, kind, &id) else {
         return fail(StatusCode::NOT_FOUND, "session not found");
     };
+    if !session.host_id.is_empty() {
+        if !state.runtime.remote.is_connected(&session.host_id) {
+            return fail(StatusCode::SERVICE_UNAVAILABLE, "目标主机当前未连接");
+        }
+        let auth_headers = headers.clone();
+        return Ok(ws
+            .on_upgrade(move |socket| remote_terminal_socket(socket, state, auth_headers, session))
+            .into_response());
+    }
     if !state.runtime.terminals.running(&id) {
         let result = match kind {
             AgentKind::Local => state
@@ -1341,11 +1878,340 @@ async fn session_terminal(
         .into_response())
 }
 fn find_terminal_session(state: &AppState, kind: AgentKind, id: &str) -> Option<Session> {
-    match kind {
-        AgentKind::Local => state.locals.read().unwrap().get(id).cloned(),
-        _ => state.runtime.session(kind, id).ok(),
+    agent_session(state, kind, id)
+}
+
+async fn client_connect(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    ws: WebSocketUpgrade,
+) -> Api {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let Some(token) = token else {
+        return fail(StatusCode::UNAUTHORIZED, "client token required");
+    };
+    let host = state
+        .hosts
+        .read()
+        .unwrap()
+        .iter()
+        .find(|host| host.id == id)
+        .cloned();
+    let Some(mut host) = host.filter(|host| host.token_hash == token_hash(token)) else {
+        return fail(StatusCode::UNAUTHORIZED, "invalid client token");
+    };
+    let platform = headers
+        .get("x-jian-platform")
+        .and_then(|value| value.to_str().ok())
+        .filter(|platform| platform.len() <= 32);
+    let home = headers
+        .get("x-jian-home")
+        .and_then(|value| value.to_str().ok())
+        .filter(|home| home.len() <= 4096);
+    if platform.is_some() || home.is_some() {
+        let mut hosts = state.hosts.write().unwrap();
+        let mut next = hosts.clone();
+        {
+            let Some(updated) = next.iter_mut().find(|registered| registered.id == id) else {
+                return fail(StatusCode::NOT_FOUND, "主机不存在");
+            };
+            if updated.token_hash != token_hash(token) {
+                return fail(StatusCode::UNAUTHORIZED, "invalid client token");
+            }
+            if let Some(platform) = platform {
+                updated.platform = platform.to_string();
+            }
+            if let Some(home) = home {
+                updated.home = home.to_string();
+            }
+        }
+        let Some(updated) = next.iter().find(|registered| registered.id == id).cloned() else {
+            return fail(StatusCode::NOT_FOUND, "主机不存在");
+        };
+        if let Err(error) = save_hosts(&state, &next) {
+            return fail(StatusCode::INTERNAL_SERVER_ERROR, error);
+        }
+        host = updated;
+        *hosts = next;
+    }
+    Ok(ws
+        .on_upgrade(move |socket| remote_client_socket(socket, state, host))
+        .into_response())
+}
+
+async fn remote_client_socket(socket: WebSocket, state: Arc<AppState>, host: RegisteredHost) {
+    let (connection_id, mut commands) = {
+        let hosts = state.hosts.read().unwrap();
+        let authorized = hosts
+            .iter()
+            .any(|current| current.id == host.id && current.token_hash == host.token_hash);
+        if !authorized {
+            return;
+        }
+        state.runtime.remote.connect(host.id.clone())
+    };
+    let (mut sender, mut receiver) = socket.split();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(25));
+    let mut handshaken = false;
+    let handshake_timeout = tokio::time::sleep(Duration::from_secs(10));
+    tokio::pin!(handshake_timeout);
+    loop {
+        tokio::select! {
+            _ = &mut handshake_timeout, if !handshaken => break,
+            _ = heartbeat.tick() => {
+                if sender.send(WsMessage::Ping(Vec::new().into())).await.is_err() { break; }
+            }
+            command = commands.recv() => match command {
+                Some(text) => {
+                    let revoke = serde_json::from_str::<Value>(&text).ok().and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned)).as_deref() == Some("client.revoke");
+                    if sender.send(WsMessage::Text(text.into())).await.is_err() || revoke { break; }
+                }
+                None => break,
+            },
+            message = receiver.next() => match message {
+                Some(Ok(WsMessage::Text(text))) => {
+                    if !state.runtime.remote.owns_connection(&host.id, &connection_id) {
+                        break;
+                    }
+                    let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
+                    match value.get("type").and_then(Value::as_str) {
+                        Some("client.hello") => {
+                            if value.get("protocol").and_then(Value::as_u64) != Some(1) {
+                                let _ = sender.send(WsMessage::Text(json!({"type":"client.incompatible","protocol":1}).to_string().into())).await;
+                                break;
+                            }
+                            handshaken = true;
+                            let platform = value.get("platform").and_then(Value::as_str).filter(|value| value.len() <= 32);
+                            let home = value.get("home").and_then(Value::as_str).filter(|value| value.len() <= 4096);
+                            if platform.is_some() || home.is_some() {
+                                let mut hosts = state.hosts.write().unwrap();
+                                let mut next = hosts.clone();
+                                if let Some(current) = next.iter_mut().find(|current| current.id == host.id) {
+                                    let changed = platform.is_some_and(|value| current.platform != value)
+                                        || home.is_some_and(|value| current.home != value);
+                                    if let Some(platform) = platform { current.platform = platform.to_string(); }
+                                    if let Some(home) = home { current.home = home.to_string(); }
+                                    if changed {
+                                        match save_hosts(&state, &next) {
+                                            Ok(()) => *hosts = next,
+                                            Err(error) => tracing::error!(%error, "could not persist remote host details"),
+                                        }
+                                    }
+                                }
+                            }
+                            let active = value.get("sessions").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter_map(|value| {
+                                Some((value.get("session_id")?.as_str()?.to_owned(), value.get("run_id")?.as_str()?.to_owned()))
+                            }).collect::<HashMap<_, _>>();
+                            let reconciled = modify_remote_sessions(&state, |sessions| {
+                                let mut changed = Vec::new();
+                                let mut stale = Vec::new();
+                                for session in sessions.iter_mut().filter(|session| session.host_id == host.id) {
+                                    let old_status = session.status.clone();
+                                    let old_run = session.run_id.clone();
+                                    if let Some(run_id) = active.get(&session.id) {
+                                        if session.run_id.is_empty() {
+                                            session.run_id = run_id.clone();
+                                        }
+                                        if session.run_id == *run_id {
+                                            session.status = "running".into();
+                                        } else {
+                                            stale.push((session.id.clone(), run_id.clone()));
+                                            session.status = "ended".into();
+                                        }
+                                    } else {
+                                        session.status = "ended".into();
+                                    }
+                                    if session.status != old_status || session.run_id != old_run {
+                                        session.updated_at = chrono::Utc::now();
+                                        changed.push(session.clone());
+                                    }
+                                }
+                                Ok((changed, stale))
+                            });
+                            match reconciled {
+                                Ok((changed, stale)) => {
+                                    for session in changed { state.runtime.update_catalog_session(session); }
+                                    for (session_id, run_id) in stale {
+                                        let _ = state.runtime.remote.send(&host.id, json!({"type":"pty.stop","session_id":session_id,"run_id":run_id}));
+                                    }
+                                }
+                                Err(error) => tracing::error!(%error, "could not reconcile remote sessions"),
+                            }
+                        }
+                        Some("pty.output" | "pty.exit" | "pty.stopped" | "session.started" | "session.replay.complete") if handshaken => {
+                            let session_id = value.get("session_id").and_then(Value::as_str).unwrap_or_default();
+                            let run_id = value.get("run_id").and_then(Value::as_str).unwrap_or_default();
+                            if session_id.is_empty() || run_id.is_empty() { continue; }
+                            let event_type = value.get("type").and_then(Value::as_str).unwrap_or_default();
+                            let status_update = if matches!(event_type, "pty.exit" | "pty.stopped") {
+                                Some("ended")
+                            } else if event_type == "session.started" {
+                                Some(if value.pointer("/payload/running").and_then(Value::as_bool).unwrap_or(false) { "running" } else { "ended" })
+                            } else { None };
+                            let updated = if let Some(status) = status_update {
+                                match modify_remote_sessions(&state, |sessions| {
+                                    let Some(session) = sessions.iter_mut().find(|session| session.id == session_id && session.host_id == host.id && session.run_id == run_id) else { return Ok(None) };
+                                    if session.status == status { return Ok(None); }
+                                    session.status = status.into();
+                                    session.updated_at = chrono::Utc::now();
+                                    Ok(Some(session.clone()))
+                                }) {
+                                    Ok(session) => session,
+                                    Err(error) => { tracing::error!(%error, "could not persist remote session state"); continue; }
+                                }
+                            } else {
+                                state.remote_sessions.read().unwrap().iter().find(|session| session.id == session_id && session.host_id == host.id && session.run_id == run_id).cloned()
+                            };
+                            let Some(session) = updated else { continue; };
+                            if matches!(event_type, "pty.exit" | "pty.stopped" | "session.started") {
+                                state.runtime.update_catalog_session(session);
+                            }
+                            state.runtime.remote.publish(session_id, text.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                Some(Ok(WsMessage::Ping(data))) => { let _ = sender.send(WsMessage::Pong(data)).await; }
+                Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => break,
+                _ => {}
+            }
+        }
+    }
+    if state.runtime.remote.disconnect(&host.id, &connection_id) {
+        match modify_remote_sessions(&state, |sessions| {
+            let mut changed = Vec::new();
+            for session in sessions
+                .iter_mut()
+                .filter(|session| session.host_id == host.id && session.status == "running")
+            {
+                session.status = "offline".into();
+                session.updated_at = chrono::Utc::now();
+                changed.push(session.clone());
+            }
+            Ok(changed)
+        }) {
+            Ok(changed) => {
+                for session in changed {
+                    state.runtime.update_catalog_session(session);
+                }
+            }
+            Err(error) => tracing::error!(%error, "could not mark remote sessions offline"),
+        }
     }
 }
+
+async fn remote_terminal_socket(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    session: Session,
+) {
+    let session_id = session.id.clone();
+    let host_id = session.host_id.clone();
+    let mut attach_id = uuid::Uuid::new_v4().to_string();
+    let mut events = state.runtime.remote.subscribe(&session_id);
+    let _ = state.runtime.remote.send(
+        &host_id,
+        json!({"type":"pty.attach","session_id":session_id,"run_id":session.run_id,"attach_id":attach_id}),
+    );
+    let mut replaying = true;
+    let mut buffered: Vec<String> = Vec::new();
+    let mut connection_check = tokio::time::interval(Duration::from_secs(1));
+    let connection_id = uuid::Uuid::new_v4().to_string();
+    let mut owns_resize = claim_resize_owner(
+        &mut state.resize_owners.lock().unwrap(),
+        &session_id,
+        &connection_id,
+    );
+    let (mut sender, mut receiver) = socket.split();
+    loop {
+        tokio::select! {
+            _ = connection_check.tick() => {
+                if !state.runtime.remote.is_connected(&host_id) {
+                    let _ = sender.send(WsMessage::Text(json!({"session_id":session_id,"run_id":session.run_id,"seq":0,"type":"session.disconnected","payload":{}}).to_string().into())).await;
+                    break;
+                }
+            }
+            event = events.recv() => match event {
+                Ok(text) => {
+                    let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
+                    if value.get("run_id").and_then(Value::as_str) != Some(session.run_id.as_str()) { continue; }
+                    let event_attach = value.get("attach_id").and_then(Value::as_str);
+                    if let Some(event_attach) = event_attach {
+                        if event_attach != attach_id { continue; }
+                        if value.get("type").and_then(Value::as_str) == Some("session.replay.complete") {
+                            let replay_seq = value.get("seq").and_then(Value::as_u64).unwrap_or(0);
+                            replaying = false;
+                            if sender.send(WsMessage::Text(text.clone().into())).await.is_err() { break; }
+                            for queued in buffered.drain(..) {
+                                let Ok(queued_value) = serde_json::from_str::<Value>(&queued) else { continue; };
+                                let seq = queued_value.get("seq").and_then(Value::as_u64).unwrap_or(0);
+                                if seq > replay_seq && sender.send(WsMessage::Text(queued.into())).await.is_err() { break; }
+                            }
+                            continue;
+                        }
+                        if sender.send(WsMessage::Text(text.into())).await.is_err() { break; }
+                    } else if replaying && value.get("type").and_then(Value::as_str) != Some("pty.stopped") {
+                        if buffered.len() < 128 { buffered.push(text.to_string()); }
+                    } else if sender.send(WsMessage::Text(text.into())).await.is_err() { break; }
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    attach_id = uuid::Uuid::new_v4().to_string();
+                    replaying = true;
+                    buffered.clear();
+                    let _ = state.runtime.remote.send(&host_id, json!({"type":"pty.attach","session_id":session_id,"run_id":session.run_id,"attach_id":attach_id}));
+                },
+                Err(_) => break,
+            },
+            message = receiver.next() => match message {
+                Some(Ok(WsMessage::Text(text))) => {
+                    if current(&state, &headers).is_none() {
+                        let _ = sender.send(WsMessage::Text(json!({"session_id":session_id,"run_id":session.run_id,"seq":0,"type":"auth.expired","payload":{}}).to_string().into())).await;
+                        break;
+                    }
+                    let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
+                    let command = match value.get("type").and_then(Value::as_str) {
+                        Some("input") => value.get("data").and_then(Value::as_str).filter(|data| data.len() <= 64 * 1024).map(|data| json!({"type":"pty.input","session_id":session_id,"run_id":session.run_id,"data":data})),
+                        Some("resize") => {
+                            if let (Some(cols), Some(rows)) = (value.get("cols").and_then(Value::as_u64).and_then(|v| u16::try_from(v).ok()), value.get("rows").and_then(Value::as_u64).and_then(|v| u16::try_from(v).ok())) {
+                                if !owns_resize {
+                                    owns_resize = claim_resize_owner(&mut state.resize_owners.lock().unwrap(), &session_id, &connection_id);
+                                }
+                                owns_resize.then(|| json!({"type":"pty.resize","session_id":session_id,"run_id":session.run_id,"cols":cols,"rows":rows}))
+                            } else { None }
+                        }
+                        Some("interrupt") => Some(json!({"type":"pty.interrupt","session_id":session_id,"run_id":session.run_id})),
+                        Some("attachment") => value.get("data").and_then(Value::as_str).filter(|data| data.len() <= (16_usize * 1024 * 1024).div_ceil(3) * 4).map(|data| json!({"type":"pty.attachment","session_id":session_id,"run_id":session.run_id,"name":value.get("name").and_then(Value::as_str).unwrap_or("attachment.bin"),"data":data})),
+                        Some("ping") => {
+                            let _ = sender.send(WsMessage::Text(json!({"type":"pong"}).to_string().into())).await;
+                            None
+                        }
+                        _ => None,
+                    };
+                    if let Some(command) = command
+                        && state.runtime.remote.send(&host_id, command).is_err()
+                    {
+                        let _ = sender.send(WsMessage::Text(json!({"session_id":session_id,"seq":0,"type":"session.disconnected","payload":{}}).to_string().into())).await;
+                        break;
+                    }
+                }
+                Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => break,
+                _ => {}
+            }
+        }
+    }
+    if owns_resize {
+        let mut owners = state.resize_owners.lock().unwrap();
+        if owners.get(&session_id) == Some(&connection_id) {
+            owners.remove(&session_id);
+        }
+    }
+}
+
 fn same_origin(headers: &HeaderMap) -> std::result::Result<(), Response> {
     if let (Some(origin), Some(host)) = (
         headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()),
@@ -1396,6 +2262,8 @@ async fn api_websocket(
 async fn api_socket(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap, username: String) {
     let (mut sender, mut receiver) = socket.split();
     let (outgoing, mut replies) = mpsc::channel::<WsMessage>(32);
+    let api = api_routes(state.clone());
+    let inflight = Arc::new(tokio::sync::Semaphore::new(16));
     let writer = tokio::spawn(async move {
         let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
         loop {
@@ -1445,7 +2313,14 @@ async fn api_socket(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap,
             continue;
         };
         if value.get("type").and_then(Value::as_str) == Some("ping") {
-            let _ = current(&state, &headers);
+            if current(&state, &headers).is_none() {
+                let _ = outgoing
+                    .send(WsMessage::Text(
+                        json!({"type":"auth.expired"}).to_string().into(),
+                    ))
+                    .await;
+                break;
+            }
             let _ = outgoing
                 .send(WsMessage::Text(json!({"type":"pong"}).to_string().into()))
                 .await;
@@ -1454,9 +2329,17 @@ async fn api_socket(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap,
         let Ok(input) = serde_json::from_value::<RpcRequest>(value) else {
             continue;
         };
-        let (state, headers, outgoing) = (state.clone(), headers.clone(), outgoing.clone());
+        let permit = match inflight.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                let _ = outgoing.send(WsMessage::Text(json!({"id":input.id,"status":503,"body":{"error":"too many concurrent API requests"}}).to_string().into())).await;
+                continue;
+            }
+        };
+        let (api, headers, outgoing) = (api.clone(), headers.clone(), outgoing.clone());
         tokio::spawn(async move {
-            let reply = rpc_response(state, headers, input).await;
+            let _permit = permit;
+            let reply = rpc_response(api, headers, input).await;
             let _ = outgoing
                 .send(WsMessage::Text(reply.to_string().into()))
                 .await;
@@ -1466,7 +2349,7 @@ async fn api_socket(socket: WebSocket, state: Arc<AppState>, headers: HeaderMap,
     notifications.abort();
 }
 
-async fn rpc_response(state: Arc<AppState>, headers: HeaderMap, input: RpcRequest) -> Value {
+async fn rpc_response(api: Router, headers: HeaderMap, input: RpcRequest) -> Value {
     let bad_request = |error: &str| json!({"id":input.id,"status":400,"body":{"error":error}});
     let (method, uri) = match rpc_target(&input.method, &input.path) {
         Ok(target) => target,
@@ -1485,9 +2368,12 @@ async fn rpc_response(state: Arc<AppState>, headers: HeaderMap, input: RpcReques
     if let Some(cookie) = headers.get(header::COOKIE) {
         request.headers_mut().insert(header::COOKIE, cookie.clone());
     }
-    let response = api_routes(state).oneshot(request).await.unwrap();
+    let response = api.oneshot(request).await.unwrap();
     let (parts, body) = response.into_parts();
-    let bytes = to_bytes(body, 16 * 1024 * 1024).await.unwrap_or_default();
+    let bytes = match to_bytes(body, 16 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(error) => return json!({"id":input.id,"status":502,"body":{"error":error.to_string()}}),
+    };
     let body = if bytes.is_empty() {
         Value::Null
     } else {
@@ -1575,6 +2461,10 @@ async fn terminal_socket(socket: WebSocket, state: Arc<AppState>, headers: Heade
             },
             message = receiver.next() => match message {
                 Some(Ok(WsMessage::Text(text))) => {
+                    if current(&state, &headers).is_none() {
+                        let _ = sender.send(WsMessage::Text(json!({"session_id":id,"seq":0,"type":"auth.expired","payload":{}}).to_string().into())).await;
+                        break;
+                    }
                     let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
                     match value.get("type").and_then(Value::as_str) {
                         Some("input") => {
@@ -1636,22 +2526,43 @@ async fn terminal_socket(socket: WebSocket, state: Arc<AppState>, headers: Heade
 }
 
 async fn static_asset(uri: Uri) -> Response {
-    let mut name = uri.path().trim_start_matches('/').to_string();
-    if name.is_empty() {
-        name = "index.html".into()
+    let path = uri.path();
+    if path == "/api" || path.starts_with("/api/") {
+        return StatusCode::NOT_FOUND.into_response();
     }
-    let asset = Assets::get(&name).or_else(|| Assets::get("index.html"));
-    match asset {
-        Some(file) => {
-            let mime = mime_guess::from_path(&name).first_or_octet_stream();
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, mime.as_ref())
-                .body(Body::from(file.data.into_owned()))
-                .unwrap()
+    let requested = path.trim_start_matches('/');
+    let requested = if requested.is_empty() {
+        "index.html"
+    } else {
+        requested
+    };
+    let (name, file) = match Assets::get(requested) {
+        Some(file) => (requested, file),
+        None if std::path::Path::new(requested)
+            .file_name()
+            .is_some_and(|name| !name.to_string_lossy().contains('.')) =>
+        {
+            let Some(file) = Assets::get("index.html") else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            ("index.html", file)
         }
-        None => StatusCode::NOT_FOUND.into_response(),
-    }
+        None => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let mime = mime_guess::from_path(name).first_or_octet_stream();
+    let cache = if name == "index.html" || name == "sw.js" {
+        "no-cache"
+    } else if name.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=300"
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime.as_ref())
+        .header(header::CACHE_CONTROL, cache)
+        .body(Body::from(file.data.into_owned()))
+        .unwrap()
 }
 fn expand_path(value: &str) -> PathBuf {
     if value == "~" {
@@ -1672,12 +2583,28 @@ fn normalize_profiles(values: &[String]) -> Vec<String> {
     out
 }
 fn clean_args(values: &[String]) -> Vec<String> {
-    values
-        .iter()
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-        .collect()
+    values.to_vec()
+}
+fn valid_args(values: &[String]) -> bool {
+    values.len() <= 128 && values.iter().all(|value| !value.contains('\0'))
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::{clean_args, valid_args};
+
+    #[test]
+    fn command_arguments_preserve_whitespace_and_empty_values() {
+        let values = vec![" --flag ".into(), String::new(), "two words".into()];
+        assert_eq!(clean_args(&values), values);
+    }
+
+    #[test]
+    fn command_arguments_reject_nul_and_excessive_count() {
+        assert!(!valid_args(&["bad\0arg".into()]));
+        assert!(!valid_args(&vec![String::new(); 129]));
+        assert!(valid_args(&vec![String::new(); 128]));
+    }
 }
 
 fn parse_config_arg(args: &[String]) -> Result<Option<PathBuf>> {
@@ -1739,10 +2666,11 @@ async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
 }
 
-const HELP: &str = "Jian — local workspace for persistent Bash, Codex, and Hermes sessions
+const HELP: &str = "Jian — web workspace for local and registered host sessions
 
 Usage:
-  jian [run] [-c, --config PATH]   Run the Jian server
+  jian serve [-c, --config PATH]   Run the Jian server
+  jian client connect ...          Connect a registered client host
   jian <command>                   Manage the systemd user service
 
 Commands:
@@ -1789,6 +2717,10 @@ fn cli(args: &[String]) -> Result<()> {
             run("journalctl", &a)
         }
         Some("deploy") if args.len() == 1 => deploy(),
+        Some("client") if args.len() > 1 => run(
+            "jian-client",
+            &args[1..].iter().map(String::as_str).collect::<Vec<_>>(),
+        ),
         Some(command) => {
             println!("{HELP}");
             Err(anyhow!("unknown command or invalid arguments: {command}"))
@@ -1839,11 +2771,7 @@ fn deploy() -> Result<()> {
     }
     let binary = std::env::current_exe()?;
     let mut inherited = String::new();
-    for (name, fallback) in [
-        ("PATH", ""),
-        ("JIAN_CODEX_BIN", "codex"),
-        ("JIAN_HERMES_BIN", "hermes"),
-    ] {
+    for (name, fallback) in [("PATH", ""), ("JIAN_CODEX_BIN", "codex")] {
         let value = std::env::var(name)
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -1855,16 +2783,6 @@ fn deploy() -> Result<()> {
         if let Some(value) = value {
             inherited.push_str(&format!("Environment={name}={}\n", systemd_quote(&value)));
         }
-    }
-    if let Some(home) = ["JIAN_HERMES_HOME", "HERMES_HOME"].iter().find_map(|name| {
-        std::env::var(name)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-    }) {
-        inherited.push_str(&format!(
-            "Environment=JIAN_HERMES_HOME={}\n",
-            systemd_quote(&home)
-        ));
     }
     let unit = format!(
         "[Unit]\nDescription=Jian Agent Workbench\nAfter=default.target\n\n[Service]\nType=simple\nWorkingDirectory={}\nExecStart={}\nEnvironmentFile=-%h/.local/jian/env\nEnvironment=JIAN_DB=%h/.local/jian/jian.db\n{}Restart=on-failure\nRestartSec=2s\n\n[Install]\nWantedBy=default.target\n",
@@ -1927,7 +2845,8 @@ mod cli_tests {
     #[test]
     fn help_documents_commands_and_aliases() {
         for text in [
-            "jian [run]",
+            "jian serve",
+            "jian client connect",
             "deploy, dep",
             "restart, rs",
             "status, st",
@@ -1971,6 +2890,21 @@ mod cli_tests {
             .unwrap();
         let started = source.find(r#"\"type\":\"session.started"#).unwrap();
         assert!(output < complete && complete < started);
+    }
+
+    #[tokio::test]
+    async fn static_assets_do_not_mask_missing_files_or_api_routes() {
+        let missing_asset = static_asset(Uri::from_static("/assets/missing.js")).await;
+        let missing_api = static_asset(Uri::from_static("/api/missing")).await;
+        let app_route = static_asset(Uri::from_static("/settings")).await;
+
+        assert_eq!(missing_asset.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing_api.status(), StatusCode::NOT_FOUND);
+        assert_eq!(app_route.status(), StatusCode::OK);
+        assert_eq!(
+            app_route.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
     }
 
     #[test]
@@ -2021,6 +2955,9 @@ mod cli_tests {
         let state = AppState {
             store: Arc::new(store),
             runtime: Runtime::new(AgentSettings::default()),
+            hosts: RwLock::new(vec![]),
+            remote_sessions: RwLock::new(vec![]),
+            settings_write: Mutex::new(()),
             locals: RwLock::new(HashMap::new()),
             attempts: Mutex::new(HashMap::new()),
             quick_notes: QuickNoteWorker::start(Arc::new(
@@ -2059,6 +2996,9 @@ mod cli_tests {
         let state = AppState {
             store: store.clone(),
             runtime: Runtime::new(AgentSettings::default()),
+            hosts: RwLock::new(vec![]),
+            remote_sessions: RwLock::new(vec![]),
+            settings_write: Mutex::new(()),
             locals: RwLock::new(HashMap::from([(local.id.clone(), local.clone())])),
             attempts: Mutex::new(HashMap::new()),
             quick_notes: QuickNoteWorker::start(store).unwrap(),
@@ -2073,7 +3013,7 @@ mod cli_tests {
             local.id
         );
         assert!(find_terminal_session(&state, AgentKind::Codex, "missing").is_none());
-        assert!(find_terminal_session(&state, AgentKind::Hermes, "missing").is_none());
+        assert!(find_terminal_session(&state, AgentKind::Command, "missing").is_none());
         let unauthorized = api_routes(Arc::new(state))
             .oneshot(
                 Request::builder()
@@ -2102,13 +3042,13 @@ mod cli_tests {
             )
             .unwrap();
         let runtime = Runtime::new(AgentSettings::default());
-        let session = Session::new(AgentKind::Hermes, "/tmp".into(), "Native".into());
+        let session = Session::new(AgentKind::Command, "/tmp".into(), "Native".into());
         runtime.update_catalog_session(session.clone());
         runtime
             .terminals
             .start(terminal::TerminalSpec {
                 session: session.clone(),
-                label: AgentKind::Hermes,
+                label: AgentKind::Command,
                 cwd: "/tmp".into(),
                 argv: vec!["/bin/bash".into(), "-c".into(), "sleep 20".into()],
                 env: std::env::vars().map(|(k, v)| format!("{k}={v}")).collect(),
@@ -2117,6 +3057,9 @@ mod cli_tests {
         let state = Arc::new(AppState {
             store: store.clone(),
             runtime: runtime.clone(),
+            hosts: RwLock::new(vec![]),
+            remote_sessions: RwLock::new(vec![]),
+            settings_write: Mutex::new(()),
             locals: RwLock::new(HashMap::new()),
             attempts: Mutex::new(HashMap::new()),
             quick_notes: QuickNoteWorker::start(store).unwrap(),
@@ -2135,7 +3078,7 @@ mod cli_tests {
                 .is_ok()
         );
         assert!(!runtime.terminals.running(&session.id));
-        let rows = runtime.catalog_state(AgentKind::Hermes).rows;
+        let rows = runtime.catalog_state(AgentKind::Command).rows;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, session.id);
         assert_eq!(rows[0].status, "ended");

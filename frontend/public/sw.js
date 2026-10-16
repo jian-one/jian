@@ -1,4 +1,4 @@
-const SHELL = 'jian-shell-v5';
+const SHELL = 'jian-shell-v6';
 self.addEventListener('install', event => event.waitUntil((async () => {
   const cache = await caches.open(SHELL);
   const response = await fetch('/');
@@ -25,6 +25,7 @@ self.addEventListener('fetch', event => {
     return;
   }
   if (request.method === 'GET' && url.origin === location.origin && !url.pathname.startsWith('/api/')) event.respondWith(fetch(request).then(response => {
-    const copy = response.clone(); caches.open(SHELL).then(cache => cache.put(request, copy)); return response;
+    if (response.ok) { const copy = response.clone(); caches.open(SHELL).then(cache => cache.put(request, copy)); }
+    return response;
   }).catch(() => caches.match(request)));
 });

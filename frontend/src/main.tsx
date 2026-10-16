@@ -25,7 +25,6 @@ import { adjacentTab, moveTab } from "./session-tabs";
 import {
   activeKindKey,
   activeAreaKey,
-  activeProfileKey,
   activeLocalSessionKey,
   themeKey,
   interfaceThemeKey,
@@ -47,6 +46,8 @@ import {
   type Theme,
   type Session,
   type SettingsResponse,
+  type Host,
+  type CommandConfig,
 } from "./shared/model";
 import {
   initialTerminalTheme,
@@ -139,11 +140,7 @@ function App() {
     [settingsOpen, setSettingsOpen] = useState(
       () => sessionStorage.getItem("jian.settings-open") === "1",
     ),
-    [agentEnabled, setAgentEnabled] = useState<Partial<Record<Kind, boolean>>>({
-      codex: true,
-      hermes: true,
-      pi: true,
-    });
+    [agentEnabled, setAgentEnabled] = useState<Partial<Record<Kind, boolean>>>({ codex: true, command: true });
   const [user, setUser] = useState<string | null>(null),
     [ready, setReady] = useState(false),
     [area, setArea] = useState<Kind | "local">(initialArea),
@@ -154,10 +151,8 @@ function App() {
     [openSessions, setOpenSessions] = useState<OpenSession[]>([]),
     [activeKey, setActiveKey] = useState<string | null>(null),
     [secondary, setSecondary] = useState<Session | null>(null),
-    [profiles, setProfiles] = useState<string[]>([]),
-    [profile, setProfile] = useState(
-      () => localStorage.getItem(activeProfileKey) || "default",
-    ),
+    [hosts, setHosts] = useState<Host[]>([]),
+    [commandConfigs, setCommandConfigs] = useState<CommandConfig[]>([]),
     [error, setError] = useState(""),
     [progress, setProgress] = useState(""),
     [refreshingKind, setRefreshingKind] = useState<Kind | null>(null),
@@ -184,10 +179,9 @@ function App() {
     [operationBusy, setOperationBusy] = useState(false),
     [connection, setConnection] = useState<ConnectionState>("disconnected"),
     [wideScreen, setWideScreen] = useState(() => window.matchMedia("(min-width: 1200px)").matches),
-    [catalogError, setCatalogError] = useState<{ kind: Kind; profile: string; message: string } | null>(null),
+    [catalogError, setCatalogError] = useState<{ kind: Kind; message: string } | null>(null),
     [visibleCounts, setVisibleCounts] = useState<Record<string, number>>({});
-  const token = useRef<SessionLoadVersion>({ current: 0 }),
-    hermesHomeSelected = useRef(false);
+  const token = useRef<SessionLoadVersion>({ current: 0 });
   const settingsBusyRef = useRef(false), creatingRef = useRef(false), authEpoch = useRef(0);
   const leavingSettings = useRef<(() => void) | null>(null);
   const operationInFlight = useRef(false);
@@ -249,7 +243,7 @@ function App() {
               ) || session
             : session,
         );
-        setCatalogError(slice.error ? { kind: target, profile, message: slice.error } : null);
+        setCatalogError(slice.error ? { kind: target, message: slice.error } : null);
       }
       if (
         currentTarget &&
@@ -257,14 +251,12 @@ function App() {
           hasOpenSessions: !!openSessions.length,
           hasActiveSession: !!active,
           isLocalArea: localStorage.getItem(activeAreaKey) === "local",
-          explicitHome: target === "hermes" && hermesHomeSelected.current,
         })
       ) {
         const restored = savedSession(
           rows,
-          localStorage.getItem(activeSessionKey(target, profile)) || (target === "pi" ? localStorage.getItem(activeSessionKey(target)) : null),
+          localStorage.getItem(activeSessionKey(target)),
           target,
-          profile,
         );
         if (restored) {
           setOpenSessions([restored]);
@@ -275,7 +267,7 @@ function App() {
       return true;
     } catch (e) {
       if (loadAuthEpoch === authEpoch.current && currentTarget && isCurrentSessionLoad(token.current, t))
-        setCatalogError({ kind: target, profile, message: errorMessage(e) });
+        setCatalogError({ kind: target, message: errorMessage(e) });
       return false;
     }
   };
@@ -306,18 +298,12 @@ function App() {
     setConnection("connecting");
     setProgress("正在加载会话…");
     setArea(session.kind);
-    localStorage.setItem(selectedSessionKey(session, profile), session.id);
+    localStorage.setItem(selectedSessionKey(session), session.id);
     if (session.kind === "local") localStorage.setItem(activeAreaKey, "local");
     else {
-      const nextProfile = session.profile || "default";
       localStorage.setItem(activeAreaKey, session.kind);
       localStorage.setItem(activeKindKey, session.kind);
       setKind(session.kind);
-      if (session.kind === "hermes" || session.kind === "pi") {
-        hermesHomeSelected.current = false;
-        localStorage.setItem(activeProfileKey, nextProfile);
-        setProfile(nextProfile);
-      }
     }
     if (isMobile()) setMobileNavigationOpen(false);
   };
@@ -349,19 +335,7 @@ function App() {
     if (user) {
       void load(kind);
     }
-  }, [user, area, kind, profile]);
-  useEffect(() => {
-    if (user && kind === "hermes")
-      void api<string[]>("/hermes/profiles")
-        .then((v) => {
-          setProfiles(v);
-          if (v.length && !v.includes(profile)) {
-            localStorage.setItem(activeProfileKey, v[0]);
-            setProfile(v[0]);
-          }
-        })
-        .catch(() => setProfiles([]));
-  }, [user, kind]);
+  }, [user, area, kind]);
   useEffect(() => {
     const media = window.matchMedia(mobileMedia);
     const update = () => { setCompactNavigation(media.matches); setMobileNavigationOpen(false); };
@@ -408,12 +382,6 @@ function App() {
     localStorage.setItem(interfaceThemeKey, theme);
   }, [theme]);
   useEffect(() => {
-    if (user && kind === "pi")
-      void api<string[]>("/pi/agents")
-        .then(setProfiles)
-        .catch(() => setProfiles([]));
-  }, [user, kind]);
-  useEffect(() => {
     localStorage.setItem(terminalThemeKey, terminalTheme);
   }, [terminalTheme]);
   useEffect(() => {
@@ -428,44 +396,36 @@ function App() {
   useEffect(() => {
     if (user)
       void api<SettingsResponse>("/settings")
-        .then((value) =>
-          setAgentEnabled({
-            codex: value.settings.codex_enabled !== false,
-            hermes: value.settings.hermes_enabled !== false,
-            pi: value.settings.pi_enabled !== false,
-          }),
-        )
+        .then((value) => {
+          setAgentEnabled({ codex: value.settings.codex_enabled !== false, command: value.settings.command_enabled !== false });
+          setHosts(value.hosts || []);
+          setCommandConfigs(value.settings.command_configs || []);
+        })
         .catch(() => {});
   }, [user]);
   useEffect(() => {
     window.dispatchEvent(
       new CustomEvent("jian-agent-settings", { detail: agentEnabled }),
     );
-  }, [agentEnabled.codex, agentEnabled.hermes, agentEnabled.pi]);
+  }, [agentEnabled.codex, agentEnabled.command]);
   useEffect(() => {
     if (settingsOpen) sessionStorage.setItem("jian.settings-open", "1");
     else sessionStorage.removeItem("jian.settings-open");
   }, [settingsOpen]);
   useEffect(() => {
     localStorage.setItem("jian.codex-enabled", String(agentEnabled.codex));
-    localStorage.setItem("jian.hermes-enabled", String(agentEnabled.hermes));
-    localStorage.setItem("jian.pi-enabled", String(agentEnabled.pi));
+    localStorage.setItem("jian.command-enabled", String(agentEnabled.command));
     if (area === "codex" && !agentEnabled.codex) {
       setArea("local");
       setActive(null);
       setActiveKey(null);
     }
-    if (area === "hermes" && !agentEnabled.hermes) {
+    if (area === "command" && !agentEnabled.command) {
       setArea("local");
       setActive(null);
       setActiveKey(null);
     }
-    if (area === "pi" && !agentEnabled.pi) {
-      setArea("local");
-      setActive(null);
-      setActiveKey(null);
-    }
-  }, [agentEnabled.codex, agentEnabled.hermes, agentEnabled.pi, area]);
+  }, [agentEnabled.codex, agentEnabled.command, area]);
   useEffect(() => {
     setLocalSessions((catalog.areas.local?.rows || []) as LocalSession[]);
     setCatalogError(null);
@@ -492,7 +452,7 @@ function App() {
     };
     window.addEventListener("jian-enter-terminal", enter);
     return () => window.removeEventListener("jian-enter-terminal", enter);
-  }, [all, localSessions, profile]);
+  }, [all, localSessions]);
   useEffect(() => {
     const releaseAll = () => {
       setOpenSessions([]);
@@ -502,12 +462,12 @@ function App() {
       setProgress("已释放所有会话");
       localStorage.removeItem(activeLocalSessionKey);
       localStorage.removeItem(activeSessionKey("codex"));
-      localStorage.removeItem(activeSessionKey("hermes", profile));
+      localStorage.removeItem(activeSessionKey("command"));
     };
     window.addEventListener("jian-release-all-terminals", releaseAll);
     return () =>
       window.removeEventListener("jian-release-all-terminals", releaseAll);
-  }, [profile]);
+  }, []);
   const tabsRef = useRef({ order: tabOrder, selected: activeKey, sessions: openSessions, underlying: activeKey, attached: terminalAttached });
   tabsRef.current = { order: tabOrder, selected: activeKey, sessions: openSessions, underlying: activeKey, attached: terminalAttached };
   if (!ready) return null;
@@ -532,8 +492,8 @@ function App() {
     const replacement = adjacentTab(order, key);
     setTabOrder(current => current.filter(item => item !== key));
     setOpenSessions(current => current.filter(item => openSessionKey(item) !== key));
-    if (closed && localStorage.getItem(selectedSessionKey(closed, profile)) === closed.id)
-      localStorage.removeItem(selectedSessionKey(closed, profile));
+    if (closed && localStorage.getItem(selectedSessionKey(closed)) === closed.id)
+      localStorage.removeItem(selectedSessionKey(closed));
     if (key !== selected) {
       if (key === underlying) clearActive();
       return;
@@ -542,7 +502,7 @@ function App() {
     if (next) activate(next); else clearActive();
   };
   const createLocal = async () => {
-    try { await create(undefined, [], "default", "local"); }
+    try { await create(undefined, [], "local"); }
     catch (e) { setError(errorMessage(e)); }
   };
   const removeLocal = async (session: LocalSession) => {
@@ -558,24 +518,18 @@ function App() {
   const create = async (
     workspace: string | undefined,
     launchArgs: string[] = [],
-    targetProfile = profile,
     targetKind: Kind | "local" = kind,
+    hostId = "",
+    agentId = "",
   ) => {
     if (navigationLocked()) return;
     creatingRef.current = true; setCreating(true);
     const epoch = authEpoch.current;
     try {
-      if (targetKind === "pi" && workspace === undefined) {
-        const { settings } = await api<SettingsResponse>("/settings");
-        if (epoch !== authEpoch.current) return;
-        const role = settings.pi_roles.find(item => item.name === targetProfile);
-        if (!role) throw new Error("Pi 角色不存在");
-        workspace = role.home;
-      }
       invalidateSessionLoads(token.current);
       const x = await api<OpenSession>(targetKind === "local" ? "/local/sessions" : `/agents/${targetKind}/sessions`, {
         method: "POST",
-        body: JSON.stringify(targetKind === "local" ? {} : { workspace, launch_args: launchArgs, ...(targetKind === "hermes" || targetKind === "pi" ? { profile: targetProfile } : {}) }),
+        body: JSON.stringify(targetKind === "local" ? {} : { workspace, host_id: hostId, agent_id: agentId, launch_args: launchArgs }),
       });
       if (epoch !== authEpoch.current) return;
       invalidateSessionLoads(token.current);
@@ -594,21 +548,21 @@ function App() {
     if (mode === "rename") {
       const x = activeView(
         await api<Session>(
-          `/agents/${kind}/sessions/${encodeURIComponent(s.id)}`,
+          `/agents/${s.kind}/sessions/${encodeURIComponent(s.id)}`,
           { method: "PATCH", body: JSON.stringify({ title }) },
         ),
       );
       choose(x);
     } else {
-      await api(`/agents/${kind}/sessions/${encodeURIComponent(s.id)}`, {
+      await api(`/agents/${s.kind}/sessions/${encodeURIComponent(s.id)}`, {
         method: "DELETE",
       });
       catalog.remove(s);
       closeTab(openSessionKey(s));
-      localStorage.removeItem(selectedSessionKey(s, profile));
+      localStorage.removeItem(selectedSessionKey(s));
     }
     setDialog(null);
-    await load(kind);
+    await load(s.kind);
   };
   const releaseSession = async (target: OpenSession) => {
     if (operationInFlight.current) return;
@@ -626,8 +580,6 @@ function App() {
     } catch (e) { setError(errorMessage(e)); }
     finally { operationInFlight.current = false; setOperationBusy(false); }
   };
-  // Keep the existing Hermes restore-key contract covered while Pi uses the same profile flow.
-  // const selectProfile = (nextProfile: string) => { localStorage.removeItem(activeSessionKey('hermes', nextProfile)); };
   const selectArea = (nextArea: Kind | "local") => {
     if (navigationLocked()) return;
     setSettingsOpen(false);
@@ -637,36 +589,22 @@ function App() {
     if (nextArea !== "local") setKind(nextArea);
     else clearActive();
   };
-  const selectProfile = (nextProfile: string) => {
+  const openWorkspace = (targetKind: Kind) => {
     if (navigationLocked()) return;
-    setSettingsOpen(false);
-    hermesHomeSelected.current = kind === "hermes";
-    localStorage.setItem(activeAreaKey, kind);
-    localStorage.setItem(activeKindKey, kind);
-    localStorage.setItem(activeProfileKey, nextProfile);
-    localStorage.removeItem(activeSessionKey(kind, nextProfile));
-    clearActive();
-    setArea(kind);
-    setProfile(nextProfile);
-  };
-  const openWorkspace = (targetKind: Kind, targetProfile?: string) => {
-    if (navigationLocked()) return;
+    if (targetKind === "command" && commandConfigs.length === 0) {
+      setError("请先在设置中的通用启动器里添加命令配置。");
+      return;
+    }
     setMobileNavigationOpen(false);
     setSettingsOpen(false);
     localStorage.setItem(activeAreaKey, targetKind);
     localStorage.setItem(activeKindKey, targetKind);
     setArea(targetKind);
     setKind(targetKind);
-    if ((targetKind === "hermes" || targetKind === "pi") && targetProfile) {
-      localStorage.setItem(activeProfileKey, targetProfile);
-      setProfile(targetProfile);
-    }
-    if (targetKind === "pi" && targetProfile && targetProfile !== "default") {
-      void create(undefined, [], targetProfile, targetKind).catch(e => setError(errorMessage(e)));
-    } else setPicking(true);
+    setPicking(true);
   };
-  const showMore = (listKind: Kind, listProfile = "") => {
-    const key = `${listKind}:${listProfile}`;
+  const showMore = (listKind: Kind, scope = "") => {
+    const key = `${listKind}:${scope}`;
     setVisibleCounts((value) => ({ ...value, [key]: (value[key] || 8) + 8 }));
   };
   const logout = () => {
@@ -744,8 +682,6 @@ function App() {
       <SidebarNavigation
         active={active}
         currentKind={area}
-        profile={profile}
-        profiles={profiles}
         sessions={all}
         localSessions={localSessions}
         compact={compactNavigation}
@@ -755,12 +691,11 @@ function App() {
         busy={settingsBusy || creating}
         creating={creating}
         onAreaChange={next => requestNavigation(() => selectArea(next))}
-        onProfileChange={next => requestNavigation(() => selectProfile(next))}
         onSelectSession={next => requestNavigation(() => choose(next))}
         onSelectLocal={next => requestNavigation(() => chooseLocal(next))}
         onCreateLocal={() => requestNavigation(() => void createLocal())}
         onRemoveLocal={session => setConfirmation({ type: "local-delete", session })}
-        onOpenWorkspace={(target, nextProfile) => requestNavigation(() => openWorkspace(target, nextProfile))}
+        onOpenWorkspace={target => requestNavigation(() => openWorkspace(target))}
         onRefresh={(target) => void refresh(target)}
         refreshingKind={refreshingKind}
         catalog={catalog.areas} opened={openSessions}
@@ -771,15 +706,15 @@ function App() {
         connectedSessionID={connectedSessionID}
         onDisconnect={disconnect}
         onOpenSecondary={openSecondary}
-        visibleCount={(listKind, listProfile = "") =>
-          visibleCounts[`${listKind}:${listProfile}`] || 8
+        visibleCount={(listKind, scope = "") =>
+          visibleCounts[`${listKind}:${scope}`] || 8
         }
         onShowMore={showMore}
         username={user}
         onLogout={() => settingsBusyRef.current ? logout() : requestNavigation(logout)}
         settingsOpen={settingsOpen}
         onSettingsPage={() => openSettings()}
-        catalogError={catalogError?.kind === area && ((area !== "hermes" && area !== "pi") || catalogError.profile === profile) ? catalogError.message : ""}
+        catalogError={catalogError?.kind === area ? catalogError.message : ""}
       />
       <div className="workspace-view">
         {settingsOpen ? (
@@ -795,16 +730,18 @@ function App() {
               terminalFontSize={terminalFontSize}
               onTerminalFontSizeChange={changeFontSize}
               onAgentEnabledChange={updateAgentEnabled}
+              onHostsChange={value => { setHosts(value); void catalog.sync(); }}
+              onCommandConfigsChange={setCommandConfigs}
               busy={settingsBusy}
               onBusyChange={setSettingsBusy}
               isCurrentUser={isCurrentUser}
             /></Suspense>
         ) : <main className="conversation">
-          {compactNavigation && <MobileWorkbench session={active} kind={activeKind} profile={profile} connection={active ? connection : 'disconnected'}
+          {compactNavigation && <MobileWorkbench session={active} kind={activeKind} connection={active ? connection : 'disconnected'}
             focused={focusMode} mode={inputMode} busy={settingsBusy || creating} attached={terminalAttached} actions={mobileActions}
             hasDraft={!!active && !!drafts.read(openSessionKey(active)).text}
             onSwitch={() => setSwitcherOpen(true)} onNavigation={() => setMobileNavigationOpen(true)}
-            onCreate={() => activeKind === 'local' ? void createLocal() : openWorkspace(activeKind, profile)}
+            onCreate={() => activeKind === 'local' ? void createLocal() : openWorkspace(activeKind)}
             onSettings={() => openSettings()} onNote={() => noteOpen.current?.()} onFocus={() => setFocusMode(value => !value)}
             onRelease={() => { if (active) void releaseSession(active); }}
             onRestart={() => { if (active) setConfirmation({ type: 'restart', session: active }); }}
@@ -817,7 +754,7 @@ function App() {
             <button className="icon session-switcher-trigger" aria-label="切换会话" onClick={() => setSwitcherOpen(true)}><ListFilter /></button>
           </div>
           <header className="context-bar">
-            <SessionContext session={active} kind={activeKind} profile={profile} />
+            <SessionContext session={active} kind={activeKind} />
             <div className="context-actions">
               {active && compactNavigation && !focusMode && <button className="icon focus-mode-trigger" aria-label="进入专注模式" onClick={() => setFocusMode(true)}><Maximize2 /></button>}
 
@@ -890,9 +827,7 @@ function App() {
               <span className="eyebrow">
                 {activeKind === "local"
                   ? "LOCAL · HOME"
-                  : activeKind === "hermes"
-                    ? `HERMES · ${profile}`
-                    : openSessionLabel({ kind: activeKind })}
+                  : openSessionLabel({ kind: activeKind })}
               </span>
               <h1>
                 {activeKind === "local"
@@ -910,7 +845,7 @@ function App() {
                   {creating ? "正在创建…" : "新建本地 Bash 会话"}
                 </button>
               ) : (
-                <button disabled={creating || settingsBusy} onClick={() => openWorkspace(kind, profile)}>
+                <button disabled={creating || settingsBusy} onClick={() => openWorkspace(kind)}>
                   <Plus />
                   选择目录并新建会话
                 </button>
@@ -928,11 +863,12 @@ function App() {
       {picking && (
         <Suspense fallback={<p role="status">正在打开目录选择器…</p>}><WorkspacePicker
           sessions={all}
-          profile={profile}
           kind={kind}
+          hosts={hosts}
+          commandConfigs={commandConfigs}
           creating={creating}
           close={() => setPicking(false)}
-          select={(path, args) => create(path, args, profile, kind)}
+          select={(path, args, hostId, agentId) => create(path, args, kind, hostId, agentId)}
         /></Suspense>
       )}
       {dialog && (

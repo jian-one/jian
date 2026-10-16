@@ -24,16 +24,16 @@ test('a failed cold discovery retains the browser catalog but a successful empty
   assert.deepEqual(empty.local?.rows, []);
 });
 
-test('terminal status updates preserve order, role identity, and deleted rows', () => {
-  const row = { id: 'same', kind: 'pi' as const, profile: 'a', title: 'A', workspace: '/work', status: 'ended' };
-  const other = { ...row, profile: 'b' };
-  const current = { pi: { ...emptyCatalogSlice(), rows: [other, row] } };
+test('terminal status updates preserve order and ignore deleted rows', () => {
+  const row = { id: 'command-one', kind: 'command' as const, agent_id: 'review', title: 'A', workspace: '/work', status: 'ended' };
+  const other = { ...row, id: 'command-two', agent_id: 'lint' };
+  const current = { command: { ...emptyCatalogSlice(), rows: [other, row] } };
   const running = updateCatalogStatus(current, row, 'running');
-  assert.equal(running.pi?.rows[0], other);
-  assert.equal(running.pi?.rows[1].status, 'running');
-  assert.equal(current.pi.rows[1].status, 'ended');
+  assert.equal(running.command?.rows[0], other);
+  assert.equal(running.command?.rows[1].status, 'running');
+  assert.equal(current.command.rows[1].status, 'ended');
   assert.equal(updateCatalogStatus(running, row, 'running'), running);
   const ended = updateCatalogStatus(running, row, 'ended');
-  assert.equal(ended.pi?.rows[1].status, 'ended');
-  assert.equal(updateCatalogStatus({}, row, 'running').pi, undefined);
+  assert.equal(ended.command?.rows[1].status, 'ended');
+  assert.equal(updateCatalogStatus({}, row, 'running').command, undefined);
 });

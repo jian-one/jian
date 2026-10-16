@@ -1,5 +1,7 @@
 # V1 - Jian：从个人远程 TUI 演变为 Agent Session Fabric
 
+> 历史规划快照（2026-08-03），不代表当前产品规格。Jian 0.3 的实现方向是 Codex 专用集成、可配置的通用命令，以及通过主动注册客户端管理远程主机；Hermes/Pi 已退出支持范围。
+
   ## 一、战略结论
 
   截至 2026-08-03，对当前仓库、官方产品、GitHub 竞品、HN、Reddit、GitHub issues 和邻近商业产品的综合判断是：

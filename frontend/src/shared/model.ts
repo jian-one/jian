@@ -1,4 +1,4 @@
-export type Kind = 'codex' | 'hermes' | 'pi';
+export type Kind = 'codex' | 'command';
 export type Theme = 'console' | 'light' | 'black';
 
 export type LocalSession = {
@@ -14,16 +14,18 @@ export type LocalSession = {
 export type TerminalSession = { id: string };
 export type BrowseResult = { path: string; parent: string; entries: { name: string; directory: boolean }[] };
 export type EnvironmentVariable = { key: string; value: string };
-export type PiRole = { name: string; entry: string; home: string };
-export type AgentSettings = { codex_bin: string; path: string; hermes_home: string; hermes_bin: string; hermes_profiles: string[]; pi_default: string; pi_roles: PiRole[]; pi_args: string[]; pi_env: EnvironmentVariable[]; local_profiles: string[]; codex_args: string[]; hermes_args: string[]; codex_env: EnvironmentVariable[]; hermes_env: EnvironmentVariable[]; local_enabled: boolean; codex_enabled: boolean; hermes_enabled: boolean; pi_enabled: boolean; agent_toggles_set?: boolean };
-export type SettingsResponse = { settings: AgentSettings; available_profiles: string[]; available_pi_agents: string[] };
-export type TerminalStatus = { id: string; label: 'local' | 'codex' | 'hermes' | 'pi'; title: string; workspace: string; profile?: string; running: boolean; busy: boolean; subscribers: number };
+export type CommandConfig = { id: string; name: string; program: string; args: string[]; env: EnvironmentVariable[] };
+export type AgentSettings = { codex_bin: string; path: string; local_profiles: string[]; codex_args: string[]; codex_env: EnvironmentVariable[]; command_configs: CommandConfig[]; local_enabled: boolean; codex_enabled: boolean; command_enabled: boolean; agent_toggles_set?: boolean };
+export type Host = { id: string; name: string; platform: string; home: string; connected: boolean; created_at: string };
+export type SettingsResponse = { settings: AgentSettings; hosts: Host[] };
+export type TerminalStatus = { id: string; label: 'local' | 'codex' | 'command'; title: string; workspace: string; running: boolean; busy: boolean; subscribers: number };
 export type TerminalStatusResponse = { active_pool: TerminalStatus[] };
 export type Session = {
   id: string;
   kind: Kind;
   native_id?: string;
-  profile?: string;
+  host_id?: string;
+  agent_id?: string;
   yolo?: boolean;
   src?: string;
   source?: string;
@@ -37,7 +39,6 @@ export type Session = {
 
 export const activeKindKey = 'jian.active_kind';
 export const activeAreaKey = 'jian.active_area';
-export const activeProfileKey = 'jian.active_hermes_profile';
 export const activeLocalSessionKey = 'jian.active_local_session';
 export const themeKey = 'jian.theme';
 export const interfaceThemeKey = 'jian.interface_theme';
@@ -46,12 +47,12 @@ export const terminalFontSizeKey = 'jian.terminal_font_size';
 export const terminalFontSizeMin = 10;
 export const terminalFontSizeMax = 24;
 export const terminalFontSizeDefault = 15;
-export const activeSessionKey = (kind: Kind, profile?: string) => `jian.active_${kind}${(kind === 'hermes' || kind === 'pi') && profile ? `_${profile}` : ''}_session`;
-export const selectedSessionKey = (session: Pick<LocalSession, 'kind'> | Pick<Session, 'kind' | 'profile'>, fallbackProfile = 'default') => session.kind === 'local' ? activeLocalSessionKey : activeSessionKey(session.kind, session.profile || fallbackProfile);
+export const activeSessionKey = (kind: Kind) => `jian.active_${kind}_session`;
+export const selectedSessionKey = (session: Pick<LocalSession, 'kind'> | Pick<Session, 'kind'>) => session.kind === 'local' ? activeLocalSessionKey : activeSessionKey(session.kind);
 export const sessionCacheKey = (username: string, kind: Kind) => `jian.session_cache.${encodeURIComponent(username)}.${kind}`;
 export const navScrollKey = (kind: Kind | 'local', profile: string) => `jian.nav_scroll_${kind}_${profile}`;
 
-export const initialKind = (): Kind => ['codex', 'hermes', 'pi'].includes(localStorage.getItem(activeKindKey) || '') ? localStorage.getItem(activeKindKey) as Kind : 'codex';
+export const initialKind = (): Kind => ['codex', 'command'].includes(localStorage.getItem(activeKindKey) || '') ? localStorage.getItem(activeKindKey) as Kind : 'codex';
 const readTheme = (key: string): Theme | null => {
   const value = localStorage.getItem(key);
   return value === 'light' || value === 'black' || value === 'console' ? value : null;
@@ -89,10 +90,10 @@ export const byLastActiveDesc = (a: Session, b: Session) => sessionTime(b) - ses
 export const activeView = (session: Session): Session => ({ ...session, title: displayTitle(session) });
 export type OpenSession = Session | LocalSession;
 export const openSessionKey = (session: OpenSession) =>
-  `${session.kind}:${session.kind === 'hermes' || session.kind === 'pi' ? `${session.profile || 'default'}:` : ''}${session.id}`;
+  `${session.kind}:${session.id}`;
 export const openSessionTitle = (session: OpenSession) => session.kind === 'local' ? session.title || 'Bash' : displayTitle(session);
 export const openSessionLabel = (session: Pick<OpenSession, 'kind'>) =>
-  ({ local: 'Local', codex: 'Codex', hermes: 'Hermes', pi: 'Pi' })[session.kind];
+  ({ local: 'Local', codex: 'Codex', command: '命令' })[session.kind];
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'ended' | 'offline';
 export type ConnectionFeedback = { state: ConnectionState; attempt: number; retrying: boolean };

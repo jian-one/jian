@@ -1,8 +1,8 @@
 import type { CSSProperties } from 'react';
 
-type AgentIconProps = { kind?: 'local' | 'codex' | 'hermes' | 'pi'; className?: string };
+type AgentIconProps = { kind?: 'local' | 'codex' | 'command'; className?: string };
 
-const iconURLs = { local: '/bash.svg', codex: '/openai.svg', hermes: '/hermesagent.svg', pi: '/pi.svg' } as const;
+const iconURLs = { local: '/bash.svg', codex: '/openai.svg', command: '/bash.svg' } as const;
 
 export function AgentIcon({ kind = 'local', className = '' }: AgentIconProps) {
   const style = { WebkitMaskImage: `url(${iconURLs[kind]})`, maskImage: `url(${iconURLs[kind]})` } as CSSProperties;

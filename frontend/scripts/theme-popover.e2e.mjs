@@ -1,5 +1,5 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -61,6 +61,7 @@ class CDP {
 }
 
 try {
+  execFileSync('cargo', ['build', '--quiet', '--locked', '--bin', 'jian-client'], { cwd: root, stdio: 'ignore' });
   await writeFile(config, JSON.stringify({ bind_ip: '127.0.0.1', listen_port: port }));
   start('cargo', ['run', '--quiet', '--', '--config', config], {
     cwd: root,
@@ -70,7 +71,6 @@ try {
       JIAN_ADMIN_USER: 'theme-test',
       JIAN_ADMIN_PASSWORD: 'theme-test-password',
       JIAN_CODEX_BIN: join(temporary, 'missing-codex'),
-      JIAN_HERMES_BIN: join(temporary, 'missing-hermes'),
     },
   });
   await waitFor(async () => (await fetch(`http://127.0.0.1:${port}/api/auth/status`)).ok, 'Jian server');
@@ -119,7 +119,11 @@ try {
     };
     window.WebSocket = new Proxy(NativeWebSocket, { construct(target, args, receiver) {
       const socket = Reflect.construct(target, args, receiver);
-      if (String(args[0]).includes('/terminal')) window.__terminalSockets.push(socket);
+      if (String(args[0]).includes('/terminal')) {
+        socket.__jianReceived = [];
+        socket.addEventListener('message', event => socket.__jianReceived.push(event.data));
+        window.__terminalSockets.push(socket);
+      }
       if (String(args[0]).endsWith('/api/ws')) {
         window.__apiSocket = socket;
         socket.addEventListener('message', event => { try { const message = JSON.parse(event.data); if (message.id) window.__rpcResponses.push(message.id); } catch {} });
@@ -344,7 +348,6 @@ try {
   console.log('PASS terminal fit skips unchanged resizes and updates for font-size changes');
   const tap = async selector => {
     await cdp.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
-    await cdp.evaluate(`(() => { const node = document.querySelector(${JSON.stringify(selector)}); if (node?.closest('.mobile-control-scroll')) node.scrollIntoView({ block: 'nearest', inline: 'nearest' }); })()`);
     const point = await cdp.evaluate(`(() => { const target = document.querySelector(${JSON.stringify(selector)}); const box = target.getBoundingClientRect(); const x = box.x + box.width / 2, y = box.y + box.height / 2; const hit = document.elementFromPoint(x, y); return { x, y, hit: target === hit || target.contains(hit), actual: hit?.outerHTML.slice(0, 300), disabled: target.disabled }; })()`);
     if (!point.hit || point.disabled) throw new Error('button not actionable: ' + selector + '; ' + JSON.stringify(point));
     delete point.hit; delete point.actual; delete point.disabled;
@@ -373,7 +376,7 @@ try {
   await tap('.terminal .xterm-screen');
   if (await cdp.evaluate(`document.activeElement.classList.contains('terminal-input-buffer')`)) throw new Error('reading output opened mobile input');
   await tap('.mobile-workbench-dock button[aria-label="输入终端"]');
-  await cdp.evaluate(`[...document.querySelectorAll('.mobile-input-modes button')].find(button => button.textContent === '实时终端').click()`);
+  if (!await cdp.evaluate(`document.querySelector('.mobile-input-modes [data-state="on"]').textContent === '实时终端'`)) throw new Error('mobile input did not default to live terminal');
   if (!await cdp.evaluate(`document.activeElement.classList.contains('terminal-input-buffer')`)) throw new Error('explicit input entry failed');
   await tap('.mobile-workbench-dock button[aria-label="收起输入"]');
   await cdp.evaluate(`document.activeElement.blur()`);
@@ -401,11 +404,31 @@ try {
     document.activeElement.blur();
     window.__shortcutInputs = [];
     const send = WebSocket.prototype.send;
-    WebSocket.prototype.send = function(data) { const message = JSON.parse(data); if (message.type === 'input') window.__shortcutInputs.push(message.data); return send.call(this, data); };
+    WebSocket.prototype.send = function(data) { const message = JSON.parse(data); if (message.type === 'input') { window.__shortcutInputs.push(message.data); if (window.__suppressShortcutInputs) return; } return send.call(this, data); };
   })()`);
   await tap('.mobile-workbench-dock button[aria-label="输入终端"]');
-  await cdp.evaluate(`[...document.querySelectorAll('.mobile-input-modes button')].find(button => button.textContent === '实时终端').click()`);
-  await tap('.mobile-control-scroll button:first-child');
+  for (const width of [320, 360, 390, 430, 800]) {
+    await cdp.send('Emulation.setDeviceMetricsOverride', { width, height: width === 800 ? 390 : 844, deviceScaleFactor: 1, mobile: true });
+    await cdp.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+    const keys = await cdp.evaluate(`(() => {
+      const bar = document.querySelector('.mobile-control-bar');
+      const buttons = [...bar.querySelectorAll('button')];
+      const rows = {};
+      for (const button of buttons) {
+        const box = button.getBoundingClientRect();
+        const top = Math.round(box.top);
+        rows[top] = (rows[top] || 0) + 1;
+        if (box.width < 44 || box.height < 48 || box.left < 0 || box.right > innerWidth + 1 || button.scrollWidth > button.clientWidth) return { invalid: button.textContent || button.getAttribute('aria-label'), width: box.width };
+      }
+      return { count: buttons.length, rows: Object.values(rows), overflow: bar.scrollWidth > bar.clientWidth };
+    })()`);
+    if (keys.count !== 12 || JSON.stringify(keys.rows) !== '[6,6]' || keys.overflow) throw new Error('mobile shortcuts do not fit two complete rows at ' + width + ': ' + JSON.stringify(keys));
+  }
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+  await cdp.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+  await screenshot('mobile-shortcuts');
+  console.log('PASS mobile shortcuts fill exactly two visible rows with readable labels and touch targets at 320–800px');
+  await tap('.mobile-control-bar button:first-child');
   if (!await cdp.evaluate(`document.activeElement.classList.contains('terminal-input-buffer')`)) throw new Error('mobile shortcut lost input focus');
   if (!await cdp.evaluate(`window.__shortcutInputs.at(-1) === String.fromCharCode(27)`)) throw new Error('mobile shortcut did not send Escape');
   // Headless Chrome has no software keyboard: reproduce its visual viewport
@@ -427,14 +450,49 @@ try {
   if (scrollState.reads !== 0 || scrollState.height !== '430px' || scrollState.offset !== '75px') throw new Error(`visual viewport scroll changed terminal layout or lost its offset: ${JSON.stringify(scrollState)}`);
   const geometry = await cdp.evaluate(`(() => { const box = document.querySelector('.mobile-control-bar').getBoundingClientRect(); return { top: box.top, bottom: box.bottom, viewportTop: visualViewport.offsetTop, viewportBottom: visualViewport.offsetTop + visualViewport.height }; })()`);
   if (geometry.top < geometry.viewportTop || geometry.bottom > geometry.viewportBottom + 1) throw new Error('mobile toolbar is behind keyboard: ' + JSON.stringify(geometry));
-  await tap('.mobile-control-scroll button[aria-label="Shift"]');
-  await tap('.mobile-control-scroll button[aria-label="方向键左"]');
-  await tap('.mobile-control-scroll button[aria-label="方向键左"]');
+  await tap('.mobile-control-bar button[aria-label="Shift"]');
+  await tap('.mobile-control-bar button[aria-label="方向键左"]');
+  await tap('.mobile-control-bar button[aria-label="方向键左"]');
   const shortcuts = await cdp.evaluate(`({ inputs: window.__shortcutInputs, focused: document.activeElement.classList.contains('terminal-input-buffer'), shifted: document.querySelector('button[aria-label="Shift"]').getAttribute('aria-pressed') })`);
   if (JSON.stringify(shortcuts.inputs) !== JSON.stringify(['\u001b[1;2D', '\u001b[1;2D']) || !shortcuts.focused || shortcuts.shifted !== 'true') throw new Error('mobile Shift shortcuts or focus failed: ' + JSON.stringify(shortcuts));
-  await tap('.mobile-control-scroll button[aria-label="Shift"]');
-  await tap('.mobile-control-scroll button[aria-label="方向键左"]');
+  await tap('.mobile-control-bar button[aria-label="Shift"]');
+  await tap('.mobile-control-bar button[aria-label="方向键左"]');
   if (!await cdp.evaluate(`window.__shortcutInputs.at(-1) === String.fromCharCode(27) + '[D'`)) throw new Error('mobile Shift did not toggle off');
+  await cdp.evaluate(`(() => {
+    window.__suppressShortcutInputs = true;
+    window.__shortcutFocusChanges = [];
+    window.__shortcutFocusIn = event => window.__shortcutFocusChanges.push('in:' + event.target.tagName);
+    window.__shortcutFocusOut = event => window.__shortcutFocusChanges.push('out:' + event.target.tagName);
+    document.addEventListener('focusin', window.__shortcutFocusIn);
+    document.addEventListener('focusout', window.__shortcutFocusOut);
+    const focus = window.__shortcutOriginalFocus = HTMLElement.prototype.focus;
+    HTMLElement.prototype.focus = function(...args) { window.__shortcutFocusChanges.push('focus:' + this.tagName); return focus.apply(this, args); };
+  })()`);
+  const assertShortcutFocus = async (selector, data, activate = tap) => {
+    if (!await cdp.evaluate(`!!document.querySelector(${JSON.stringify(selector)})`)) throw new Error('shortcut unavailable: ' + selector);
+    await cdp.evaluate(`window.__shortcutFocusChanges = []; window.__shortcutInputs = []`);
+    await activate(selector);
+    await cdp.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+    const state = await cdp.evaluate(`({ changes: window.__shortcutFocusChanges, inputs: window.__shortcutInputs })`);
+    if (state.changes.length || JSON.stringify(state.inputs) !== JSON.stringify(data === null ? [] : [data])) throw new Error('shortcut changed focus or sent wrong input: ' + selector + '; ' + JSON.stringify(state));
+  };
+  for (const focused of [true, false]) {
+    await cdp.evaluate(`document.querySelector('.terminal-input-buffer').${focused ? 'focus()' : 'blur()'}`);
+    for (const [selector, data] of [
+      ['.mobile-control-bar button:first-child', '\u001b'],
+      ['.mobile-control-bar button:nth-child(2)', '\t'],
+      ...['左', '上', '下', '右'].map((label, index) => ['.mobile-control-bar button[aria-label="方向键' + label + '"]', '\u001b[' + ['D', 'A', 'B', 'C'][index]]),
+      ['.mobile-control-bar button[aria-label="Shift"]', null],
+      ['.mobile-control-bar button[aria-label="Shift"]', null],
+      ['.mobile-control-bar button[aria-label="中断 Ctrl+C"]', '\u0003'],
+      ['.mobile-control-bar button[aria-label="结束输入 Ctrl+D"]', '\u0004'],
+      ['.mobile-control-bar button[aria-label="清屏 Ctrl+L"]', '\u000c'],
+      ['.mobile-control-bar button:nth-child(7)', '\u001b[Z'],
+      ['.mobile-control-bar button:last-child', '\r'],
+    ]) await assertShortcutFocus(selector, data);
+
+  }
+  await cdp.evaluate(`window.__suppressShortcutInputs = false`);
   await cdp.evaluate(`(() => {
     document.activeElement.blur();
     delete visualViewport.height;
@@ -463,6 +521,23 @@ try {
     await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code: key, windowsVirtualKeyCode: virtualKey, nativeVirtualKeyCode: virtualKey });
   };
   await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: false });
+  await mouseClick('.mobile-workbench-dock button[aria-label="输入终端"]');
+  await cdp.evaluate(`window.__suppressShortcutInputs = true`);
+  for (const focused of [true, false]) {
+    await cdp.evaluate(`document.querySelector('.terminal-input-buffer').${focused ? 'focus()' : 'blur()'}`);
+    await assertShortcutFocus('.mobile-control-bar button[aria-label="方向键左"]', '\u001b[D', mouseClick);
+    await assertShortcutFocus('.mobile-control-bar button:nth-child(7)', '\u001b[Z', mouseClick);
+    await assertShortcutFocus('.mobile-control-bar button[aria-label="结束输入 Ctrl+D"]', '\u0004', mouseClick);
+    await assertShortcutFocus('.mobile-control-bar button[aria-label="清屏 Ctrl+L"]', '\u000c', mouseClick);
+  }
+  await cdp.evaluate(`(() => {
+    window.__suppressShortcutInputs = false;
+    HTMLElement.prototype.focus = window.__shortcutOriginalFocus;
+    document.removeEventListener('focusin', window.__shortcutFocusIn);
+    document.removeEventListener('focusout', window.__shortcutFocusOut);
+  })()`);
+  await mouseClick('.mobile-workbench-dock button[aria-label="收起输入"]');
+  console.log('PASS mobile shortcuts preserve open/closed input focus and send Ctrl+D, Ctrl+L and Shift+Tab with touch and mouse');
   await cdp.send('Emulation.setDeviceMetricsOverride', { width: 801, height: 844, deviceScaleFactor: 1, mobile: false });
   await waitFor(() => cdp.evaluate(`!!document.querySelector('.sidebar') && !document.querySelector('.nav-drawer')`), 'desktop sidebar after breakpoint');
   for (let i = 0; i < 13; i++) {
@@ -523,7 +598,7 @@ try {
   await cdp.send('Emulation.setEmulatedMedia', { features: [{ name: 'prefers-reduced-motion', value: 'reduce' }] });
   await waitFor(() => cdp.evaluate(`!document.querySelector('.sidebar')`), 'closed mobile drawer');
   const mobileMore = async label => {
-    if (label === '文本编辑') { await tap('.mobile-workbench-dock button[aria-label="输入终端"]'); return; }
+    if (label === '文本编辑') { await tap('.mobile-workbench-dock button[aria-label="输入终端"]'); await tap('.mobile-input-modes button:first-child'); return; }
     await tap('.mobile-workbench-dock button[aria-label="更多工作台操作"]');
     await waitFor(() => cdp.evaluate(`!!document.querySelector('.mobile-workbench-sheet')`), 'mobile menu');
     const group = ['会话目录与管理', '新建会话', '重新连接', '关闭当前会话显示', '重启当前会话', '释放当前会话'].includes(label) ? '会话管理' : ['选择输出文本', '搜索终端输出', '粘贴到终端'].includes(label) ? '输出' : '工作台';
@@ -650,13 +725,11 @@ try {
   const catalogAccess = await cdp.evaluate(`Promise.all([fetch('/api/sessions/catalog', { credentials: 'omit' }).then(r => r.status), fetch('/api/sessions/catalog?areas=invalid').then(r => r.status)])`);
   if (catalogAccess[0] !== 401 || catalogAccess[1] !== 400) throw new Error('catalog authentication or area validation failed: ' + JSON.stringify(catalogAccess));
   console.log('PASS real catalog push synchronizes creation/deletion and snapshot access stays authenticated');
-  const cachedFixture = (kind, profile) => ({ id: 'same-native-id', kind, profile, title: 'Build service', workspace: '/work/team', status: 'idle' });
+  const cachedFixture = (id, agent_id) => ({ id, kind: 'command', agent_id, title: 'Build service', workspace: '/work/team', status: 'idle' });
   const fixtureCatalog = await cdp.evaluate(`window.__rpcCall('/sessions/catalog')`);
   fixtureCatalog.areas.codex.error = '测试缓存读取失败';
-  fixtureCatalog.areas.hermes.rows = [cachedFixture('hermes', 'ops')];
-  fixtureCatalog.areas.hermes.error = null;
-  fixtureCatalog.areas.pi.rows = [cachedFixture('pi', 'ops'), cachedFixture('pi', 'research')];
-  fixtureCatalog.areas.pi.error = null;
+  fixtureCatalog.areas.command.rows = [cachedFixture('command-ops', 'ops'), cachedFixture('command-research', 'research')];
+  fixtureCatalog.areas.command.error = null;
   for (const slice of Object.values(fixtureCatalog.areas)) slice.revision += 100;
   await rule({ method: 'GET', prefix: '/sessions/catalog', body: fixtureCatalog });
   await cdp.evaluate(`window.__apiSocket.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'sessions.catalog.resync' }) }))`);
@@ -664,9 +737,9 @@ try {
   const beforeSwitcherSockets = await cdp.evaluate(`window.__terminalSockets.length`);
   await mouseClick('.session-tabs .session-switcher-trigger');
   await waitFor(() => cdp.evaluate(`!!document.querySelector('.switcher-error') && !document.querySelector('.switcher-feedback')?.textContent.includes('正在') && document.activeElement.getAttribute('aria-label') === '搜索全部会话'`), 'switcher partial results and desktop focus');
-  await input('.switcher-search input', 'PI TEAM');
-  await waitFor(() => cdp.evaluate(`document.querySelectorAll('.switcher-result').length === 2`), 'same ID Pi roles remain distinct');
-  await input('.switcher-search input', 'PI ops TEAM');
+  await input('.switcher-search input', 'BUILD TEAM');
+  await waitFor(() => cdp.evaluate(`document.querySelectorAll('.switcher-result').length === 2`), 'same command config sessions remain distinct');
+  await input('.switcher-search input', 'BUILD ops TEAM');
   if (!await cdp.evaluate(`document.querySelectorAll('.switcher-result').length === 1 && document.querySelector('.switcher-result').textContent.includes('ops')`)) throw new Error('switcher role search failed');
   fixtureCatalog.areas.codex.error = null; fixtureCatalog.areas.codex.revision++;
   await rule({ method: 'POST', path: '/agents/codex/sessions/refresh', body: [] });
@@ -760,159 +833,98 @@ try {
 
   await mouseClick('button[aria-label="设置"]');
   await waitFor(() => cdp.evaluate(`!!document.querySelector('.agent-toggle-list')`), 'settings form');
-  for (const kind of ['Codex', 'Hermes', 'Pi']) await mouseClick(`${roster(kind)} .agent-roster-trigger`);
-  await mouseClick(`${roster('Codex')} button[aria-label="添加启动参数"]`);
-  await input(`${roster('Codex')} input[aria-label="启动参数 1"]`, ' --model ');
-  await mouseClick(`${roster('Hermes')} button[aria-label="添加启动参数"]`);
-  await input(`${roster('Hermes')} input[aria-label="启动参数 1"]`, 'hermes-draft');
-  await mouseClick(`${roster('Pi')} button[aria-label="添加角色"]`);
-  await rule({ method: 'PUT', path: '/settings', hold: true, label: 'save-codex' });
-  await cdp.evaluate(`(() => { const form = document.querySelector(${JSON.stringify(roster('Codex'))} + ' form'); form.requestSubmit(); form.requestSubmit(); })()`);
-  await waitFor(() => cdp.evaluate(`window.__heldRPC.some(item => item.label === 'save-codex')`), 'delayed Codex save');
-  const locked = await cdp.evaluate(`(() => {
-    const request = window.__heldRPC.find(item => item.label === 'save-codex');
-    return { count: window.__rpcRequests.filter(item => item.method === 'PUT' && item.path === '/settings').length, own: request.body.codex_args, other: request.body.hermes_args, roles: request.body.pi_roles, formLocked: document.querySelector(${JSON.stringify(roster('Codex'))} + ' fieldset').disabled, tabLocked: document.querySelector('[aria-label="返回工作台"]').disabled, navLocked: document.querySelector('.agent-rail').inert, logoutAvailable: !document.querySelector('[aria-label="退出登录"]').disabled };
-  })()`);
-  if (locked.count !== 1 || JSON.stringify(locked.own) !== JSON.stringify([' --model ']) || locked.other.length || locked.roles.length || !locked.formLocked || !locked.tabLocked || !locked.navLocked || !locked.logoutAvailable) throw new Error('scoped save/lock failed: ' + JSON.stringify(locked));
-  await cdp.evaluate(`window.dispatchEvent(new CustomEvent('jian-enter-terminal', { detail: { id: ${JSON.stringify(sharedID)} } }))`);
-  if (!await cdp.evaluate(`!!document.querySelector('.settings-page')`)) throw new Error('pending save allowed leaving settings');
-  await releaseRPC('save-codex');
-  await waitFor(() => cdp.evaluate(`document.querySelector('.settings-save-status')?.textContent.includes('已保存') && !document.querySelector('[aria-label="返回工作台"]').disabled`), 'save success and unlock');
-  if (!await cdp.evaluate(`document.querySelector(${JSON.stringify(roster('Codex'))} + ' input[aria-label="启动参数 1"]').value === '--model' && document.querySelector(${JSON.stringify(roster('Hermes'))} + ' input[aria-label="启动参数 1"]').value === 'hermes-draft' && !!document.querySelector(${JSON.stringify(roster('Pi'))} + ' input[placeholder="角色名称"]')`)) throw new Error('save response replaced unsaved drafts');
-  await rule({ method: 'PUT', path: '/settings', hold: true, label: 'toggle-hermes' });
-  await mouseClick('button[aria-label="启用 Hermes"]');
-  await waitFor(() => cdp.evaluate(`window.__heldRPC.some(item => item.label === 'toggle-hermes')`), 'toggle save');
-  if (!await cdp.evaluate(`window.__heldRPC.find(item => item.label === 'toggle-hermes').body.hermes_args.length === 0`)) throw new Error('toggle submitted edited launch arguments');
-  await releaseRPC('toggle-hermes');
-  await waitFor(() => cdp.evaluate(`document.querySelector('[aria-label="启用 Hermes"]').getAttribute('aria-checked') === 'false' && !Array.from(document.querySelectorAll('.agent-rail button span')).some(span => span.textContent === 'Hermes')`), 'disabled Hermes');
-  await mouseClick('button[aria-label="启用 Hermes"]');
-  await waitFor(() => cdp.evaluate(`document.querySelector('[aria-label="启用 Hermes"]').getAttribute('aria-checked') === 'true' && !document.querySelector('[aria-label="返回工作台"]').disabled`), 'Hermes restored');
-  await rule({ method: 'PUT', path: '/settings', error: '测试保存失败' });
-  await mouseClick(`${roster('Hermes')} button[type="submit"]`);
-  try { await waitFor(() => cdp.evaluate(`[...document.querySelectorAll('.general-settings-content [role="alert"]')].some(node => node.textContent.includes('测试保存失败')) && !document.querySelector('[aria-label="返回工作台"]').disabled`), 'save failure and unlock'); } catch (error) { throw new Error(error.message + '; ' + JSON.stringify(await cdp.evaluate(`({ text: document.querySelector('.general-settings-content')?.textContent, rules: window.__rpcRules, requests: window.__rpcRequests.slice(-6) })`))); }
-  if (!await cdp.evaluate(`document.querySelector(${JSON.stringify(roster('Hermes'))} + ' input[aria-label="启动参数 1"]').value === 'hermes-draft'`)) throw new Error('save failure erased input');
-  await mouseClick(`${roster('Hermes')} button[type="submit"]`);
-  await waitFor(() => cdp.evaluate(`document.querySelector(${JSON.stringify(roster('Hermes'))} + ' .settings-save-status')?.textContent.includes('Hermes 设置已保存')`), 'save retry');
+  const codexRoster = roster('Codex');
+  const commandRoster = roster('通用启动器');
+  await mouseClick(codexRoster + ' .agent-roster-trigger');
+  await mouseClick(commandRoster + ' .agent-roster-trigger');
+  await mouseClick(codexRoster + ' button[aria-label="添加启动参数"]');
+  await input(codexRoster + ' input[aria-label="启动参数 1"]', '--model');
+  await mouseClick(commandRoster + ' button[aria-label="添加命令配置"]');
+  await input('.command-config-card input[placeholder="例如：Codex Review"]', 'Codex Review');
+  await input('.command-config-card input[placeholder="例如 codex、python 或绝对路径"]', '/bin/sh');
+  await mouseClick(codexRoster + ' button[type="submit"]');
+  await waitFor(() => cdp.evaluate(`document.querySelector('.settings-save-status')?.textContent.includes('Codex 设置已保存')`), 'Codex settings saved');
+  await mouseClick(commandRoster + ' button[type="submit"]');
+  await waitFor(() => cdp.evaluate(`document.querySelector(${JSON.stringify(commandRoster + ' .settings-save-status')})?.textContent.includes('通用启动器 设置已保存')`), 'generic command settings saved');
   const persistedSettings = await cdp.evaluate(`window.__rpcCall('/settings')`);
-  if (JSON.stringify(persistedSettings.settings.codex_args) !== JSON.stringify(['--model']) || JSON.stringify(persistedSettings.settings.hermes_args) !== JSON.stringify(['hermes-draft']) || persistedSettings.settings.pi_roles.length) throw new Error('real server did not persist only submitted fields');
-  await cdp.evaluate(`(() => { const trigger = document.querySelector(${JSON.stringify(roster('Local'))} + ' .agent-roster-trigger'); if (trigger.getAttribute('data-state') !== 'open') trigger.click(); })()`);
-  const profileSaveCount = await cdp.evaluate(`window.__rpcRequests.filter(item => item.method === 'PUT' && item.path === '/settings').length`);
-  await mouseClick(`${roster('Local')} button[aria-label="添加 profile 文件"]`);
-  await waitFor(() => cdp.evaluate(`!!document.querySelector('.profile-file-picker') && document.activeElement.getAttribute('aria-label') === '关闭文件选择器'`), 'profile picker focus');
-  await input('.profile-file-picker input[aria-label="文件目录路径"]', root);
-  await cdp.evaluate(`document.querySelector('.profile-file-picker .workspace-path').requestSubmit()`);
-  await waitFor(() => cdp.evaluate(`document.querySelector('.profile-file-picker > footer span').textContent === ${JSON.stringify(root)}`), 'profile directory browse');
-  if (!await cdp.evaluate(`window.__rpcRequests.filter(item => item.method === 'PUT' && item.path === '/settings').length === ${profileSaveCount} && Number(getComputedStyle(document.querySelector('.profile-file-picker')).zIndex) > Number(getComputedStyle(document.querySelector('.profile-file-overlay')).zIndex)`)) throw new Error('profile browse saved settings or appeared below its overlay');
-  await keyPress('Escape');
-  await waitFor(() => cdp.evaluate(`!document.querySelector('.profile-file-picker') && document.activeElement.getAttribute('aria-label') === '添加 profile 文件'`), 'profile picker return focus');
-  if (!await cdp.evaluate(`document.querySelector(${JSON.stringify(roster('Codex'))} + ' button[type="submit"]').disabled && !document.querySelector(${JSON.stringify(roster('Codex'))} + ' .settings-dirty-badge')`)) throw new Error('unchanged card remains saveable');
-  await input(`${roster('Codex')} input[aria-label="启动参数 1"]`, '--review-draft');
-  await mouseClick(`${roster('Codex')} .settings-reset`);
-  if (!await cdp.evaluate(`document.querySelector(${JSON.stringify(roster('Codex'))} + ' input[aria-label="启动参数 1"]').value === '--model' && !!document.querySelector(${JSON.stringify(roster('Pi'))} + ' .settings-dirty-badge')`)) throw new Error('single-card reset changed other drafts');
-  console.log('PASS card dirty markers and individual reset preserve other drafts');
-  await input(`${roster('Codex')} input[aria-label="启动参数 1"]`, '--model-timeout');
-  await rule({ method: 'GET', path: '/settings', hold: true, label: 'save-timeout' });
-  await cdp.evaluate(`(() => { window.__regularTimeout = window.setTimeout; window.setTimeout = (callback, duration, ...args) => window.__regularTimeout(callback, duration === 120000 ? 100 : duration, ...args); })()`);
-  await mouseClick(`${roster('Codex')} button[type="submit"]`);
-  await waitFor(() => cdp.evaluate(`document.querySelector('.general-settings-content [role="alert"]')?.textContent.includes('请求超时') && !document.querySelector('[aria-label="返回工作台"]').disabled`), 'real RPC timeout unlock');
-  await cdp.evaluate(`window.setTimeout = window.__regularTimeout`);
-  await releaseRPC('save-timeout');
-  console.log('PASS scoped settings saves, switch-only writes, delayed locks, normalization, and failure retry');
+  if (persistedSettings.settings.command_configs.length !== 1 || persistedSettings.settings.command_configs[0].name !== 'Codex Review') throw new Error('generic command settings did not persist');
 
-  await mouseClick('.settings-navigation-item:last-child');
-  await mouseClick('.settings-navigation-item:first-child');
-  if (!await cdp.evaluate(`!!document.querySelector(${JSON.stringify(roster('Pi'))} + ' input[placeholder="角色名称"]')`)) throw new Error('subsection change discarded settings drafts');
+  await mouseClick('.settings-navigation-item:nth-child(2)');
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('.host-register-form input')`), 'remote host settings');
+  await input('.host-register-form input', 'e2e-remote');
+  await mouseClick('.host-register-form button[type="submit"]');
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('.host-token-dialog')`), 'one-time host credential');
+  const hostCommand = await cdp.evaluate(`document.querySelector('.host-token-dialog pre code').textContent`);
+  if (!hostCommand.includes('jian-client connect --server ') || !hostCommand.includes('--token ')) throw new Error('remote registration omitted the client connection command');
+  const remoteHostID = hostCommand.match(/--host ([^ ]+)/)?.[1];
+  const clientArgs = hostCommand.match(/--server ([^ ]+) --host ([^ ]+) --token ([^ ]+)/)?.slice(1);
+  if (!remoteHostID || !clientArgs) throw new Error('remote registration omitted the host ID or client token');
+  await mouseClick('.host-token-actions button:last-child');
+  await waitFor(() => cdp.evaluate(`document.querySelector('.registered-host-card strong')?.textContent === 'e2e-remote'`), 'registered host');
   await mouseClick('button[aria-label="返回工作台"]');
-  await waitFor(() => cdp.evaluate(`document.querySelector('[aria-describedby="confirm-dialog-description"]')?.textContent.includes('放弃')`), 'unsaved draft confirmation');
-  await mouseClick('[aria-describedby="confirm-dialog-description"] footer button:last-child');
-  await cdp.evaluate(`window.__rpcCall('/settings', 'PUT', ${JSON.stringify({ ...persistedSettings.settings, pi_default: join(temporary, 'missing-pi'), pi_args: ['--model'] })})`);
-  await mouseClick('.agent-rail button:has(.agent-icon-pi)');
-  await waitFor(() => cdp.evaluate(`document.querySelector('.catalog-header strong')?.textContent === 'Pi' && window.__rpcRequests.filter(item => item.path.startsWith('/sessions/catalog')).every(item => window.__rpcResponses.includes(item.id))`), 'Pi catalog response');
-  if (await cdp.evaluate(`!!document.querySelector('[aria-describedby="error-dialog-description"]')`)) await clickSelector('[aria-describedby="error-dialog-description"] button', 'fixture cache notice');
-  await rule({ method: 'GET', path: '/settings', error: '测试参数读取失败' });
+
+  await mouseClick('.agent-rail button:has(.agent-icon-command)');
+  await waitFor(() => cdp.evaluate(`window.__rpcRequests.filter(item => item.path.startsWith('/sessions/catalog')).every(item => window.__rpcResponses.includes(item.id))`), 'generic command catalog');
   await mouseClick('button[aria-label="新建会话"]');
-  await waitFor(() => cdp.evaluate(`!!document.querySelector('.workspace-picker')`), 'workspace picker opens');
-  await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-picker [role="alert"]')?.textContent.includes('测试参数读取失败')`), 'launch-argument load error');
-  if (!await cdp.evaluate(`document.querySelector('.workspace-picker > footer button').disabled && document.activeElement.getAttribute('aria-label') === '关闭目录选择器'`)) throw new Error('picker allowed missing parameters or stole input focus');
-  await mouseClick('.workspace-picker [role="alert"] button');
-  await waitFor(() => cdp.evaluate(`!document.querySelector('.workspace-picker > footer button').disabled`), 'argument retry');
-  await mouseClick('.workspace-advanced > button');
-  await rule({ method: 'GET', prefix: '/workspaces/browse?', hold: true, label: 'old-directory' });
-  await mouseClick('.workspace-picker button[aria-label="用户主目录"]');
-  await waitFor(() => cdp.evaluate(`window.__heldRPC.some(item => item.label === 'old-directory')`), 'old directory request');
-  await input('.workspace-picker input[aria-label="文件目录路径"]', root);
-  await cdp.evaluate(`document.querySelector('.workspace-path').requestSubmit()`);
-  await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-picker > footer span').textContent === ${JSON.stringify(root)} && !document.querySelector('.workspace-picker > footer button').disabled`), 'latest directory');
-  await releaseRPC('old-directory');
-  await cdp.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
-  if (!await cdp.evaluate(`document.querySelector('.workspace-picker > footer span').textContent === ${JSON.stringify(root)}`)) throw new Error('old directory response overwrote newer selection');
-  await rule({ method: 'POST', path: '/agents/pi/sessions', hold: true, label: 'create-agent' });
-  await cdp.evaluate(`(() => { const button = document.querySelector('.workspace-picker > footer button'); button.click(); button.click(); })()`);
-  await waitFor(() => cdp.evaluate(`window.__heldRPC.some(item => item.label === 'create-agent')`), 'delayed agent creation');
-  await keyPress('Escape');
-  if (!await cdp.evaluate(`!!document.querySelector('.workspace-picker') && document.querySelector('[aria-label="关闭目录选择器"]').disabled && window.__rpcRequests.filter(item => item.method === 'POST' && item.path === '/agents/pi/sessions').length === 1`)) throw new Error('pending creation dismissed or submitted twice');
-  await releaseRPC('create-agent');
-  await waitFor(() => cdp.evaluate(`!!document.querySelector('.workspace-picker [role="alert"]') && !document.querySelector('.workspace-picker > footer button').disabled`), 'real unavailable Pi create failure');
-  if (!await cdp.evaluate(`document.querySelector('.workspace-picker input[aria-label="启动参数 1"]').value === '--model' && document.querySelector('.workspace-picker > footer span').textContent === ${JSON.stringify(root)}`)) throw new Error('creation failure lost launch input');
-  await rule({ method: 'POST', path: '/agents/pi/sessions', error: '测试创建重试失败' });
-  await mouseClick('.workspace-picker > footer button');
-  await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-picker [role="alert"]')?.textContent.includes('测试创建重试失败') && !document.querySelector('.workspace-picker > footer button').disabled`), 'creation retry');
-  await keyPress('Escape');
-  await waitFor(() => cdp.evaluate(`!document.querySelector('.workspace-picker') && document.activeElement.getAttribute('aria-label') === '新建会话'`), 'picker return focus');
-  console.log('PASS workspace parameter retry, out-of-order browse, duplicate creation guard, and real server failure recovery');
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('.workspace-picker') && !document.querySelector('.workspace-picker > footer button').disabled`), 'generic command picker');
+  const selectValue = async (selector, value) => cdp.evaluate("(() => { const element = document.querySelector(" + JSON.stringify(selector) + "); element.value = " + JSON.stringify(value) + "; element.dispatchEvent(new Event('change', { bubbles: true })); })()");
+  await selectValue('.workspace-picker select', remoteHostID);
+  await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-picker [role=\"status\"]')?.textContent.includes('远程主机当前离线')`), 'offline remote host');
+  if (!await cdp.evaluate(`document.querySelector('.workspace-picker > footer button').disabled`)) throw new Error('offline host allowed session creation');
 
-  await mouseClick('.agent-rail button:has(.agent-icon-codex)');
-  await waitFor(() => cdp.evaluate(`document.querySelector('.catalog-header strong')?.textContent === 'Codex' && window.__rpcRequests.filter(item => item.path.startsWith('/sessions/catalog')).every(item => window.__rpcResponses.includes(item.id))`), 'Codex catalog response');
-  await dismissUnavailableNotice();
-  await mouseClick('button[aria-label="codex 设置"]');
-  await waitFor(() => cdp.evaluate(`!!document.querySelector(${JSON.stringify(roster('Codex'))} + ' .agent-roster-content')`), 'shortcut opens Codex configuration');
-  await input(`${roster('Codex')} input[aria-label="启动参数 1"]`, '--shortcut-retry');
-  await rule({ method: 'PUT', path: '/settings', hold: true, error: '测试快捷保存失败', label: 'shortcut-save' });
-  await mouseClick(`${roster('Codex')} button[type="submit"]`);
-  await waitFor(() => cdp.evaluate(`window.__heldRPC.some(item => item.label === 'shortcut-save')`), 'shortcut delayed save');
-  if (!await cdp.evaluate(`document.querySelector('.settings-back').disabled`)) throw new Error('shortcut save was not locked');
-  await releaseRPC('shortcut-save');
-  await waitFor(() => cdp.evaluate(`document.querySelector('.general-settings-content [role="alert"]')?.textContent.includes('测试快捷保存失败')`), 'shortcut failure feedback');
-  await mouseClick(`${roster('Codex')} button[type="submit"]`);
-  await waitFor(() => cdp.evaluate(`document.querySelector('.settings-save-status')?.textContent.includes('Codex 设置已保存')`), 'shortcut save retry');
+  await keyPress('Escape');
+  await waitFor(() => cdp.evaluate(`!document.querySelector('.workspace-picker')`), 'offline picker closed');
+  const targetDirectory = process.env.CARGO_TARGET_DIR ? resolve(root, process.env.CARGO_TARGET_DIR) : join(root, 'target');
+  const clientPath = join(targetDirectory, 'debug', process.platform === 'win32' ? 'jian-client.exe' : 'jian-client');
+  start(clientPath, ['connect', '--server', clientArgs[0], '--host', clientArgs[1], '--token', clientArgs[2]], { cwd: root });
+  await mouseClick('button[aria-label="设置"]');
+  await mouseClick('.settings-navigation-item:nth-child(2)');
+  await waitFor(() => cdp.evaluate(`document.querySelector('.registered-host-card .registered-host-status')?.textContent === '在线'`), 'remote client connected');
   await mouseClick('button[aria-label="返回工作台"]');
+  await mouseClick('.agent-rail button:has(.agent-icon-command)');
+  await mouseClick('button[aria-label="新建会话"]');
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('.workspace-picker') && !document.querySelector('.workspace-picker > footer button').disabled`), 'connected remote command picker');
+  await selectValue('.workspace-picker select', remoteHostID);
+  await waitFor(() => cdp.evaluate(`!document.querySelector('.workspace-picker > footer button').disabled && document.querySelector('.workspace-picker > footer span').textContent.includes('e2e-remote')`), 'remote host ready');
+  const socketsBeforeRemoteSession = await cdp.evaluate(`window.__terminalSockets.length`);
+  const commandsBeforeRemoteSession = await cdp.evaluate(`window.__rpcRequests.filter(item => item.method === 'POST' && item.path === '/agents/command/sessions').length`);
+  await mouseClick('.workspace-picker > footer button');
+  await waitFor(() => cdp.evaluate(`window.__rpcRequests.filter(item => item.method === 'POST' && item.path === '/agents/command/sessions').length === ${commandsBeforeRemoteSession + 1}`), 'remote command creation request');
+  const remoteCreateRequest = await cdp.evaluate(`window.__rpcRequests.filter(item => item.method === 'POST' && item.path === '/agents/command/sessions').at(-1)`);
+  await waitFor(() => cdp.evaluate(`window.__rpcResponses.includes(${remoteCreateRequest.id})`), 'remote command creation response');
+  const remoteSessions = await cdp.evaluate(`window.__rpcCall('/agents/command/sessions')`);
+  const remoteSession = remoteSessions.find(session => session.host_id === remoteHostID);
+  if (!remoteSession) throw new Error('remote command did not appear in the session catalog');
+  await waitFor(() => cdp.evaluate(`window.__terminalSockets.slice(${socketsBeforeRemoteSession}).some(socket => socket.readyState === WebSocket.OPEN) && !!document.querySelector('.terminal .xterm')`), 'remote terminal attached');
+  const remoteInput = 'echo JIAN_REMOTE_OK\n';
+  await cdp.evaluate(`window.__terminalSockets.slice(${socketsBeforeRemoteSession}).findLast(socket => socket.readyState === WebSocket.OPEN).send(JSON.stringify({ type: 'input', data: ${JSON.stringify(remoteInput)} }))`);
+  await waitFor(() => cdp.evaluate(`window.__terminalSockets.slice(${socketsBeforeRemoteSession}).some(socket => socket.__jianReceived.some(raw => {
+    try { const message = JSON.parse(raw); return message.type === 'pty.output' && typeof message.payload === 'string' && message.payload.includes('JIAN_REMOTE_OK'); } catch { return false; }
+  }))`), 'remote shell command output');
+  await cdp.evaluate(`window.__rpcCall('/agents/command/sessions/' + ${JSON.stringify(remoteSession.id)} + '/stop', 'POST')`);
+  await mouseClick('button[aria-label="新建会话"]');
+  await waitFor(() => cdp.evaluate(`!!document.querySelector('.workspace-picker') && !document.querySelector('.workspace-picker > footer button').disabled`), 'local generic command picker');
 
-  const selectFixtureAgent = async kind => {
-    await mouseClick(`.agent-rail button:has(.agent-icon-${kind})`);
-    await waitFor(() => cdp.evaluate(`document.querySelector('.catalog-header strong')?.textContent.toLowerCase() === ${JSON.stringify(kind)} && window.__rpcRequests.filter(item => item.path.startsWith('/sessions/catalog')).every(item => window.__rpcResponses.includes(item.id))`), kind + ' catalog settled');
-    if (await cdp.evaluate(`!!document.querySelector('[aria-describedby="error-dialog-description"]')`)) await clickSelector('[aria-describedby="error-dialog-description"] button', kind + ' fixture cache notice');
-  };
-  for (const kind of ['codex', 'hermes']) {
-    await selectFixtureAgent(kind);
-    await mouseClick('button[aria-label="新建会话"]');
-    await waitFor(() => cdp.evaluate(`!!document.querySelector('.workspace-picker') && !document.querySelector('.workspace-picker > footer button').disabled`), kind + ' picker ready');
-    const before = await cdp.evaluate(`window.__rpcRequests.filter(item => item.method === 'POST' && item.path === '/agents/${kind}/sessions').length`);
-    await rule({ method: 'POST', path: `/agents/${kind}/sessions`, hold: true, error: `测试 ${kind} 创建失败`, label: 'typed-create' });
-    await cdp.evaluate(`(() => { const button = document.querySelector('.workspace-picker > footer button'); button.click(); button.click(); })()`);
-    await waitFor(() => cdp.evaluate(`window.__heldRPC.some(item => item.label === 'typed-create')`), kind + ' create snapshot');
-    if (!await cdp.evaluate(`window.__rpcRequests.filter(item => item.method === 'POST' && item.path === '/agents/${kind}/sessions').length === ${before + 1} && window.__heldRPC.find(item => item.label === 'typed-create').body.launch_args[0] === ${JSON.stringify(kind === 'codex' ? '--shortcut-retry' : 'hermes-draft')}`)) throw new Error(kind + ' creation routing or snapshot failed');
-    await releaseRPC('typed-create');
-    await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-picker [role="alert"]')?.textContent.includes('测试 ${kind} 创建失败') && !document.querySelector('.workspace-picker > footer button').disabled`), kind + ' create failure unlock');
-    await keyPress('Escape');
-  }
-  await cdp.evaluate(`window.__rpcCall('/settings').then(value => window.__rpcCall('/settings', 'PUT', { ...value.settings, pi_roles: [{ name: 'e2e-role', entry: ${JSON.stringify(join(temporary, 'missing-role'))}, home: ${JSON.stringify(root)} }] }))`);
-  await selectFixtureAgent('pi');
-  await waitFor(() => cdp.evaluate(`Array.from(document.querySelectorAll('.role-strip [role="tab"]')).some(tab => tab.textContent === 'e2e-role')`), 'Pi fixture role');
-  await mouseClick('.role-strip [role="tab"]:last-child');
-  await waitFor(() => cdp.evaluate(`document.querySelector('.role-strip [data-state="active"]')?.textContent === 'e2e-role' && window.__rpcRequests.filter(item => item.path.startsWith('/sessions/catalog')).every(item => window.__rpcResponses.includes(item.id))`), 'Pi role selected');
-  if (await cdp.evaluate(`!!document.querySelector('[aria-describedby="error-dialog-description"]')`)) await clickSelector('[aria-describedby="error-dialog-description"] button', 'Pi role cache notice');
-  await rule({ method: 'GET', path: '/settings', hold: true, label: 'role-preflight' });
-  await rule({ method: 'POST', path: '/agents/pi/sessions', error: '测试 Pi 角色创建失败' });
-  await cdp.evaluate(`(() => { const button = document.querySelector('[aria-label="新建会话"]'); button.click(); button.click(); })()`);
-  await waitFor(() => cdp.evaluate(`window.__heldRPC.some(item => item.label === 'role-preflight')`), 'Pi role preflight guard');
-  await cdp.evaluate(`window.dispatchEvent(new CustomEvent('jian-enter-terminal', { detail: { id: ${JSON.stringify(sharedID)} } }))`);
-  if (!await cdp.evaluate(`document.querySelector('.catalog-header strong').textContent === 'Pi' && window.__heldRPC.filter(item => item.label === 'role-preflight').length === 1 && !document.querySelector('.workspace-picker')`)) throw new Error('Pi role preflight lost routing or duplicated');
-  await releaseRPC('role-preflight');
-  await waitFor(() => cdp.evaluate(`document.querySelector('[aria-describedby="error-dialog-description"]')?.textContent.includes('测试 Pi 角色创建失败') && !document.querySelector('.session-catalog').inert`), 'Pi role failure unlock');
-  if (!await cdp.evaluate(`(() => { const request = window.__rpcRequests.filter(item => item.method === 'POST' && item.path === '/agents/pi/sessions').at(-1); return request.body.profile === 'e2e-role' && request.body.workspace === ${JSON.stringify(root)}; })()`)) throw new Error('Pi role request used stale kind, profile or directory');
-  await clickSelector('[aria-describedby="error-dialog-description"] button', 'Pi role failure notice');
-  await selectFixtureAgent('codex');
-  console.log('PASS Codex/Hermes creation routes and Pi role preflight retain their captured targets');
+  await selectValue('.workspace-picker select', '');
+  await waitFor(() => cdp.evaluate(`!document.querySelector('.workspace-picker > footer button').disabled`), 'local host selected');
+  await mouseClick('.workspace-advanced > button');
+  await mouseClick('.workspace-picker button[aria-label="添加启动参数"]');
+  await input('.workspace-picker input[aria-label="启动参数 1"]', '--review');
+  const commandsBeforeLocalCreate = await cdp.evaluate(`window.__rpcRequests.filter(item => item.method === 'POST' && item.path === '/agents/command/sessions').length`);
+  await rule({ method: 'POST', path: '/agents/command/sessions', hold: true, error: '测试通用启动器创建失败', label: 'create-command' });
+  await cdp.evaluate("(() => { const button = document.querySelector('.workspace-picker > footer button'); button.click(); button.click(); })()");
+  await waitFor(() => cdp.evaluate(`window.__heldRPC.some(item => item.label === 'create-command')`), 'generic command create');
+  const commandCreate = await cdp.evaluate(`window.__heldRPC.find(item => item.label === 'create-command').body`);
+  if (commandCreate.agent_id !== persistedSettings.settings.command_configs[0].id || commandCreate.launch_args[0] !== '--review') throw new Error('generic command request lost selected config or launch arguments');
+  await keyPress('Escape');
+  if (!await cdp.evaluate(`!!document.querySelector('.workspace-picker') && document.querySelector('[aria-label=\"关闭目录选择器\"]').disabled && window.__rpcRequests.filter(item => item.method === 'POST' && item.path === '/agents/command/sessions').length === ${commandsBeforeLocalCreate + 1}`)) throw new Error('pending command creation was dismissed or duplicated');
+  await releaseRPC('create-command');
+  await waitFor(() => cdp.evaluate(`document.querySelector('.workspace-picker [role=\"alert\"]')?.textContent.includes('测试通用启动器创建失败') && !document.querySelector('.workspace-picker > footer button').disabled`), 'command create failure retry');
+  await keyPress('Escape');
+  await waitFor(() => cdp.evaluate(`!document.querySelector('.workspace-picker')`), 'command picker closed');
+  await mouseClick('.agent-rail button:has(.agent-icon-codex)');
+  await waitFor(() => cdp.evaluate(`document.querySelector('.catalog-header strong')?.textContent === 'Codex'`), 'return to Codex');
+  console.log('PASS generic command settings, remote host registration, offline host selection, and create retry guard');
 
   await cdp.send('Emulation.setDeviceMetricsOverride', { width: 360, height: 844, deviceScaleFactor: 1, mobile: true });
   await cdp.send('Emulation.setTouchEmulationEnabled', { enabled: true });

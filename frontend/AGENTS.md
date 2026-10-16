@@ -5,10 +5,11 @@ description: Implementation and visual-design rules for Jian's React frontend.
 
 # Jian frontend
 
-Jian is an authenticated local-agent control plane, not a generic dashboard.
-Its main job is to let a user choose a local Bash, Codex, or Hermes session and
-operate a long-lived server-owned terminal without obscuring terminal state.
-The UI should feel calm, precise, and operationally trustworthy.
+Jian is an authenticated local and remote terminal workspace, not a generic
+dashboard. Its main job is to let a user choose a Local Bash, Codex, or generic
+command session, then operate its long-lived terminal without obscuring host
+and process state. The UI should feel calm, precise, and operationally
+trustworthy.
 
 ## Mandatory component policy: Radix UI first
 
@@ -41,8 +42,8 @@ instead of wrapping it in extra imperative event listeners.
 ## Current frontend structure
 
 - `src/main.tsx` is the composition root and currently owns authentication,
-  session loading/refresh guards, selected area/profile, tabs, terminal
-  attachment, workspace creation, and top-level dialogs. Keep changes
+  session loading/refresh guards, selected area, tabs, terminal attachment,
+  workspace and host selection, and top-level dialogs. Keep changes
   compatible with its persisted local-storage keys and async-load guards.
 - `src/features/auth` contains login; `features/navigation` owns the sidebar;
   `features/session-catalog` owns session rows and rename/delete UI;
@@ -67,20 +68,25 @@ instead of wrapping it in extra imperative event listeners.
   can reconnect and receives replayed output, so do not equate socket close
   with agent/session termination.
 - The three visible areas have different identities: `local` is a server-owned
-  Bash-terminal area; `codex` and `hermes` are the only agent kinds. Hermes
-  session selection and persistence are profile-aware.
+  Bash-terminal area, `codex` is the specialized agent, and `command` selects
+  a reusable generic launcher configuration. A session may run locally or on
+  a registered remote host.
+- Host registration and command configuration are shared server settings.
+  Display remote host identity and connection state when creating or managing
+  sessions; do not treat a remote workspace path as a local server path.
 - Session responses may represent a native session with no active PTY. Keep
   status, reconnect, stop/delete, release, and restart actions distinct.
-- Per-user agent settings control executable paths, profiles, launch arguments,
-  and agent visibility. Do not replace server settings with browser-only state.
-- Treat all API text (session titles, workspaces, profiles, errors, and terminal
+- Shared server settings control launcher paths, command presets, launch
+  arguments, and launcher visibility. Do not replace them with browser-only
+  state.
+- Treat all API text (session titles, workspaces, host names, errors, and terminal
   output) as untrusted. Render text normally; never use raw HTML injection.
 
 ## Design and interaction quality
 
 - Ground new UI in Jian's task: a person is managing real local processes.
   Favor clear state, direct verbs, stable session identity, and readable
-  workspace/profile context over decorative dashboard patterns.
+  workspace/host context over decorative dashboard patterns.
 - Follow the existing visual language before introducing a new one. Make one
   deliberate visual choice only when the task calls for it; do not add generic
   gradients, ornamental statistics, or animation just to fill space.

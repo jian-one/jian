@@ -121,7 +121,7 @@ export function AgentTerminal({
     if (ws?.readyState !== WebSocket.OPEN || termRef.current?.options.disableStdin) return false;
     try { ws.send(JSON.stringify({ type: 'input', data })); pasteAccepted.current = true; }
     catch { return false; }
-    if (!usesTouchInput()) requestAnimationFrame(focus);
+    if (!mobile && !usesTouchInput()) requestAnimationFrame(focus);
     return true;
   };
   const sendRef = useRef(send); sendRef.current = send;

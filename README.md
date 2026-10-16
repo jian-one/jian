@@ -1,106 +1,101 @@
 # Jian
 
-Jian is a small, same-origin Rust + React workspace for Codex and Hermes
-agents.
+Jian is a same-origin Rust + React terminal workspace for local and remote
+hosts. Use Local Bash, the Codex integration, or reusable generic command
+configurations from one browser interface.
 
-## Deploy and manage the user service
+## Build and version
 
 ```sh
-./build.sh
+./build.sh                  # increment patch version, build UI, install jian and jian-client
+./build.sh --keep-version   # build without changing x.y.z
+./build.sh -kv
+./build.sh --version 0.3.0  # select an exact version
+```
+
+`build.sh` keeps `Cargo.toml`, `frontend/package.json`, and
+`frontend/package-lock.json` in sync. It restores the previous version if the
+build or install fails. Binaries are installed under
+`${CARGO_HOME:-$HOME/.cargo}/bin`.
+
+## Run and deploy the server
+
+```sh
+JIAN_ADMIN_PASSWORD='change-me-now' jian serve
 jian deploy
 jian start
-jian stop
-jian restart
 jian status
-jian log
-jian log -f
 ```
 
-`build.sh` builds the UI and installs the `jian` binary with Cargo under
-`${CARGO_HOME:-$HOME/.cargo}/bin`. The `deploy` subcommand only writes the systemd user
-unit, reloads and enables it, then restarts the service. It stores application data under
-`~/.local/jian` and manages
-`~/.config/systemd/user/jian.service`. Run it from the repository, or
-set `JIAN_SOURCE_DIR` to the repository path. The service listens on
-`0.0.0.0:8080` by default. Optional administrator and Hermes settings can be
-placed in `~/.local/jian/env`. The file is created with development
-defaults on the first deploy and is never overwritten on subsequent deploys.
+The server listens on `0.0.0.0:8080` by default. Set `bind_ip` and
+`listen_port` in `~/.local/jian/config.json` to change it. `jian deploy` writes
+the systemd user unit and environment under `~/.local/jian` and
+`~/.config/systemd/user/jian.service`; run it from the repository or set
+`JIAN_SOURCE_DIR`. Set `JIAN_ADMIN_USER`, `JIAN_ADMIN_PASSWORD`, or `JIAN_DB`
+to configure account and storage defaults. The production UI is embedded from
+`web/dist`.
 
+## Register a remote host
 
-## Run locally
+1. Open **设置 → 远程主机**, enter a host name, and register it.
+2. Install Jian on that host and run the one-time command shown by the UI:
 
-```sh
-cd frontend && npm install && npm run build
-cd ..
-JIAN_ADMIN_PASSWORD='change-me-now' cargo run
-```
+   ```sh
+   cargo install --path . --locked --bin jian-client
+   jian-client connect --server https://jian.example --host HOST_ID --token TOKEN
+   ```
 
-The server listens on `0.0.0.0:8080`. Set `bind_ip` and `listen_port` in
-`~/.local/jian/config.json` to change it. Set `JIAN_ADMIN_USER`,
-`JIAN_ADMIN_PASSWORD`, or `JIAN_DB` to adjust those defaults. The production
-UI is embedded from `web/dist`.
+3. Leave `jian-client` running. It reconnects after network interruptions.
+   The host appears as online, and its home directory is available in the
+   workspace picker.
 
-## Codex terminal integration
+Use HTTPS in deployed environments so the client uses WSS and its bearer token
+is encrypted in transit. Jian stores only the token hash. The registration
+token is shown once; rotate it to revoke the previous client. Removing a host
+revokes its connection and removes its remote sessions.
 
-Jian discovers native Codex threads through the local `codex app-server`
-stdio protocol. Each active session is run by a backend-owned Bash process and
-PTY; the browser only displays the stream and forwards terminal input. Browser
-refreshes and WebSocket disconnects only detach the display, while buffered
-output is replayed on reconnect. Stopping or deleting a session terminates its
-Bash process group and the Agent child.
+The client owns the remote PTYs. A browser disconnect only detaches the
+display; the client keeps terminal output for replay after reconnect. Run the
+client under the process manager used by that host if it should start
+automatically. `jian deploy` manages only the Jian server service.
 
-Set `JIAN_CODEX_BIN` to an absolute executable path when Codex is not on
-the service user's `PATH`; place it in the service environment file so the
-systemd service can use it.
+## Launchers and sessions
+
+Codex native thread discovery uses the local `codex app-server --stdio`
+protocol. New local sessions use a server-owned Bash PTY. Remote Codex starts
+`codex` on the selected host. Set `JIAN_CODEX_BIN` when the local Codex binary
+is not on the server user's `PATH`; remote clients resolve `codex` on their
+own host.
+
+The **通用启动器** settings let you define named commands with a program,
+separate argv entries, and environment variables. These configurations are
+shared by all Jian users and can run locally or on an online remote host.
+Arguments are passed directly to the program without shell interpolation.
+
+Set `JIAN_BASH_BIN` to override the local Bash executable; it defaults to
+`/bin/bash`.
 
 ## Codex quota API
 
 `GET /api/agents/codex/rate-limits` requires a Jian login cookie and returns
 the complete JSON result from Codex `account/rateLimits/read`, including
-`rateLimits`, `rateLimitsByLimitId`, credit details and
-`rateLimitResetCredits` when available. Unknown/new fields are preserved.
-It uses the same configured Codex executable and environment as the sessions.
-Unauthenticated requests return HTTP 401; unavailable Codex, account or upstream
-quota data returns HTTP 503 with `{"error":"..."}`.
+`rateLimits`, `rateLimitsByLimitId`, credit details, and
+`rateLimitResetCredits` when available. Unknown fields are preserved.
+Unauthenticated requests return HTTP 401; unavailable Codex, account, or
+upstream quota data returns HTTP 503 with `{"error":"..."}`.
 
-Codex session headers on desktop, mobile and split terminals share a quota
+Codex session headers on desktop, mobile, and split terminals share a quota
 snapshot, refreshed every 30 seconds while the page is visible and immediately
-when it becomes visible again. For example: `5h: 25% | weekly: 15% | Reset: 3`.
-The percentages are remaining quota for the 300-minute and 10080-minute windows;
-`Reset` is `rateLimitResetCredits.availableCount`, not a reset timestamp.
-Missing fields display `—`; failed reads display `额度暂不可用`.
+when it becomes visible again. `Reset` is
+`rateLimitResetCredits.availableCount`, not a reset timestamp. Missing fields
+display `—`; failed reads display `额度暂不可用`.
 
-## Hermes chat integration
-
-When Hermes is available, Jian exposes an interactive xterm.js workspace
-backed by a per-session Bash process running the Hermes CLI through a PTY. Set
-`JIAN_HERMES_BIN` when the `hermes` command is not on the service user's
-`PATH`. Profiles are configured with a comma-separated
-`JIAN_HERMES_PROFILES` value (for example `default,swork`). If it is
-omitted or empty, Jian uses `default` plus every profile directory under
-`$JIAN_HERMES_HOME/profiles`. Jian directly runs `hermes -p <profile> sessions
-list --limit 10000` whenever it loads the session list, so the browser shows
-the same native sessions as the Hermes CLI.
-
-Hermes sessions are resumed through the CLI in a server-owned PTY and survive
-browser reconnects while the server process remains alive. Jian does not start
-or depend on an Hermes ACP process.
-
-Set `JIAN_BASH_BIN` to override the Bash executable used for session
-terminals; it defaults to `/bin/bash`.
-
-For a user service, put these variables in
-`~/.local/jian/env` (the recommended persistent location), or
-export them before running the server/deploy script:
-
-```sh
-JIAN_HERMES_BIN=/home/gaofei/.local/bin/hermes
-JIAN_HERMES_HOME=/home/gaofei/hermes
-# Leave unset or empty to discover all profiles.
-# JIAN_HERMES_PROFILES=default,swork
-```
+## Development checks
 
 ```sh
 cargo test
-cd frontend && npm run build
+npm --prefix frontend run test:input
+npm --prefix frontend run test:session
+npm --prefix frontend run test:layout
+npm --prefix frontend run build
 ```

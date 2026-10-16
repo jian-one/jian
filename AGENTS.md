@@ -1,149 +1,148 @@
 # Jian
 
-Code navigation in this repository starts with `codegraph_codegraph_explore` (a
-`.codegraph/` index is present): pass a question or symbol names, treat the
-returned source as already read, and use text search only to fill gaps.
+Code navigation starts with `codegraph_codegraph_explore`; a `.codegraph/`
+index is present. Treat returned source as already read and use text search to
+fill gaps.
 
 ## Project purpose
 
-Jian is a same-origin, cookie-authenticated browser workspace for local Bash,
-Codex, and Hermes sessions. It is deliberately a thin control plane: the Rust
-server owns processes and their terminal state; the React UI displays the
-catalog and proxies terminal input.
+Jian is a cookie-authenticated browser workspace for local and remote terminal
+sessions. The Rust server owns local PTYs and relays browser input/output to
+registered remote clients. The React UI manages the catalog and attaches to a
+terminal; a browser connection never owns a process.
 
 Core capabilities:
 
-- Create and manage server-owned local Bash PTYs, plus Codex and Hermes agent
-  sessions in a selected workspace. Hermes sessions are scoped to a profile.
-- Discover native Codex threads through its app-server protocol and native
-  Hermes sessions through the Hermes CLI. The runtime manager keeps an
-  in-memory cache; normal listing reads that cache and explicit refreshes run
-  native discovery.
-- Attach xterm.js over an authenticated, same-origin WebSocket. A browser
-  disconnect only detaches the display: the PTY continues and its bounded
-  output buffer is replayed when a client reconnects.
-- Keep active and inactive terminal pools. Idle, unsubscribed, non-busy
-  terminals move to the inactive pool; the next sweep releases that pool.
-- Persist users, login sessions, user-specific agent settings, recent
-  workspaces, audit events, runtime state, and monitor definitions in a
-  private BoltDB database. Native-agent discovery data and live PTYs are not
-  authoritative BoltDB records.
-- Build the Vite frontend into `web/dist` and embed it in the Rust server; the
-  `jian` CLI installs and manages the systemd user service.
+- Create local Bash and Codex sessions, plus sessions from reusable generic
+  command configurations.
+- Register remote hosts. A `jian-client` process connects back to Jian and
+  opens PTYs on that host; browser sessions can target either the local server
+  or an online registered host.
+- Discover local native Codex threads through `codex app-server --stdio`.
+  Normal catalog reads use the runtime cache; explicit refresh performs native
+  discovery. Generic command sessions and remote sessions are server-owned
+  catalog records.
+- Attach xterm.js over an authenticated, same-origin WebSocket. Browser
+  disconnects detach the display while the host keeps the PTY and bounded
+  output buffer for reconnect replay.
+- Persist users, login sessions, shared launcher settings, registered-host
+  token hashes, remote session records, recent workspaces, audit events,
+  runtime state, and monitor definitions in a private BoltDB database.
+- Build the Vite frontend into `web/dist` and embed it in the server. `jian`
+  manages the server service; `jian-client` runs on remote hosts.
 
 ## Repository map
 
-- `src/main.rs` wires configuration, authentication, HTTP/WebSocket routes,
-  embedded assets, and the `jian` administration CLI.
-- `src/model.rs` contains shared agent, session, event, and message types.
-  `domain.AgentKind` intentionally contains only `codex` and `hermes`; local
-  Bash is a terminal label/UI area, not an agent kind.
-- `src/runtime.rs` contains Codex, Hermes, local-Bash integration, and native
-  session discovery. Keep native CLI work out of normal list requests.
-- `src/terminal.rs` owns PTY process lifecycle, buffered output,
-  subscribers, restart/release operations, and active/inactive pooling.
-- `src/store.rs` is the BoltDB-compatible persistence layer. `Store::open` creates the
-  buckets, migrates away the legacy session snapshot bucket, and keeps data
-  permissions private.
-- `frontend` is the Vite + React source application; see
-  [`frontend/AGENTS.md`](frontend/AGENTS.md) for mandatory frontend rules.
-- `web/dist` is generated frontend output embedded by `rust-embed`. Never
-  edit it by hand.
-- `build.sh` builds the frontend and installs the `jian` CLI. Deployment is
-  performed by `jian deploy`, not by a `deploy.sh` script.
+- `src/main.rs` wires server configuration, authentication, HTTP/WebSocket
+  routes, host registration, session routing, embedded assets, and the `jian`
+  administration CLI.
+- `src/model.rs` contains shared agent, session, event, and configuration
+  types. `AgentKind` supports `codex`, `command`, and `local`; Local is a
+  terminal area and does not represent a configurable agent.
+- `src/runtime.rs` owns local Codex and generic command launchers, local Bash,
+  and native Codex discovery.
+- `src/remote.rs` tracks connected clients and routes PTY commands and events.
+- `src/bin/jian-client.rs` is the remote host client. It reconnects to Jian,
+  owns remote PTYs, and keeps bounded output for reconnect replay.
+- `src/terminal.rs` owns local PTY process lifecycle, subscribers,
+  restart/release operations, and active/inactive pooling.
+- `src/store.rs` is the BoltDB-compatible persistence layer. `Store::open`
+  creates buckets and keeps database permissions private.
+- `frontend` is the Vite + React application; see
+  [`frontend/AGENTS.md`](frontend/AGENTS.md) for frontend rules.
+- `web/dist` is generated output embedded by `rust-embed`. Never edit it by
+  hand.
+- `build.sh` builds and installs both binaries. `jian deploy` manages the
+  server service; it does not install a remote client service.
 
 ## Architecture and invariants
 
-- Codex and Hermes are the only supported `domain.AgentKind` values. Adding an
-  agent requires coordinated domain, runtime-manager, HTTP API, frontend, and
-  test changes.
-- Codex uses `codex app-server --stdio` for thread discovery/creation and the
-  Codex CLI in a Bash-backed PTY for interactive work and resume.
-- Hermes does **not** use ACP. It discovers and manages native sessions by
-  invoking the Hermes CLI per configured profile, and its interactive UI is a
-  Bash-backed PTY. Do not reintroduce an ACP process or document one.
-- Local sessions are also server-owned Bash PTYs. Their launch profiles and
-  agent executable paths/arguments are per-user settings; preserve that scope
-  when changing settings or runtime replacement.
-- A browser WebSocket never owns a process. Preserve same-origin origin checks,
-  cookie authentication, reconnect buffering, and server ownership for every
-  terminal endpoint.
-- Stop, delete, and terminal-release operations must terminate the PTY process
-  group so agent children do not survive their session. Build process commands
-  with argv; never interpolate untrusted input into shell strings.
-- API endpoints under `/api/` require the authentication middleware, except
-  the authentication endpoints. Workspace paths are canonicalized to absolute,
-  clean paths before starting a session. Treat paths, terminal input, CLI
-  output, and agent-provided metadata as untrusted input.
-- Native Codex sessions cannot be renamed. Hermes native identity is
-  `(kind, profile, native ID)`. Keep compatibility for imported/native sessions
-  that have no server-owned terminal.
-- Missing Codex or Hermes executables are a supported degraded mode: return a
-  clear unavailable response without preventing server startup.
-- The terminal manager's active/inactive pool and its status/release/restart
-  endpoints are operational controls, not a replacement for session discovery.
-  Preserve their synchronization and process-group lifecycle semantics.
+- Codex is the only specialized agent adapter. Other CLIs use shared
+  `CommandConfig` records with a program, argv list, and environment variables.
+  Adding a specialized adapter requires coordinated model, runtime, HTTP,
+  frontend, and test changes.
+- Build process commands with argv; never interpolate user input into shell
+  strings. Generic command configuration intentionally permits administrators
+  to launch arbitrary programs.
+- Local sessions run as server-owned PTYs. Remote sessions run as
+  `jian-client`-owned PTYs and are addressed by session ID through the server
+  relay. Keep those process owners explicit in lifecycle changes.
+- Preserve same-origin origin checks, cookie authentication for browser APIs,
+  bearer-token authentication for remote clients, reconnect buffering, and
+  process ownership. Persist only a hash of each remote client token.
+- Stop, delete, and release operations terminate the PTY process and its child
+  processes where the platform provides process-group control.
+- Canonicalize local workspace paths before launch. Remote paths are interpreted
+  on the selected host. Treat paths, terminal input, CLI output, and
+  agent-provided metadata as untrusted.
+- Missing Codex executables are a supported degraded mode: report a clear
+  unavailable response without preventing server startup.
+- The local terminal manager's active/inactive pool and status/release/restart
+  endpoints are operational controls. Preserve their synchronization and
+  lifecycle semantics.
 
 ## Development workflow
 
-Prerequisites are stable Rust, Node/npm, and optionally the `codex` and `hermes`
-CLIs for live integration work.
+Prerequisites are stable Rust and Node/npm. Codex is optional for live local
+integration work; `jian-client` can build without installed agent CLIs.
 
 ```sh
 # Backend tests
 cargo test
 
-# Frontend unit/guard checks
+# Frontend focused checks
 npm --prefix frontend run test:input
 npm --prefix frontend run test:session
 npm --prefix frontend run test:layout
 
-# Build the embedded frontend after frontend changes
+# Build embedded frontend assets after frontend changes
 npm --prefix frontend run build
 
-# Run locally (use a real password outside development)
-JIAN_ADMIN_PASSWORD='change-me-now' cargo run
+# Run locally
+JIAN_ADMIN_PASSWORD='change-me-now' cargo run -- serve
 
-# Install the CLI and manage the user service
+# Build and install both binaries; default build increments patch version
 ./build.sh
-jian deploy
-jian status
+./build.sh --keep-version
+./build.sh --version 0.3.0
 ```
 
-Useful settings include `JIAN_DB`, `JIAN_ADMIN_USER`,
+Useful server settings include `JIAN_DB`, `JIAN_ADMIN_USER`,
 `JIAN_ADMIN_PASSWORD`, `JIAN_SECURE_COOKIE`, `JIAN_CODEX_BIN`, `CODEX_BIN`,
-`JIAN_HERMES_BIN`, `HERMES_BIN`, `JIAN_HERMES_HOME`, `HERMES_HOME`,
-`JIAN_HERMES_PROFILES`, `JIAN_BASH_BIN`, and `JIAN_SOURCE_DIR`.
+`JIAN_BASH_BIN`, and `JIAN_SOURCE_DIR`. Remote command programs are resolved
+on the remote host; remote Codex uses `codex` from that host's PATH.
 
-`jian deploy` writes the user service and its environment file under the
-user's XDG-style Jian/systemd locations. It uses the repository at the current
-directory or `JIAN_SOURCE_DIR`. Do not hand-edit generated `web/dist` assets
-or commit local databases, service environment files, or `frontend/node_modules`.
+Remote clients should connect through HTTPS/WSS in deployed environments so
+their registration token is protected in transit. Run the generated
+`jian-client connect` command in the remote host process manager appropriate
+for that host; Jian does not create remote services automatically.
 
-Run `cargo fmt` on modified Rust files. Add or update focused Rust tests for HTTP
-handlers, catalog/cache behavior, persistence, authentication, terminal
-pool/lifecycle behavior, and runtime command construction. Unit tests must not
-require installed external agent CLIs; use the existing seams and temporary
-fixtures.
+`jian deploy` writes the server unit and environment under the user's XDG-style
+Jian/systemd locations. It uses the repository at the current directory or
+`JIAN_SOURCE_DIR`. Do not hand-edit generated `web/dist` assets or commit local
+databases, service environment files, or `frontend/node_modules`.
+
+Run `cargo fmt` on modified Rust files. Add focused tests for host registration,
+authentication, remote routing, settings persistence, catalog behavior,
+terminal lifecycle, and command construction. Unit tests must not require
+installed external agent CLIs; use temporary fixtures and existing seams.
 
 ## Frontend scope
 
 For any work inside `frontend/`, read and follow
-[`frontend/AGENTS.md`](frontend/AGENTS.md). It takes precedence for frontend
-implementation and design choices. In particular, Radix UI primitives are
-mandatory whenever an appropriate primitive exists. Keep API paths and
-WebSocket semantics aligned with `src/main.rs`, and rebuild `web/dist`
-whenever frontend source changes are meant for deployment.
+[`frontend/AGENTS.md`](frontend/AGENTS.md). Radix UI primitives are mandatory
+when an appropriate primitive exists. Keep API paths and WebSocket semantics
+aligned with `src/main.rs`, and rebuild `web/dist` after frontend changes
+intended for deployment.
 
 ## Change discipline
 
-- Prefer small, cohesive changes that preserve the separation between HTTP,
-  runtime adapters, terminal lifecycle, storage, and frontend state.
-- Preserve compatibility paths for native/imported sessions and unavailable
-  agents unless a tested change deliberately removes them.
-- Preserve unrelated work in a dirty worktree. Do not overwrite user-provided
-  files or generated output except when the requested frontend build creates
-  it.
-- Never commit credentials, local databases, generated transient files, or
-  `frontend/node_modules`; treat service credentials and environment files as
-  sensitive.
+- Prefer cohesive changes that preserve the separation between HTTP, local
+  runtime adapters, remote-client relay, terminal lifecycle, storage, and
+  frontend state.
+- Preserve unavailable-Codex behavior and remote-session records whose host is
+  temporarily offline.
+- Preserve unrelated dirty worktree changes. Never overwrite user-provided
+  edits or generated output except through the requested frontend build.
+- Never commit credentials, local databases, generated transient files,
+  service environment files, or `frontend/node_modules`.

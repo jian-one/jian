@@ -11,7 +11,7 @@ import type { MobileInputMode } from '../../features/terminal/mobile-state';
 import type { TerminalActions } from '../../features/terminal/MobileTerminalInput';
 
 type Props = {
-  session: OpenSession | null; kind: Kind | 'local'; profile: string; connection: ConnectionState;
+  session: OpenSession | null; kind: Kind | 'local'; connection: ConnectionState;
   focused: boolean; mode: MobileInputMode; busy: boolean; attached: boolean;
   actions: { current: TerminalActions | null }; hasDraft: boolean;
   onSwitch: () => void; onNavigation: () => void; onCreate: () => void;
@@ -27,12 +27,12 @@ export function MobileWorkbench(p: Props) {
   const act = (action: () => void) => { flushSync(() => setPanel(null)); action(); };
   const view = connectionView(p.connection);
   return <>
-    {!p.focused && <header className="mobile-workbench-header"><SessionContext session={p.session} kind={p.kind} profile={p.profile} />
+    {!p.focused && <header className="mobile-workbench-header"><SessionContext session={p.session} kind={p.kind} />
       <span className={'status ' + view.tone} aria-label={'终端状态：' + view.label}>{view.label}</span></header>}
     <nav className="mobile-workbench-dock" aria-label="移动工作台">
       <button disabled={p.busy} aria-label="切换会话" onClick={() => { p.actions.current?.leave(); p.onSwitch(); }}><ListFilter /><span>会话</span></button>
       <button disabled={!p.session || !p.attached || p.busy} aria-label={p.mode === 'read' ? '输入终端' : '收起输入'}
-        onClick={() => p.mode === 'read' ? p.actions.current?.enter('compose') : p.actions.current?.leave()}>
+        onClick={() => p.mode === 'read' ? p.actions.current?.enter('direct') : p.actions.current?.leave()}>
         <Keyboard /><span>{p.mode === 'read' ? p.hasDraft ? '输入 · 草稿' : '输入' : '收起输入'}</span></button>
       <Dialog.Root open={panel !== null} onOpenChange={open => { if (!open) setPanel(null); }}>
         <Dialog.Trigger asChild><button ref={trigger} aria-label="更多工作台操作" disabled={p.busy}
